@@ -50,7 +50,10 @@ def analyze_image(path):
     print(f"  Энтропия: {img_entropy:.4f}")
     print(f"  Стандартное отклонение яркости: {std_dev:.2f}")
     print(f"  Среднеквадратичное отклонение от сглаженного (эвристика шума): {noise_metric:.2f}")
+recomendation = "\nНеобходимые методы предобработки: Медианный фильтр, CLAHE"
 
 
 # Пример использования:
 analyze_image("N:/VKR_Datasets/SAR_low/test/images/Gao_ship_hh_020160825440209047.jpg")
+
+print(recomendation)

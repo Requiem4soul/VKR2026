@@ -538,7 +538,7 @@ class RetinaNetWrapper(BaseModelWrapper):
             num_classes=self.num_classes
         )
 
-        print(f"[✓] Инициализирован RetinaNet (classes={self.num_classes}, включая фон)")
+        print(f"Инициализирован RetinaNet (classes={self.num_classes}, включая фон)")
         print(f"    Использует Focal Loss для борьбы с дисбалансом классов")
 
     def train_epoch(self, dataloader, device, optimizer, epoch, **kwargs):
@@ -1066,11 +1066,11 @@ if __name__ == "__main__":
             print(f"  ✓ {name}")
 
     if missing:
-        print(f"\n❌ ОШИБКА! Не найдены датасеты: {missing}")
+        print(f"\nОШИБКА! Не найдены датасеты: {missing}")
         print("Проверьте названия в списке dataset_names")
         exit(1)
 
-    print(f"\n✅ Все {len(dataset_names)} датасетов найдены!")
+    print(f"\nВсе {len(dataset_names)} датасетов найдены!")
     print("=" * 60)
     print()
 
@@ -1078,8 +1078,8 @@ if __name__ == "__main__":
     trainer = UniversalModelTrainer(
         model_configs=model_configs,
         dataset_names=dataset_names,
-        max_epochs=2,
-        checkpoint_interval=1
+        max_epochs=80,
+        checkpoint_interval=5
     )
 
     trainer.run_training()
