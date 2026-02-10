@@ -1,3 +1,15 @@
+"""
+Применение предобработки к датасету
+
+ИЗМЕНЕНИЯ в v2.0:
+- Поддержка параметров для разных типов датасетов
+- Автоматический выбор метода denoise на основе типа шума
+- Передача параметров из правил предобработки
+
+Автор: Система адаптивной предобработки
+Дата: 2025
+"""
+
 import shutil
 from pathlib import Path
 from tqdm import tqdm
@@ -9,7 +21,13 @@ from Data.Datasets.dataset_work import get_dataset_path
 
 
 class DatasetPreprocessor:
-    """Применяет предобработку к целому датасету"""
+    """
+    Применяет предобработку к целому датасету
+    
+    НОВОЕ в v2.0:
+    - Принимает params для адаптации под тип датасета
+    - Передаёт специфичные параметры в методы
+    """
 
     def __init__(self):
         self.methods = PreprocessingMethods()
@@ -22,13 +40,32 @@ class DatasetPreprocessor:
             params: Optional[Dict[str, Dict[str, Any]]] = None,
             splits: List[str] = ['train', 'valid', 'test']
     ):
-        """Применяет одну и ту же предобработку ко всем изображениям"""
+        """
+        Применяет одну и ту же предобработку ко всем изображениям
+        
+        Args:
+            source_dataset: Название исходного датасета
+            target_dataset: Название нового датасета
+            methods: Список методов ['denoise', 'contrast_enhancement', ...]
+            params: Параметры для методов, например:
+                    {
+                        'denoise': {'method': 'median', 'ksize': 5},
+                        'contrast_enhancement': {'clip_limit': 1.0}
+                    }
+            splits: Какие splits обрабатывать
+        """
         src_path = get_dataset_path(source_dataset)
         dst_path = get_dataset_path(target_dataset)
 
         print(f"\nПрименяем глобальную предобработку:")
         print(f"  Методы: {', '.join(methods)}")
         print(f"  {source_dataset} → {target_dataset}")
+        
+        if params:
+            print(f"  Параметры:")
+            for method, method_params in params.items():
+                if method in methods:
+                    print(f"     {method}: {method_params}")
 
         # Удаляем старую версию если есть
         if dst_path.exists():
@@ -62,9 +99,20 @@ class DatasetPreprocessor:
             target_dataset: str,
             clusters: Dict[int, Dict],
             image_metrics: List,
+            params: Optional[Dict[str, Dict[str, Any]]] = None,
             splits: List[str] = ['train', 'valid', 'test']
     ):
-        """Применяет разную предобработку к разным кластерам"""
+        """
+        Применяет разную предобработку к разным кластерам
+        
+        Args:
+            source_dataset: Название исходного датасета
+            target_dataset: Название нового датасета
+            clusters: Словарь с кластерами и их методами обработки
+            image_metrics: Метрики изображений (для автоопределения шума)
+            params: Параметры для методов (общие для всех кластеров)
+            splits: Какие splits обрабатывать
+        """
         src_path = get_dataset_path(source_dataset)
         dst_path = get_dataset_path(target_dataset)
 
@@ -84,7 +132,7 @@ class DatasetPreprocessor:
         if (src_path / 'data.yaml').exists():
             shutil.copy(src_path / 'data.yaml', dst_path / 'data.yaml')
 
-        # Получаем список изображений train
+        # Обрабатываем train split по кластерам
         images_dir = src_path / 'train' / 'images'
         image_files = sorted(list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png")))
 
@@ -104,14 +152,14 @@ class DatasetPreprocessor:
                 image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
 
                 if methods:
-                    # Передаём информацию о шуме для автоматического выбора фильтра
-                    params_with_noise = {
-                        'denoise': {
-                            'noise_type': img_metrics.noise_type,
-                            'noise_level': img_metrics.noise_level
-                        }
-                    }
-                    processed = self.methods.apply_pipeline(image, methods, params_with_noise)
+                    # 🔥 НОВОЕ: Строим параметры с учётом шума изображения
+                    combined_params = self._build_params_for_image(
+                        methods, 
+                        img_metrics, 
+                        params
+                    )
+                    
+                    processed = self.methods.apply_pipeline(image, methods, combined_params)
                 else:
                     processed = image
 
@@ -155,12 +203,13 @@ class DatasetPreprocessor:
             image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
 
             # Применяем pipeline
-            # Для глобальной предобработки используем median по умолчанию
+            # 🔥 ИЗМЕНЕНО: Если params не указаны, используем безопасные дефолты
             if params is None:
                 params = {}
-
-            if 'denoise' not in params:
-                params['denoise'] = {'method': 'median'}  # Безопасный дефолт
+            
+            # Для denoise используем median по умолчанию если метод не указан
+            if 'denoise' in methods and 'denoise' not in params:
+                params['denoise'] = {'method': 'median'}
 
             processed = self.methods.apply_pipeline(image, methods, params)
 
@@ -184,3 +233,53 @@ class DatasetPreprocessor:
             if src_dir.exists():
                 for file in src_dir.iterdir():
                     shutil.copy(file, dst_dir / file.name)
+    
+    def _build_params_for_image(
+        self,
+        methods: List[str],
+        img_metrics,
+        global_params: Optional[Dict]
+    ) -> Dict:
+        """
+        🔥 НОВАЯ ФУНКЦИЯ: Строит параметры с учётом характеристик конкретного изображения
+        
+        Объединяет:
+        1. Глобальные параметры из правил (global_params)
+        2. Информацию о шуме конкретного изображения
+        
+        Args:
+            methods: Список методов
+            img_metrics: Метрики изображения (содержит noise_type)
+            global_params: Глобальные параметры из правил типа датасета
+            
+        Returns:
+            dict: Параметры для apply_pipeline
+        """
+        combined_params = global_params.copy() if global_params else {}
+        
+        # Для denoise объединяем параметры правильно
+        if 'denoise' in methods:
+            if 'denoise' not in combined_params:
+                combined_params['denoise'] = {}
+            
+            # Добавляем тип шума из метрик изображения
+            combined_params['denoise']['noise_type'] = img_metrics.noise_type
+            combined_params['denoise']['noise_level'] = img_metrics.noise_level
+            
+            # ВАЖНО: Если в global_params уже есть 'method', НЕ перезаписываем
+            # Иначе выбираем автоматически на основе типа шума
+            if 'method' not in combined_params['denoise']:
+                # Автоматический выбор метода на основе типа шума
+                noise_to_method = {
+                    'gaussian': 'bilateral',
+                    'salt_pepper': 'median',
+                    'poisson': 'nlm',
+                    'speckle': 'median'
+                }
+                combined_params['denoise']['method'] = noise_to_method.get(
+                    img_metrics.noise_type, 
+                    'median'  # Безопасный дефолт
+                )
+            # Если метод уже указан в global_params - используем его
+        
+        return combined_params

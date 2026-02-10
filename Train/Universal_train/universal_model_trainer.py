@@ -28,6 +28,27 @@ import numpy as np
 from Data.Datasets.dataset_work import get_dataset_path
 
 
+def get_image_size_from_dataset(dataset_path: Path) -> int:
+    """Определяет размер изображений в датасете и округляет до кратного 32"""
+    import cv2
+
+    images_dir = dataset_path / "train" / "images"
+    image_files = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png"))
+
+    if not image_files:
+        return 640
+
+    # Берём первое изображение
+    img = cv2.imread(str(image_files[0]))
+    h, w = img.shape[:2]
+
+    # YOLO требует размер кратный 32
+    max_side = max(h, w)
+    imgsz = ((max_side + 31) // 32) * 32
+
+    return imgsz
+
+
 # ===================== YOLO DATASET INFO =====================
 
 class YOLODatasetInfo:
@@ -845,12 +866,15 @@ class UniversalModelTrainer:
             epochs_to_train = end_epoch - start_epoch
 
             if model_type == 'yolo':
+                imgsz = get_image_size_from_dataset(dataset_path)
+                print(f"[INFO] Размер изображений: {imgsz}x{imgsz}")
+
                 metrics = self.models[key].train_epoch(
                     dataset_path=dataset_path,
                     epochs=epochs_to_train,
                     device=device,
-                    batch=16,
-                    imgsz=640
+                    batch=-1,
+                    imgsz=imgsz
                 )
 
             elif model_type in ['faster_rcnn', 'retinanet']:
@@ -1037,19 +1061,19 @@ if __name__ == "__main__":
         {
             'type': 'yolo',
             'size': 's',  # small
-            'name': 'yolo_small'
-        },
-        {
-            'type': 'retinanet',
-            'pretrained': True,
-            'name': 'retinanet'
-        }
+            'name': 'yolo_small'}
+        # },
+        # {
+        #     'type': 'retinanet',
+        #     'pretrained': True,
+        #     'name': 'retinanet'
+        # }
     ]
 
     # ============ ДАТАСЕТЫ С РАЗНОЙ ПРЕДОБРАБОТКОЙ ============
     dataset_names = [
-        "SAR_low",
-        "SAR_LP_med3_CLACHE1_16",
+        "dataset_LUNA16",
+        "LUNA16_CHECK",
     ]
 
     # ============ ПРОВЕРКА ДАТАСЕТОВ ============
@@ -1078,7 +1102,7 @@ if __name__ == "__main__":
     trainer = UniversalModelTrainer(
         model_configs=model_configs,
         dataset_names=dataset_names,
-        max_epochs=80,
+        max_epochs=20,
         checkpoint_interval=5
     )
 

@@ -1,3 +1,13 @@
+"""
+Методы предобработки изображений
+
+Содержит все методы для улучшения качества изображений:
+- Шумоподавление (denoise)
+- Улучшение контраста (contrast_enhancement)
+- Коррекция яркости (brightness_correction)
+- Увеличение резкости (sharpening)
+"""
+
 import cv2
 import numpy as np
 from typing import Dict, List, Any, Optional
@@ -55,7 +65,6 @@ class PreprocessingMethods:
             elif noise_type == 'speckle':
                 # Median также хорош для speckle (SAR)
                 method = 'median'
-
 
             else:  # unknown
                 # Консервативный подход: median с минимальным kernel
@@ -126,6 +135,7 @@ class PreprocessingMethods:
 
         Args:
             method: 'clahe', 'histogram_eq'
+            **kwargs: Дополнительные параметры
         """
         if method == 'clahe':
             clip_limit = kwargs.get('clip_limit', 2.0)
@@ -153,6 +163,7 @@ class PreprocessingMethods:
 
         Args:
             target_brightness: Целевая яркость (0-1)
+            **kwargs: Дополнительные параметры
         """
         current_brightness = np.mean(image.astype(np.float32) / 255.0)
 
@@ -166,14 +177,20 @@ class PreprocessingMethods:
         return corrected
 
     @staticmethod
-    def sharpening(image: np.ndarray, method: str = 'unsharp_mask', **kwargs) -> np.ndarray:
+    def sharpening(
+            image: np.ndarray,
+            method: str = 'unsharp_mask',
+            **kwargs
+    ) -> np.ndarray:
         """
         Увеличение резкости
 
         Args:
             method: 'unsharp_mask', 'laplacian'
+            **kwargs: Дополнительные параметры
         """
         if method == 'unsharp_mask':
+            # Unsharp masking
             blurred = cv2.GaussianBlur(image, (0, 0), 3)
             alpha = kwargs.get('alpha', 1.5)
             sharpened = cv2.addWeighted(image, 1 + alpha, blurred, -alpha, 0)
@@ -203,6 +220,10 @@ class PreprocessingMethods:
             image: Входное изображение
             methods: Список методов ['denoise', 'contrast_enhancement', ...]
             params: Параметры для каждого метода
+                    Например: {
+                        'denoise': {'method': 'median', 'ksize': 5},
+                        'contrast_enhancement': {'clip_limit': 2.0}
+                    }
         """
         if params is None:
             params = {}
@@ -210,14 +231,17 @@ class PreprocessingMethods:
         result = image.copy()
 
         for method in methods:
-            method_params = params.get(method, {})
+            method_params = params.get(method, {}).copy()  # Копируем чтобы не изменять оригинал
 
             if method == 'denoise':
-                # Передаём информацию о шуме для автовыбора фильтра
+                # ИСПРАВЛЕНИЕ: Извлекаем 'method' из params если есть
+                denoise_method = method_params.pop('method', 'auto')  # pop удаляет из dict
+                
+                # Теперь передаём method как keyword аргумент
                 result = PreprocessingMethods.denoise(
                     result,
-                    method='auto',  # Автоматический выбор
-                    **method_params
+                    method=denoise_method,  # Передаём извлечённый метод
+                    **method_params  # Остальные параметры (noise_type, ksize и т.д.)
                 )
             elif method == 'contrast_enhancement':
                 result = PreprocessingMethods.contrast_enhancement(result, **method_params)

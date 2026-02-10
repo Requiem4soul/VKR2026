@@ -1,3 +1,19 @@
+# Изображения датасетов
+*.png
+*.jpg
+*.jpeg
+
+# Разметка YOLO
+*.txt
+*.csv
+*.json
+*.yaml
+
+# Веса моделей
+*.pt
+*.pth
+*.weights
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
