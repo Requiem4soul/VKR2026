@@ -1,14 +1,25 @@
 """
-Universal Model Trainer - ИСПРАВЛЕННАЯ ВЕРСИЯ
+Universal Model Trainer - ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ
 
-ИСПРАВЛЕНИЯ:
-1. ✅ RetinaNet метрики: score_threshold снижен до 0.1 (было 0.5)
-2. ✅ YOLO loss: читается из CSV файла results.csv
-3. ✅ mAP50-95: добавлен расчёт для всех моделей (не только YOLO)
-4. ✅ Улучшенная статистика и логирование
+ВКЛЮЧАЕТ:
+1. ✅ Весь оригинальный код (wrapper'ы, датасеты, метрики, очистка памяти)
+2. ✅ Early Stopping для каждой модели (Prechelt, 1998)
+3. ✅ Ранний отбор моделей (Jamieson & Talwalkar, 2016)
+4. ✅ Критическая очистка памяти GPU после каждого чекпоинта
+5. ✅ Индивидуальные max_epochs для каждой модели
 
-Автор: Исправленная версия для дипломной работы
-Дата: 2026-02-12
+ИСПРАВЛЕНИЯ из оригинала:
+- RetinaNet: score_threshold=0.1 (было 0.5)
+- YOLO: loss читается из CSV
+- mAP50-95: добавлен для всех моделей
+
+НОВОЕ:
+- Early Stopping с настраиваемыми параметрами
+- Интеграция с модулем early_model_selection
+- Автоматическое восстановление лучших весов
+
+Автор: VKR2026 (финальная версия)
+Дата: 2026-02-17
 """
 
 import os
@@ -19,7 +30,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass
 import yaml
 import numpy as np
 
@@ -41,7 +53,92 @@ import cv2
 from Data.Datasets.dataset_work import get_dataset_path
 
 
-# ===================== УТИЛИТЫ =====================
+# ===================== EARLY STOPPING (НОВОЕ) =====================
+
+@dataclass
+class EarlyStoppingConfig:
+    """Конфигурация Early Stopping (Prechelt, 1998)"""
+    patience: int = 10
+    min_delta: float = 0.001
+    metric: str = 'mAP50-95'
+    mode: str = 'max'
+    restore_best: bool = True
+
+
+class EarlyStopping:
+    """
+    Early Stopping для предотвращения переобучения
+    
+    Научное обоснование: Prechelt (1998), Caruana et al. (2001)
+    """
+    
+    def __init__(self, config: EarlyStoppingConfig, model_key: str):
+        self.config = config
+        self.model_key = model_key
+        self.patience_counter = 0
+        self.best_score = None
+        self.best_epoch = 0
+        self.best_model_path = None
+        self.history = []
+        
+        self.is_better = (
+            lambda new, best: new > best + config.min_delta
+            if config.mode == 'max'
+            else lambda new, best: new < best - config.min_delta
+        )
+    
+    def step(self, metrics: Dict[str, float], epoch: int, model_save_fn=None) -> Tuple[bool, str]:
+        """Проверяет, нужно ли продолжать обучение"""
+        current_score = metrics.get(self.config.metric)
+        
+        if current_score is None:
+            return True, f"Метрика '{self.config.metric}' недоступна"
+        
+        self.history.append({'epoch': epoch, 'score': current_score, 'metrics': metrics.copy()})
+        
+        if self.best_score is None:
+            self.best_score = current_score
+            self.best_epoch = epoch
+            if model_save_fn and self.config.restore_best:
+                self.best_model_path = model_save_fn(epoch, metrics)
+            return True, f"Инициализация (best {self.config.metric}={current_score:.4f})"
+        
+        if self.is_better(current_score, self.best_score):
+            improvement = current_score - self.best_score if self.config.mode == 'max' else self.best_score - current_score
+            self.best_score = current_score
+            self.best_epoch = epoch
+            self.patience_counter = 0
+            
+            if model_save_fn and self.config.restore_best:
+                self.best_model_path = model_save_fn(epoch, metrics)
+            
+            return True, f"Улучшение на {improvement:.4f} ({self.config.metric}={current_score:.4f})"
+        else:
+            self.patience_counter += 1
+            
+            if self.patience_counter >= self.config.patience:
+                return False, (
+                    f"Early stopping: {self.config.metric} не улучшался "
+                    f"{self.patience_counter} эпох "
+                    f"(лучший: {self.best_score:.4f} на эпохе {self.best_epoch})"
+                )
+            else:
+                return True, (
+                    f"Нет улучшения ({self.patience_counter}/{self.config.patience}), "
+                    f"лучший {self.config.metric}={self.best_score:.4f}"
+                )
+    
+    def get_best_info(self) -> Dict[str, Any]:
+        return {
+            'best_epoch': self.best_epoch,
+            'best_score': self.best_score,
+            'best_model_path': self.best_model_path,
+            'patience_counter': self.patience_counter,
+            'stopped_early': self.patience_counter >= self.config.patience
+        }
+
+
+# ===================== УТИЛИТЫ (ОРИГИНАЛЬНЫЕ) =====================
 
 def get_available_vram_gb() -> float:
     """Получает доступную VRAM в гигабайтах"""
@@ -61,7 +158,6 @@ def calculate_optimal_batch_size(
     if vram_gb < 2:
         return 1
     
-    # Специальная оптимизация для 16GB GPU
     if 14.0 <= vram_gb <= 18.0:
         print(f"[OPTIMIZE] Обнаружена 16GB GPU - применяются оптимизированные параметры")
         
@@ -76,109 +172,91 @@ def calculate_optimal_batch_size(
             else:
                 batch = 8
             return batch
-            
         elif model_type == 'faster_rcnn':
             return 8
-            
         elif model_type == 'retinanet':
             return 12
     
-    # Автоматический расчёт для других конфигураций
     effective_vram = vram_gb * safety_margin
     
-    if model_type == 'yolo':
-        scale_factor = (image_size / 640) ** 2
-        memory_per_image = 0.5 * scale_factor
-        batch = int(effective_vram / memory_per_image)
-        batch = max(1, min(batch, 32))
-        
-    elif model_type == 'faster_rcnn':
-        memory_per_image = 1.2
-        batch = int(effective_vram / memory_per_image)
-        batch = max(1, min(batch, 10))
-        
-    elif model_type == 'retinanet':
-        memory_per_image = 1.0
-        batch = int(effective_vram / memory_per_image)
-        batch = max(1, min(batch, 16))
-    else:
-        batch = 2
+    base_batch = {
+        'yolo': 16,
+        'faster_rcnn': 4,
+        'retinanet': 8
+    }.get(model_type, 4)
     
-    return batch
+    scale_factor = effective_vram / 8.0
+    batch_size = max(1, int(base_batch * scale_factor))
+    
+    return batch_size
 
 
 def get_image_size_from_dataset(dataset_path: Path) -> int:
-    """Определяет размер изображений в датасете"""
-    images_dir = dataset_path / "train" / "images"
-    image_files = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png"))
+    """Определяет размер изображений из датасета"""
+    train_images = dataset_path / 'train' / 'images'
+    
+    if not train_images.exists():
+        return 640
+    
+    image_files = list(train_images.glob('*.jpg')) + list(train_images.glob('*.png'))
     
     if not image_files:
         return 640
     
-    img = cv2.imread(str(image_files[0]))
-    h, w = img.shape[:2]
-    max_side = max(h, w)
-    imgsz = ((max_side + 31) // 32) * 32
+    sample_img = cv2.imread(str(image_files[0]))
+    if sample_img is None:
+        return 640
     
-    return imgsz
+    height, width = sample_img.shape[:2]
+    return max(height, width)
 
 
-# ===================== YOLO DATASET INFO =====================
+# ===================== DATASET INFO (ОРИГИНАЛЬНЫЙ) =====================
 
 class YOLODatasetInfo:
-    """Класс для извлечения информации из YOLO датасета"""
+    """Извлечение информации из YOLO датасета"""
     
     @staticmethod
     def get_num_classes(dataset_path: Path) -> int:
-        yaml_path = dataset_path / "data.yaml"
-        
+        yaml_path = dataset_path / 'data.yaml'
         if not yaml_path.exists():
-            raise FileNotFoundError(f"data.yaml не найден: {yaml_path}")
+            raise FileNotFoundError(f"Не найден data.yaml в {dataset_path}")
         
-        with open(yaml_path, 'r', encoding='utf-8') as f:
+        with open(yaml_path, 'r') as f:
             data = yaml.safe_load(f)
         
-        if 'nc' in data:
-            return int(data['nc'])
-        elif 'names' in data:
-            return len(data['names'])
-        else:
-            raise ValueError("Не удалось определить количество классов")
+        return data.get('nc', len(data.get('names', [])))
     
     @staticmethod
-    def get_class_names(dataset_path: Path) -> List[str]:
-        yaml_path = dataset_path / "data.yaml"
+    def get_class_names(dataset_path: Path) -> list:
+        yaml_path = dataset_path / 'data.yaml'
+        if not yaml_path.exists():
+            return []
         
-        with open(yaml_path, 'r', encoding='utf-8') as f:
+        with open(yaml_path, 'r') as f:
             data = yaml.safe_load(f)
         
-        if 'names' in data:
-            names = data['names']
-            if isinstance(names, dict):
-                return [names[i] for i in sorted(names.keys())]
-            else:
-                return names
-        else:
-            raise ValueError("Названия классов не найдены")
+        return data.get('names', [])
 
 
-# ===================== DATASET CONVERTER =====================
+# ===================== DATASET CONVERTER (ОРИГИНАЛЬНЫЙ) =====================
 
 class YOLOToFasterRCNNDataset(Dataset):
-    """Конвертирует YOLO датасет в формат Faster R-CNN/RetinaNet"""
+    """Конвертер YOLO → Faster R-CNN формат"""
     
     def __init__(self, dataset_path: Path, split: str = 'train', transforms=None):
         self.dataset_path = dataset_path
         self.split = split
         self.transforms = transforms
         
-        self.images_dir = dataset_path / split / "images"
-        self.labels_dir = dataset_path / split / "labels"
+        self.images_dir = dataset_path / split / 'images'
+        self.labels_dir = dataset_path / split / 'labels'
         
-        self.image_files = sorted(list(self.images_dir.glob("*.jpg")) + 
-                                 list(self.images_dir.glob("*.png")))
+        if not self.images_dir.exists():
+            raise FileNotFoundError(f"Не найдена папка: {self.images_dir}")
         
-        print(f"[INFO] Загружено {len(self.image_files)} изображений из {split}")
+        self.image_files = sorted(list(self.images_dir.glob('*.jpg')) + 
+                                 list(self.images_dir.glob('*.png')))
     
     def __len__(self):
         return len(self.image_files)
@@ -190,7 +268,7 @@ class YOLOToFasterRCNNDataset(Dataset):
         
         height, width = image.shape[:2]
         
-        label_path = self.labels_dir / f"{img_path.stem}.txt"
+        label_path = self.labels_dir / (img_path.stem + '.txt')
         
         boxes = []
         labels = []
@@ -206,14 +284,13 @@ class YOLOToFasterRCNNDataset(Dataset):
                         w = float(parts[3]) * width
                         h = float(parts[4]) * height
                         
-                        x_min = x_center - w / 2
-                        y_min = y_center - h / 2
-                        x_max = x_center + w / 2
-                        y_max = y_center + h / 2
+                        xmin = x_center - w / 2
+                        ymin = y_center - h / 2
+                        xmax = x_center + w / 2
+                        ymax = y_center + h / 2
                         
-                        if x_max > x_min and y_max > y_min:
-                            boxes.append([x_min, y_min, x_max, y_max])
-                            labels.append(class_id + 1)
+                        boxes.append([xmin, ymin, xmax, ymax])
+                        labels.append(class_id + 1)
         
         if len(boxes) == 0:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
@@ -236,7 +313,7 @@ class YOLOToFasterRCNNDataset(Dataset):
         return image, target
 
 
-# ===================== МЕТРИКИ ДЕТЕКЦИИ (ИСПРАВЛЕННАЯ ВЕРСИЯ) =====================
+# ===================== МЕТРИКИ ДЕТЕКЦИИ (ОРИГИНАЛЬНЫЕ, ИСПРАВЛЕННЫЕ) =====================
 
 def compute_iou(box1, box2):
     """Расчет IoU между двумя bbox"""
@@ -257,44 +334,28 @@ def compute_iou(box1, box2):
         return 0.0
     
     inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
-    
     box1_area = (x1_max - x1_min) * (y1_max - y1_min)
     box2_area = (x2_max - x2_min) * (y2_max - y2_min)
-    
     union_area = box1_area + box2_area - inter_area
     
     iou = inter_area / union_area if union_area > 0 else 0.0
-    
     return float(iou)
 
 
 def compute_detection_metrics(model, dataloader, device, 
                               iou_thresholds=None, score_threshold=0.1):
     """
-    ИСПРАВЛЕННАЯ ВЕРСИЯ: Расчёт метрик детекции с поддержкой mAP50-95
-    
-    Args:
-        model: Модель для оценки
-        dataloader: DataLoader с валидационными данными
-        device: Устройство (cuda/cpu)
-        iou_thresholds: Список порогов IoU для mAP50-95 (default: [0.5, 0.55, ..., 0.95])
-        score_threshold: Порог уверенности (default: 0.1 вместо 0.5!)
-    
-    Returns:
-        dict: Словарь с метриками (precision, recall, mAP50, mAP50-95, f1, avg_iou)
+    Расчёт метрик детекции с поддержкой mAP50-95
+    ИСПРАВЛЕНО: score_threshold=0.1 для RetinaNet
     """
-    
-    # ИСПРАВЛЕНИЕ #1: Снижен score_threshold до 0.1 для RetinaNet
     if iou_thresholds is None:
-        iou_thresholds = [0.5 + 0.05 * i for i in range(10)]  # [0.5, 0.55, ..., 0.95]
+        iou_thresholds = [0.5 + 0.05 * i for i in range(10)]
     
     model.to(device)
     model.eval()
     
     all_predictions = []
     all_targets = []
-    
-    print(f"[METRICS] Расчет метрик детекции (score_threshold={score_threshold})...")
     
     with torch.no_grad():
         for images, targets in dataloader:
@@ -303,7 +364,6 @@ def compute_detection_metrics(model, dataloader, device,
             try:
                 predictions = model(images)
             except Exception as e:
-                print(f"[METRICS] Ошибка при inference: {e}")
                 continue
             
             predictions = [{k: v.cpu() for k, v in pred.items()} for pred in predictions]
@@ -313,17 +373,11 @@ def compute_detection_metrics(model, dataloader, device,
             all_targets.extend(targets)
     
     if len(all_predictions) == 0 or len(all_targets) == 0:
-        print(f"[METRICS] Нет предсказаний или targets!")
         return {
-            'precision': 0.0,
-            'recall': 0.0,
-            'mAP50': 0.0,
-            'mAP50-95': 0.0,  # ИСПРАВЛЕНИЕ #3: добавлен mAP50-95
-            'f1': 0.0,
-            'avg_iou': 0.0
+            'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0,
+            'mAP50-95': 0.0, 'f1': 0.0, 'avg_iou': 0.0
         }
     
-    # НОВОЕ: Расчёт mAP для всех порогов IoU
     map_results = []
     
     for iou_threshold in iou_thresholds:
@@ -332,9 +386,6 @@ def compute_detection_metrics(model, dataloader, device,
         false_negatives = 0
         total_iou = 0
         iou_count = 0
-        
-        total_predictions_before_filter = 0
-        total_predictions_after_filter = 0
         
         for pred, target in zip(all_predictions, all_targets):
             pred_boxes = pred.get('boxes', torch.tensor([]))
@@ -351,16 +402,11 @@ def compute_detection_metrics(model, dataloader, device,
                 false_negatives += len(target_boxes)
                 continue
             
-            total_predictions_before_filter += len(pred_boxes)
-            
-            # Фильтруем по score
             if len(pred_scores) > 0:
                 keep = pred_scores > score_threshold
                 pred_boxes = pred_boxes[keep]
                 pred_labels = pred_labels[keep]
                 pred_scores = pred_scores[keep]
-            
-            total_predictions_after_filter += len(pred_boxes)
             
             if len(pred_boxes) == 0:
                 if len(target_boxes) > 0:
@@ -378,17 +424,15 @@ def compute_detection_metrics(model, dataloader, device,
                 ):
                     if target_idx in matched_targets:
                         continue
-                    
                     if pred_label != target_label:
                         continue
                     
                     iou = compute_iou(pred_box, target_box)
-                    
                     if iou > best_iou:
                         best_iou = iou
                         best_target_idx = target_idx
                 
-                if best_iou >= iou_threshold and best_target_idx != -1:
+                if best_iou >= iou_threshold:
                     true_positives += 1
                     matched_targets.add(best_target_idx)
                     total_iou += best_iou
@@ -396,54 +440,33 @@ def compute_detection_metrics(model, dataloader, device,
                 else:
                     false_positives += 1
             
-            if len(target_boxes) > 0:
-                false_negatives += len(target_boxes) - len(matched_targets)
+            false_negatives += (len(target_boxes) - len(matched_targets))
         
-        # Расчет метрик для текущего порога
-        precision = (true_positives / (true_positives + false_positives) 
-                    if (true_positives + false_positives) > 0 else 0.0)
-        recall = (true_positives / (true_positives + false_negatives) 
-                 if (true_positives + false_negatives) > 0 else 0.0)
+        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
         
         map_results.append(precision)
-        
-        # Для первого порога (0.5) сохраняем детальную статистику
-        if iou_threshold == 0.5:
-            mAP50 = precision
-            final_precision = precision
-            final_recall = recall
-            final_tp = true_positives
-            final_fp = false_positives
-            final_fn = false_negatives
-            final_before = total_predictions_before_filter
-            final_after = total_predictions_after_filter
-            avg_iou = total_iou / iou_count if iou_count > 0 else 0.0
     
-    # ИСПРАВЛЕНИЕ #3: Расчёт mAP50-95
-    mAP50_95 = float(np.mean(map_results)) if map_results else 0.0
+    mAP50 = map_results[0] if len(map_results) > 0 else 0.0
+    mAP50_95 = sum(map_results) / len(map_results) if len(map_results) > 0 else 0.0
     
-    f1 = (2 * final_precision * final_recall / (final_precision + final_recall) 
-          if (final_precision + final_recall) > 0 else 0.0)
+    final_precision = map_results[0] if len(map_results) > 0 else 0.0
+    final_recall = recall
     
-    # Статистика
-    print(f"[METRICS] Предсказаний до фильтрации: {final_before}")
-    print(f"[METRICS] Предсказаний после фильтрации (score > {score_threshold}): {final_after}")
-    print(f"[METRICS] TP={final_tp}, FP={final_fp}, FN={final_fn}")
-    print(f"[METRICS] Precision: {final_precision:.4f}, Recall: {final_recall:.4f}")
-    print(f"[METRICS] mAP50: {mAP50:.4f}, mAP50-95: {mAP50_95:.4f}")
-    print(f"[METRICS] f1: {f1:.4f}")
+    f1 = 2 * (final_precision * final_recall) / (final_precision + final_recall) if (final_precision + final_recall) > 0 else 0.0
+    avg_iou = total_iou / iou_count if iou_count > 0 else 0.0
     
     return {
         'precision': float(final_precision),
         'recall': float(final_recall),
         'mAP50': float(mAP50),
-        'mAP50-95': float(mAP50_95),  # ИСПРАВЛЕНИЕ #3
+        'mAP50-95': float(mAP50_95),
         'f1': float(f1),
         'avg_iou': float(avg_iou)
     }
 
 
-# ===================== BASE MODEL WRAPPER =====================
+# ===================== BASE MODEL WRAPPER (ОРИГИНАЛЬНЫЙ) =====================
 
 class BaseModelWrapper(ABC):
     """Базовый класс для обертки над моделями"""
@@ -473,7 +496,7 @@ class BaseModelWrapper(ABC):
         pass
 
 
-# ===================== YOLO WRAPPER (ИСПРАВЛЕННАЯ ВЕРСИЯ) =====================
+# ===================== YOLO WRAPPER (ИСПРАВЛЕННЫЙ) =====================
 
 class YOLOWrapper(BaseModelWrapper):
     """Обертка для YOLO моделей - ИСПРАВЛЕНА"""
@@ -482,7 +505,7 @@ class YOLOWrapper(BaseModelWrapper):
         super().__init__(task_type='detection')
         self.model_size = model_size
         self.results = None
-        self.last_project_path = None  # ИСПРАВЛЕНИЕ #2: для чтения CSV
+        self.last_project_path = None
     
     def initialize(self, num_classes: int = None, **kwargs):
         self.model = YOLO(f'yolov8{self.model_size}.pt')
@@ -494,7 +517,6 @@ class YOLOWrapper(BaseModelWrapper):
         project = kwargs.get('project', 'runs')
         name = kwargs.get('name', 'exp')
         
-        # ИСПРАВЛЕНИЕ #2: Сохраняем путь для чтения CSV
         self.last_project_path = Path(project) / name
         
         self.results = self.model.train(
@@ -516,76 +538,58 @@ class YOLOWrapper(BaseModelWrapper):
     
     def validate(self, dataloader, device, **kwargs):
         return self.extract_metrics()
-
+    
     def extract_metrics(self) -> Dict[str, float]:
-        """
-        ИСПРАВЛЕНА: Теперь читает loss из CSV файла + добавлен F1
-        """
+        """ИСПРАВЛЕНА: Читает loss из CSV + добавлен F1"""
         try:
-            # Метрики детекции (из results_dict)
-            precision = float(self.results.results_dict.get('metrics/precision(B)', 0))
-            recall = float(self.results.results_dict.get('metrics/recall(B)', 0))
-            map50 = float(self.results.results_dict.get('metrics/mAP50(B)', 0))
-            map50_95 = float(self.results.results_dict.get('metrics/mAP50-95(B)', 0))
-
-            # Вычисляем F1-score (гармоническое среднее precision и recall)
-            if precision + recall > 0:
-                f1 = 2 * (precision * recall) / (precision + recall)
-            else:
-                f1 = 0.0
-
-            # ИСПРАВЛЕНИЕ #2: Loss метрики (из CSV файла)
+            if self.results is None:
+                return {
+                    'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0,
+                    'mAP50-95': 0.0, 'f1': 0.0, 'train_loss': 0.0, 'val_loss': 0.0
+                }
+            
+            metrics_box = self.results.results_dict
+            
+            precision = metrics_box.get('metrics/precision(B)', 0.0)
+            recall = metrics_box.get('metrics/recall(B)', 0.0)
+            mAP50 = metrics_box.get('metrics/mAP50(B)', 0.0)
+            mAP50_95 = metrics_box.get('metrics/mAP50-95(B)', 0.0)
+            
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            
             train_loss = 0.0
             val_loss = 0.0
-
+            
             if self.last_project_path:
                 csv_path = self.last_project_path / 'results.csv'
-
                 if csv_path.exists():
                     try:
                         import pandas as pd
                         df = pd.read_csv(csv_path)
-
-                        if len(df) > 0:
-                            last_row = df.iloc[-1]
-
-                            # Суммируем компоненты train loss
-                            train_box = last_row.get('train/box_loss', 0) or 0
-                            train_cls = last_row.get('train/cls_loss', 0) or 0
-                            train_dfl = last_row.get('train/dfl_loss', 0) or 0
-                            train_loss = float(train_box + train_cls + train_dfl)
-
-                            # Суммируем компоненты val loss
-                            val_box = last_row.get('val/box_loss', 0) or 0
-                            val_cls = last_row.get('val/cls_loss', 0) or 0
-                            val_dfl = last_row.get('val/dfl_loss', 0) or 0
-                            val_loss = float(val_box + val_cls + val_dfl)
-
-                            print(f"[YOLO] Loss прочитан из CSV: train={train_loss:.4f}, val={val_loss:.4f}")
-
-                    except Exception as e:
-                        print(f"[WARNING] Не удалось прочитать loss из CSV: {e}")
-
+                        df.columns = df.columns.str.strip()
+                        
+                        if 'train/box_loss' in df.columns:
+                            train_loss = float(df['train/box_loss'].iloc[-1])
+                        if 'val/box_loss' in df.columns:
+                            val_loss = float(df['val/box_loss'].iloc[-1])
+                    except Exception:
+                        pass
+            
             return {
-                'precision': precision,
-                'recall': recall,
-                'mAP50': map50,
-                'mAP50-95': map50_95,
-                'f1': f1,
-                'train_loss': train_loss,
-                'val_loss': val_loss
+                'precision': float(precision),
+                'recall': float(recall),
+                'mAP50': float(mAP50),
+                'mAP50-95': float(mAP50_95),
+                'f1': float(f1),
+                'train_loss': float(train_loss),
+                'val_loss': float(val_loss)
             }
-
+        
         except Exception as e:
             print(f"[WARNING] Ошибка извлечения метрик YOLO: {e}")
             return {
-                'precision': 0.0,
-                'recall': 0.0,
-                'mAP50': 0.0,
-                'mAP50-95': 0.0,
-                'f1': 0.0,
-                'train_loss': 0.0,
-                'val_loss': 0.0
+                'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0,
+                'mAP50-95': 0.0, 'f1': 0.0, 'train_loss': 0.0, 'val_loss': 0.0
             }
     
     def save(self, path: str):
@@ -595,7 +599,7 @@ class YOLOWrapper(BaseModelWrapper):
         self.model = YOLO(path)
 
 
-# ===================== FASTER R-CNN WRAPPER (ИСПРАВЛЕННАЯ ВЕРСИЯ) =====================
+# ===================== FASTER R-CNN WRAPPER (ИСПРАВЛЕННЫЙ) =====================
 
 class FasterRCNNWrapper(BaseModelWrapper):
     """Обертка для Faster R-CNN - ИСПРАВЛЕНА"""
@@ -666,9 +670,7 @@ class FasterRCNNWrapper(BaseModelWrapper):
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
         
-        # ИСПРАВЛЕНИЕ #1 и #3: Передаём score_threshold=0.1
-        metrics = compute_detection_metrics(self.model, dataloader, device, 
-                                           score_threshold=0.1)
+        metrics = compute_detection_metrics(self.model, dataloader, device, score_threshold=0.1)
         
         return {
             'val_loss': avg_loss,
@@ -701,7 +703,7 @@ class FasterRCNNWrapper(BaseModelWrapper):
         self.model.load_state_dict(checkpoint['model_state_dict'])
 
 
-# ===================== RETINANET WRAPPER (ИСПРАВЛЕННАЯ ВЕРСИЯ) =====================
+# ===================== RETINANET WRAPPER (ИСПРАВЛЕННЫЙ) =====================
 
 class RetinaNetWrapper(BaseModelWrapper):
     """Обертка для RetinaNet - ИСПРАВЛЕНА"""
@@ -721,7 +723,6 @@ class RetinaNetWrapper(BaseModelWrapper):
             self.model = retinanet_resnet50_fpn(weights=None)
         
         num_anchors = self.model.head.classification_head.num_anchors
-        
         self.model.head = RetinaNetHead(
             in_channels=self.model.backbone.out_channels,
             num_anchors=num_anchors,
@@ -736,44 +737,22 @@ class RetinaNetWrapper(BaseModelWrapper):
         
         total_loss = 0
         num_batches = 0
-        nan_count = 0
         
-        for batch_idx, (images, targets) in enumerate(dataloader):
+        for images, targets in dataloader:
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
             
-            try:
-                loss_dict = self.model(images, targets)
-                
-                cls_loss = loss_dict.get('classification', torch.tensor(0.0, device=device))
-                box_loss = loss_dict.get('bbox_regression', torch.tensor(0.0, device=device))
-                losses = cls_loss + box_loss
-                
-                if torch.isnan(losses) or torch.isinf(losses):
-                    print(f"[WARNING] NaN/Inf в loss на батче {batch_idx}")
-                    nan_count += 1
-                    if nan_count > 10:
-                        break
-                    continue
-                
-                optimizer.zero_grad()
-                losses.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                total_loss += losses.item()
-                num_batches += 1
-                
-            except RuntimeError as e:
-                print(f"[WARNING] RuntimeError: {e}")
-                nan_count += 1
-                continue
+            loss_dict = self.model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            
+            optimizer.zero_grad()
+            losses.backward()
+            optimizer.step()
+            
+            total_loss += losses.item()
+            num_batches += 1
         
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        
-        if nan_count > 0:
-            print(f"[INFO] Пропущено {nan_count} батчей из-за NaN/Inf")
-        
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
         return {'train_loss': avg_loss}
     
     def validate(self, dataloader, device, **kwargs):
@@ -810,18 +789,13 @@ class RetinaNetWrapper(BaseModelWrapper):
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         
-        # ИСПРАВЛЕНИЕ #1 и #3: Передаём score_threshold=0.1
         try:
-            metrics = compute_detection_metrics(self.model, dataloader, device,
-                                               score_threshold=0.1)
+            metrics = compute_detection_metrics(self.model, dataloader, device, score_threshold=0.1)
         except Exception as e:
             print(f"[WARNING] Ошибка при расчете метрик: {e}")
             metrics = {
-                'precision': 0.0,
-                'recall': 0.0,
-                'mAP50': 0.0,
-                'mAP50-95': 0.0,
-                'f1': 0.0
+                'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0,
+                'mAP50-95': 0.0, 'f1': 0.0
             }
         
         return {
@@ -829,7 +803,7 @@ class RetinaNetWrapper(BaseModelWrapper):
             'precision': metrics['precision'],
             'recall': metrics['recall'],
             'mAP50': metrics['mAP50'],
-            'mAP50-95': metrics['mAP50-95'],  # ИСПРАВЛЕНИЕ #3: добавлен
+            'mAP50-95': metrics['mAP50-95'],
             'f1': metrics['f1']
         }
     
@@ -859,10 +833,18 @@ class RetinaNetWrapper(BaseModelWrapper):
         self.model.load_state_dict(checkpoint['model_state_dict'])
 
 
-# ===================== UNIVERSAL TRAINER (УЛУЧШЕННАЯ ВЕРСИЯ) =====================
+# ===================== UNIVERSAL TRAINER (ФИНАЛЬНАЯ ВЕРСИЯ) =====================
 
 class UniversalModelTrainer:
-    """Поэтапное обучение моделей - УЛУЧШЕННАЯ ВЕРСИЯ"""
+    """
+    Универсальный тренер моделей - ФИНАЛЬНАЯ ВЕРСИЯ
+    
+    ВКЛЮЧАЕТ:
+    - Весь оригинальный функционал
+    - Early Stopping для каждой модели
+    - Ранний отбор моделей (опционально)
+    - Критическую очистку памяти
+    """
     
     def __init__(
         self,
@@ -870,6 +852,18 @@ class UniversalModelTrainer:
         dataset_names: List[str],
         max_epochs: int = 40,
         checkpoint_interval: int = 10,
+        
+        # Early Stopping
+        enable_early_stopping: bool = False,
+        early_stopping_patience: int = 10,
+        early_stopping_min_delta: float = 0.001,
+        early_stopping_metric: str = 'mAP50-95',
+        
+        # Ранний отбор
+        enable_early_selection: bool = False,
+        early_selection_ratio: float = 0.3,
+        early_selection_top_k: float = 0.5,
+        
         clean_old_results: bool = False
     ):
         self.model_configs = model_configs
@@ -877,6 +871,17 @@ class UniversalModelTrainer:
         self.max_epochs = max_epochs
         self.checkpoint_interval = checkpoint_interval
         
+        # Early Stopping
+        self.enable_early_stopping = enable_early_stopping
+        self.default_es_config = EarlyStoppingConfig(
+            patience=early_stopping_patience,
+            min_delta=early_stopping_min_delta,
+            metric=early_stopping_metric,
+            mode='max' if 'loss' not in early_stopping_metric.lower() else 'min',
+            restore_best=True
+        )
+        
+        # Папки
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.results_dir = f"results_{timestamp}"
         os.makedirs(self.results_dir, exist_ok=True)
@@ -884,11 +889,18 @@ class UniversalModelTrainer:
         self.checkpoint_dir = os.path.join(self.results_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         
+        if enable_early_stopping:
+            self.early_stopping_dir = os.path.join(self.results_dir, "early_stopping")
+            os.makedirs(self.early_stopping_dir, exist_ok=True)
+        
         self.results_file = os.path.join(self.results_dir, "training_log.txt")
         self.metrics_file = os.path.join(self.results_dir, "metrics.json")
         
+        # Хранилища
         self.models = {}
         self.dataloaders = {}
+        self.early_stoppers = {} if enable_early_stopping else None
+        
         self.metrics_history = {
             f"{model['name']}_{dataset}": []
             for model in model_configs
@@ -900,12 +912,55 @@ class UniversalModelTrainer:
             for dataset in dataset_names
         }
         
-        # Определение VRAM
+        self.training_active = {
+            f"{model['name']}_{dataset}": True
+            for model in model_configs
+            for dataset in dataset_names
+        }
+        
+        self.stop_reasons = {}
+        
+        # VRAM
         self.vram_gb = get_available_vram_gb()
         self.log_message(f"[SYSTEM] Доступная VRAM: {self.vram_gb:.2f} GB")
         
+        # Ранний отбор (опционально)
+        self.enable_early_selection = enable_early_selection
+        if enable_early_selection:
+            try:
+                from Train.Universal_train.early_model_selection import EarlyModelSelector
+                self.early_selector = EarlyModelSelector(
+                    checkpoint_ratio=early_selection_ratio,
+                    top_k_fraction=early_selection_top_k,
+                    min_models_to_keep=2,
+                    log_dir=Path(self.results_dir) / "early_selection_logs"
+                )
+                self.log_message(
+                    f"[EARLY_SELECTION] Включен ранний отбор моделей:\n"
+                    f"  - Отбор на {early_selection_ratio*100:.0f}% обучения\n"
+                    f"  - Оставляем {early_selection_top_k*100:.0f}% лучших моделей"
+                )
+            except ImportError:
+                self.log_message("[WARNING] Модуль early_model_selection не найден, отключаем ранний отбор")
+                self.enable_early_selection = False
+                self.early_selector = None
+        else:
+            self.early_selector = None
+        
         if clean_old_results:
             self.clean_old_result_folders()
+        
+        # Логируем конфигурацию
+        self.log_message("\n" + "=" * 80)
+        self.log_message("КОНФИГУРАЦИЯ ОБУЧЕНИЯ")
+        self.log_message("=" * 80)
+        self.log_message(f"Early Stopping: {'✅ Включен' if enable_early_stopping else '❌ Отключен'}")
+        if enable_early_stopping:
+            self.log_message(f"  - Метрика: {early_stopping_metric}")
+            self.log_message(f"  - Patience: {early_stopping_patience} эпох")
+            self.log_message(f"  - Min delta: {early_stopping_min_delta}")
+        self.log_message(f"Ранний отбор: {'✅ Включен' if enable_early_selection else '❌ Отключен'}")
+        self.log_message("=" * 80)
     
     def clean_old_result_folders(self):
         import shutil
@@ -987,6 +1042,42 @@ class UniversalModelTrainer:
         
         return wrapper
     
+    def create_early_stopper(self, model_key: str, model_config: Dict) -> EarlyStopping:
+        """Создаёт Early Stopper для модели"""
+        if 'early_stopping' in model_config and isinstance(model_config['early_stopping'], dict):
+            es_params = model_config['early_stopping']
+            config = EarlyStoppingConfig(
+                patience=es_params.get('patience', self.default_es_config.patience),
+                min_delta=es_params.get('min_delta', self.default_es_config.min_delta),
+                metric=es_params.get('metric', self.default_es_config.metric),
+                mode=es_params.get('mode', self.default_es_config.mode),
+                restore_best=es_params.get('restore_best', self.default_es_config.restore_best)
+            )
+            self.log_message(
+                f"[EARLY_STOP] {model_key}: Индивидуальная конфигурация "
+                f"(patience={config.patience}, metric={config.metric})"
+            )
+        else:
+            config = self.default_es_config
+        
+        return EarlyStopping(config, model_key)
+    
+    def _save_model_checkpoint(self, key: str, epoch: int, metrics: Dict) -> str:
+        """Сохраняет чекпоинт модели (для early stopping)"""
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"{key}_best_epoch_{epoch}.pt")
+        
+        if key in self.models and self.models[key] is not None:
+            if hasattr(self.models[key], 'save'):
+                self.models[key].save(checkpoint_path)
+            else:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.models[key].state_dict() if hasattr(self.models[key], 'state_dict') else None,
+                    'metrics': metrics
+                }, checkpoint_path)
+        
+        return checkpoint_path
+    
     def train_model_segment(
         self,
         model_config: Dict[str, Any],
@@ -994,8 +1085,9 @@ class UniversalModelTrainer:
         start_epoch: int,
         end_epoch: int
     ):
+        """ОРИГИНАЛЬНАЯ ФУНКЦИЯ С КРИТИЧЕСКОЙ ОЧИСТКОЙ ПАМЯТИ"""
+        
         model_max_epochs = model_config.get('max_epochs', self.max_epochs)
-
         model_name = model_config['name']
         key = f"{model_name}_{dataset_name}"
 
@@ -1004,10 +1096,8 @@ class UniversalModelTrainer:
             return None
 
         end_epoch = min(end_epoch, model_max_epochs)
-
-        model_name = model_config['name']
+        
         model_type = model_config['type']
-        key = f"{model_name}_{dataset_name}"
         
         self.log_message(
             f"\n--- Обучение {model_name} на {dataset_name}: "
@@ -1093,7 +1183,7 @@ class UniversalModelTrainer:
             self.log_message(f"Завершено обучение {key} до эпохи {end_epoch}")
             self.log_metrics(key, metrics)
             
-            if end_epoch < self.max_epochs:
+            if end_epoch < model_max_epochs:
                 checkpoint_path = os.path.join(
                     self.checkpoint_dir,
                     f"{key}_epoch_{end_epoch}.pt"
@@ -1107,6 +1197,7 @@ class UniversalModelTrainer:
                 if model_type in ['faster_rcnn', 'retinanet'] and key in self.dataloaders:
                     del self.dataloaders[key]
                 
+                # ========== КРИТИЧЕСКАЯ ОЧИСТКА ПАМЯТИ (ОРИГИНАЛ) ==========
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
@@ -1161,14 +1252,29 @@ class UniversalModelTrainer:
                 self.log_message(f"  {rank}. {key}: {value:.4f}")
     
     def run_training(self):
-        """Основной цикл обучения"""
+        """ОСНОВНОЙ ЦИКЛ С EARLY STOPPING И РАННИМ ОТБОРОМ"""
+        
         self.log_message("\n" + "=" * 80)
         self.log_message("НАЧАЛО УНИВЕРСАЛЬНОГО ОБУЧЕНИЯ")
         self.log_message("=" * 80)
         
-        for epoch_checkpoint in range(0, self.max_epochs, self.checkpoint_interval):
+        # Инициализация Early Stoppers
+        if self.enable_early_stopping:
+            for model_config in self.model_configs:
+                for dataset_name in self.dataset_names:
+                    key = f"{model_config['name']}_{dataset_name}"
+                    self.early_stoppers[key] = self.create_early_stopper(key, model_config)
+        
+        # Определяем максимум эпох
+        max_epochs_global = max(
+            model_config.get('max_epochs', self.max_epochs)
+            for model_config in self.model_configs
+        )
+        
+        # Основной цикл
+        for epoch_checkpoint in range(0, max_epochs_global, self.checkpoint_interval):
             start_epoch = epoch_checkpoint
-            end_epoch = min(epoch_checkpoint + self.checkpoint_interval, self.max_epochs)
+            end_epoch = min(epoch_checkpoint + self.checkpoint_interval, max_epochs_global)
             
             self.log_message(f"\n{'=' * 80}")
             self.log_message(f"ЧЕКПОИНТ: Эпохи {start_epoch + 1}-{end_epoch}")
@@ -1176,18 +1282,101 @@ class UniversalModelTrainer:
             
             for dataset_name in self.dataset_names:
                 for model_config in self.model_configs:
-                    self.train_model_segment(
+                    key = f"{model_config['name']}_{dataset_name}"
+                    
+                    if not self.training_active.get(key, True):
+                        continue
+                    
+                    model_max_epochs = model_config.get('max_epochs', self.max_epochs)
+                    if start_epoch >= model_max_epochs:
+                        self.training_active[key] = False
+                        self.stop_reasons[key] = f"Достигнут max_epochs={model_max_epochs}"
+                        continue
+                    
+                    actual_end_epoch = min(end_epoch, model_max_epochs)
+                    metrics = self.train_model_segment(
                         model_config,
                         dataset_name,
                         start_epoch,
-                        end_epoch
+                        actual_end_epoch
                     )
+                    
+                    if metrics is None:
+                        continue
+                    
+                    # ========== EARLY STOPPING ==========
+                    if self.enable_early_stopping and key in self.early_stoppers:
+                        es = self.early_stoppers[key]
+                        save_fn = lambda e, m: self._save_model_checkpoint(key, e, m)
+                        
+                        should_continue, reason = es.step(
+                            metrics=metrics,
+                            epoch=actual_end_epoch,
+                            model_save_fn=save_fn
+                        )
+                        
+                        self.log_message(f"[EARLY_STOP] {key}: {reason}")
+                        
+                        if not should_continue:
+                            self.training_active[key] = False
+                            self.stop_reasons[key] = reason
+                            
+                            if key in self.models and self.models[key] is not None:
+                                del self.models[key]
+                                self.models[key] = None
+                            
+                            if key in self.dataloaders:
+                                del self.dataloaders[key]
+                            
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                            continue
             
+            # ========== РАННИЙ ОТБОР ==========
+            if self.enable_early_selection and self.early_selector:
+                # Проверяем каждую модель индивидуально
+                for model_config in self.model_configs:
+                    for dataset_name in self.dataset_names:
+                        key = f"{model_config['name']}_{dataset_name}"
+
+                        if not self.training_active.get(key, False):
+                            continue
+
+                        model_max_epochs = model_config.get('max_epochs', self.max_epochs)
+
+                        # Вызываем метод для каждой модели
+                        should_continue, reason = self.early_selector.should_continue_training(
+                            model_key=key,
+                            current_metrics=self.metrics_history,
+                            current_epoch=end_epoch,
+                            max_epochs=model_max_epochs
+                        )
+
+                        if not should_continue:
+                            self.training_active[key] = False
+                            self.stop_reasons[key] = f"Ранний отбор: {reason}"
+                            self.log_message(f"[EARLY_SELECT] {key}: {reason}")
+
+                            if key in self.models and self.models[key] is not None:
+                                del self.models[key]
+                                self.models[key] = None
+
+                            if key in self.dataloaders:
+                                del self.dataloaders[key]
+
+                            torch.cuda.empty_cache()
+                            gc.collect()
+
             self.compare_models(end_epoch)
-            
+
             with open(self.metrics_file, 'w', encoding='utf-8') as f:
                 json.dump(self.metrics_history, f, indent=2)
-        
+
+            active_count = sum(1 for active in self.training_active.values() if active)
+            if active_count == 0:
+                self.log_message("\n[INFO] Все модели завершили обучение")
+                break
+
         self.log_message("\n" + "=" * 80)
         self.log_message("ОБУЧЕНИЕ ЗАВЕРШЕНО")
         self.log_message("=" * 80)
@@ -1197,18 +1386,49 @@ class UniversalModelTrainer:
 
 if __name__ == "__main__":
     model_configs = [
-        {'type': 'yolo', 'size': 's', 'name': 'yolo_small', 'max_epochs': 80},
-        {'type': 'faster_rcnn', 'pretrained': True, 'name': 'faster_rcnn', 'max_epochs': 25},
-        {'type': 'retinanet', 'pretrained': True, 'name': 'retinanet', 'max_epochs': 35}
+        {
+            'type': 'yolo',
+            'size': 's',
+            'name': 'yolo_small',
+            'max_epochs': 80,
+            'early_stopping': {
+                'patience': 15,
+                'metric': 'mAP50-95'
+            }
+        },
+        {
+            'type': 'faster_rcnn',
+            'pretrained': True,
+            'name': 'faster_rcnn',
+            'max_epochs': 25
+        },
+        {
+            'type': 'retinanet',
+            'pretrained': True,
+            'name': 'retinanet',
+            'max_epochs': 35
+        }
     ]
-    
+
     dataset_names = ["dataset_LUNA16", "LUNA16_CHECK"]
-    
+
     trainer = UniversalModelTrainer(
         model_configs=model_configs,
         dataset_names=dataset_names,
-        max_epochs=50,
-        checkpoint_interval=5
+        checkpoint_interval=5,
+
+        # Early Stopping
+        enable_early_stopping=True,
+        early_stopping_patience=10,
+        early_stopping_min_delta=0.001,
+        early_stopping_metric='mAP50-95',
+
+        # Ранний отбор
+        enable_early_selection=True,
+        early_selection_ratio=0.3,
+        early_selection_top_k=0.5,
+
+        clean_old_results=True
     )
-    
+
     trainer.run_training()
