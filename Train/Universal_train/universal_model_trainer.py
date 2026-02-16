@@ -431,6 +431,7 @@ def compute_detection_metrics(model, dataloader, device,
     print(f"[METRICS] TP={final_tp}, FP={final_fp}, FN={final_fn}")
     print(f"[METRICS] Precision: {final_precision:.4f}, Recall: {final_recall:.4f}")
     print(f"[METRICS] mAP50: {mAP50:.4f}, mAP50-95: {mAP50_95:.4f}")
+    print(f"[METRICS] f1: {f1:.4f}")
     
     return {
         'precision': float(final_precision),
@@ -477,7 +478,7 @@ class BaseModelWrapper(ABC):
 class YOLOWrapper(BaseModelWrapper):
     """Обертка для YOLO моделей - ИСПРАВЛЕНА"""
     
-    def __init__(self, model_size: str = 'n'):
+    def __init__(self, model_size: str = 'm'):
         super().__init__(task_type='detection')
         self.model_size = model_size
         self.results = None
@@ -500,7 +501,7 @@ class YOLOWrapper(BaseModelWrapper):
             data=str(yaml_path),
             epochs=epochs,
             imgsz=kwargs.get('imgsz', 640),
-            batch=kwargs.get('batch', 16),
+            batch=kwargs.get('batch', -1),
             device=device,
             save=False,
             project=project,
@@ -515,10 +516,10 @@ class YOLOWrapper(BaseModelWrapper):
     
     def validate(self, dataloader, device, **kwargs):
         return self.extract_metrics()
-    
+
     def extract_metrics(self) -> Dict[str, float]:
         """
-        ИСПРАВЛЕНА: Теперь читает loss из CSV файла
+        ИСПРАВЛЕНА: Теперь читает loss из CSV файла + добавлен F1
         """
         try:
             # Метрики детекции (из results_dict)
@@ -526,48 +527,55 @@ class YOLOWrapper(BaseModelWrapper):
             recall = float(self.results.results_dict.get('metrics/recall(B)', 0))
             map50 = float(self.results.results_dict.get('metrics/mAP50(B)', 0))
             map50_95 = float(self.results.results_dict.get('metrics/mAP50-95(B)', 0))
-            
+
+            # Вычисляем F1-score (гармоническое среднее precision и recall)
+            if precision + recall > 0:
+                f1 = 2 * (precision * recall) / (precision + recall)
+            else:
+                f1 = 0.0
+
             # ИСПРАВЛЕНИЕ #2: Loss метрики (из CSV файла)
             train_loss = 0.0
             val_loss = 0.0
-            
+
             if self.last_project_path:
                 csv_path = self.last_project_path / 'results.csv'
-                
+
                 if csv_path.exists():
                     try:
                         import pandas as pd
                         df = pd.read_csv(csv_path)
-                        
+
                         if len(df) > 0:
                             last_row = df.iloc[-1]
-                            
+
                             # Суммируем компоненты train loss
                             train_box = last_row.get('train/box_loss', 0) or 0
                             train_cls = last_row.get('train/cls_loss', 0) or 0
                             train_dfl = last_row.get('train/dfl_loss', 0) or 0
                             train_loss = float(train_box + train_cls + train_dfl)
-                            
+
                             # Суммируем компоненты val loss
                             val_box = last_row.get('val/box_loss', 0) or 0
                             val_cls = last_row.get('val/cls_loss', 0) or 0
                             val_dfl = last_row.get('val/dfl_loss', 0) or 0
                             val_loss = float(val_box + val_cls + val_dfl)
-                            
+
                             print(f"[YOLO] Loss прочитан из CSV: train={train_loss:.4f}, val={val_loss:.4f}")
-                    
+
                     except Exception as e:
                         print(f"[WARNING] Не удалось прочитать loss из CSV: {e}")
-            
+
             return {
                 'precision': precision,
                 'recall': recall,
                 'mAP50': map50,
                 'mAP50-95': map50_95,
+                'f1': f1,
                 'train_loss': train_loss,
                 'val_loss': val_loss
             }
-            
+
         except Exception as e:
             print(f"[WARNING] Ошибка извлечения метрик YOLO: {e}")
             return {
@@ -575,6 +583,7 @@ class YOLOWrapper(BaseModelWrapper):
                 'recall': 0.0,
                 'mAP50': 0.0,
                 'mAP50-95': 0.0,
+                'f1': 0.0,
                 'train_loss': 0.0,
                 'val_loss': 0.0
             }
@@ -666,7 +675,7 @@ class FasterRCNNWrapper(BaseModelWrapper):
             'precision': metrics['precision'],
             'recall': metrics['recall'],
             'mAP50': metrics['mAP50'],
-            'mAP50-95': metrics['mAP50-95'],  # ИСПРАВЛЕНИЕ #3: добавлен
+            'mAP50-95': metrics['mAP50-95'],
             'f1': metrics['f1']
         }
     
@@ -985,6 +994,17 @@ class UniversalModelTrainer:
         start_epoch: int,
         end_epoch: int
     ):
+        model_max_epochs = model_config.get('max_epochs', self.max_epochs)
+
+        model_name = model_config['name']
+        key = f"{model_name}_{dataset_name}"
+
+        if start_epoch >= model_max_epochs:
+            self.log_message(f"\n--- {key}: достигнут max_epochs={model_max_epochs}, пропуск ---")
+            return None
+
+        end_epoch = min(end_epoch, model_max_epochs)
+
         model_name = model_config['name']
         model_type = model_config['type']
         key = f"{model_name}_{dataset_name}"
@@ -1057,7 +1077,7 @@ class UniversalModelTrainer:
                     val_metrics = self.models[key].validate(val_loader, device)
                     
                     self.log_message(
-                        f"    Train Loss: {train_metrics['train_loss']:.4f}, "
+                        f"Train Loss: {train_metrics['train_loss']:.4f}, "
                         f"Val Loss: {val_metrics['val_loss']:.4f}"
                     )
                     
@@ -1177,9 +1197,9 @@ class UniversalModelTrainer:
 
 if __name__ == "__main__":
     model_configs = [
-        {'type': 'yolo', 'size': 's', 'name': 'yolo_small'},
-        {'type': 'faster_rcnn', 'pretrained': True, 'name': 'faster_rcnn'},
-        {'type': 'retinanet', 'pretrained': True, 'name': 'retinanet'}
+        {'type': 'yolo', 'size': 's', 'name': 'yolo_small', 'max_epochs': 80},
+        {'type': 'faster_rcnn', 'pretrained': True, 'name': 'faster_rcnn', 'max_epochs': 25},
+        {'type': 'retinanet', 'pretrained': True, 'name': 'retinanet', 'max_epochs': 35}
     ]
     
     dataset_names = ["dataset_LUNA16", "LUNA16_CHECK"]
@@ -1187,8 +1207,8 @@ if __name__ == "__main__":
     trainer = UniversalModelTrainer(
         model_configs=model_configs,
         dataset_names=dataset_names,
-        max_epochs=4,
-        checkpoint_interval=2
+        max_epochs=50,
+        checkpoint_interval=5
     )
     
     trainer.run_training()
