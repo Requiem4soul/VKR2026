@@ -1,37 +1,48 @@
 """
 Применение предобработки с автоматическим определением типа датасета
 
-КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ (v2.0):
-- Автоматическая классификация типа датасета
-- Вывод правил предобработки для типа
-- Блокировка опасных методов
+ИЗМЕНЕНИЯ (v3.0 — Intensity Variants):
+    После подбора идеальной стратегии (методы + параметры под тип датасета)
+    добавлен интерактивный выбор вариантов интенсивности: слабый / базовый / сильный.
+
+    Научное обоснование:
+    Montaha et al. (2022, Front. Med., doi: 10.3389/fmed.2022.924979)
+    "MNet-10: A robust shallow CNN performing ablation study on medical images"
+    Авторы показали на 8 датасетах, что оптимальный уровень интенсивности
+    предобработки нельзя определить теоретически — он выявляется эмпирически
+    через сравнение метрик обученной модели. На части датасетов оригинальные
+    данные превосходили обработанные, что прямо мотивирует проверку нескольких
+    вариантов интенсивности.
+
+    Старое поведение (v2.0) полностью сохранено: если пользователь выбирает
+    только базовый вариант — создаётся ровно один датасет, как и раньше.
 
 Автор: Система адаптивной предобработки
 Дата: 2025
 """
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 from Data.Datasets.dataset_work import get_dataset_path, list_available_datasets
 from Utils.image_analyzer import UniversalImageAnalyzer
 from Utils.modality_classifier import ImageModalityClassifier
 from Utils.preprocessing_rules import PreprocessingRules
 from Utils.preprocessing_selector import AdaptivePreprocessingSelector
+from Utils.intensity_variants import generate_intensity_variants, print_variants_comparison
 from Preprocessing.applicator import DatasetPreprocessor
 
 
 def apply_preprocessing_with_modality_detection():
     """
-    Полный цикл применения предобработки с учётом типа датасета
-    
-    НОВОЕ в v2.0:
-    1. Определяет тип датасета (SAR/Medical/Natural/Infrared/Microscopy)
-    2. Показывает правила для этого типа
-    3. Блокирует неподходящие методы
-    4. Применяет предобработку с адаптированными параметрами
+    Полный цикл применения предобработки с учётом типа датасета.
+
+    НОВОЕ в v3.0:
+    После Шага 7 (название датасета) добавлен Шаг 7.5 — интерактивный
+    выбор вариантов интенсивности. Позволяет создать 1–3 датасета
+    (слабый / базовый / сильный) за один запуск.
     """
-    
+
     print("=" * 80)
     print("ПРИМЕНЕНИЕ ПРЕДОБРАБОТКИ С ОПРЕДЕЛЕНИЕМ ТИПА ДАТАСЕТА")
     print("=" * 80)
@@ -67,14 +78,13 @@ def apply_preprocessing_with_modality_detection():
     print(f"{'='*80}")
 
     analyzer = UniversalImageAnalyzer(verbose=False)
-    
+
     print("\n⏳ Анализирую изображения...")
     dataset_metrics, image_metrics = analyzer.analyze_dataset(
-        dataset_path, 
+        dataset_path,
         split='train'
     )
 
-    # Краткий отчёт
     print(f"\n📊 Базовые метрики:")
     print(f"   Изображений: {dataset_metrics.num_images}")
     print(f"   SNR: {dataset_metrics.avg_snr:.2f} dB")
@@ -83,7 +93,7 @@ def apply_preprocessing_with_modality_detection():
     print(f"   Резкость: {dataset_metrics.avg_sharpness:.0f}")
 
     # ========================================================================
-    # ШАГ 3: КЛАССИФИКАЦИЯ ТИПА ДАТАСЕТА 🔥 НОВОЕ!
+    # ШАГ 3: КЛАССИФИКАЦИЯ ТИПА ДАТАСЕТА
     # ========================================================================
     print(f"\n{'='*80}")
     print(f"ШАГ 3: КЛАССИФИКАЦИЯ ТИПА ДАТАСЕТА")
@@ -91,35 +101,30 @@ def apply_preprocessing_with_modality_detection():
 
     classifier = ImageModalityClassifier()
     modality_info = classifier.classify(dataset_metrics)
-    
-    # Красиво показываем результат
     classifier.print_classification_report(modality_info)
 
     # ========================================================================
-    # ШАГ 4: ПРАВИЛА ПРЕДОБРАБОТКИ ДЛЯ ТИПА 🔥 НОВОЕ!
+    # ШАГ 4: ПРАВИЛА ПРЕДОБРАБОТКИ ДЛЯ ТИПА
     # ========================================================================
     print(f"\n{'='*80}")
     print(f"ШАГ 4: ПРАВИЛА ПРЕДОБРАБОТКИ ДЛЯ ТИПА '{modality_info['modality'].upper()}'")
     print(f"{'='*80}")
-    
+
     PreprocessingRules.print_rules_summary(modality_info['modality'])
 
     # ========================================================================
-    # ШАГ 5: ВЫБОР СТРАТЕГИИ С УЧЁТОМ ТИПА 🔥 ИЗМЕНЕНО!
+    # ШАГ 5: ВЫБОР СТРАТЕГИИ С УЧЁТОМ ТИПА
     # ========================================================================
     print(f"\n{'='*80}")
     print(f"ШАГ 5: ВЫБОР СТРАТЕГИИ ПРЕДОБРАБОТКИ")
     print(f"{'='*80}")
 
-    # Создаём селектор С ИНФОРМАЦИЕЙ О ТИПЕ
     selector = AdaptivePreprocessingSelector(
         analyzer=analyzer,
-        modality_info=modality_info  # 🔥 Передаём тип!
+        modality_info=modality_info
     )
-    
+
     strategy = selector.select_strategy(dataset_path, split='train')
-    
-    # Красиво показываем стратегию
     selector.print_strategy_info(strategy)
 
     # ========================================================================
@@ -133,15 +138,34 @@ def apply_preprocessing_with_modality_detection():
         return
 
     # ========================================================================
-    # ШАГ 7: НАЗВАНИЕ НОВОГО ДАТАСЕТА
+    # ШАГ 7: БАЗОВОЕ НАЗВАНИЕ НОВОГО ДАТАСЕТА
     # ========================================================================
     default_name = f"{dataset_name}_preprocessed_{modality_info['modality']}"
-    new_name = input(f"\nВведите название нового датасета [{default_name}]: ").strip()
-    if not new_name:
-        new_name = default_name
+    base_name = input(f"\nВведите базовое название нового датасета [{default_name}]: ").strip()
+    if not base_name:
+        base_name = default_name
 
     # ========================================================================
-    # ШАГ 8: ПРИМЕНЕНИЕ ПРЕДОБРАБОТКИ
+    # ШАГ 7.5: ВЫБОР ВАРИАНТОВ ИНТЕНСИВНОСТИ
+    # ========================================================================
+    selected_variants = _ask_intensity_variants()
+
+    base_params = _build_params_for_modality(modality_info, selector)
+    methods = strategy.get('methods', [])
+
+    variants_params = generate_intensity_variants(
+        base_params=base_params,
+        methods=methods,
+        variants=selected_variants
+    )
+
+    if len(selected_variants) > 1:
+        print_variants_comparison(variants_params, methods)
+
+    dataset_names = _ask_dataset_names(base_name, selected_variants)
+
+    # ========================================================================
+    # ШАГ 8: ПРИМЕНЕНИЕ ПРЕДОБРАБОТКИ ДЛЯ КАЖДОГО ВАРИАНТА
     # ========================================================================
     print(f"\n{'='*80}")
     print(f"ШАГ 8: ПРИМЕНЕНИЕ ПРЕДОБРАБОТКИ")
@@ -149,160 +173,236 @@ def apply_preprocessing_with_modality_detection():
 
     preprocessor = DatasetPreprocessor()
 
-    if strategy['strategy'] == 'adaptive':
-        print("\n⏳ Применяю адаптивную предобработку...")
-        
-        # Получаем параметры методов для типа датасета
-        params = _build_params_for_modality(modality_info, selector)
-        
-        preprocessor.apply_adaptive_preprocessing(
-            source_dataset=dataset_name,
-            target_dataset=new_name,
-            clusters=strategy['clusters'],
-            image_metrics=image_metrics,
-            params=params  # 🔥 Передаём адаптированные параметры
-        )
-    else:
-        print("\n⏳ Применяю глобальную предобработку...")
-        
-        # Получаем параметры методов для типа датасета
-        params = _build_params_for_modality(modality_info, selector)
-        
-        preprocessor.apply_global_preprocessing(
-            source_dataset=dataset_name,
-            target_dataset=new_name,
-            methods=strategy['methods'],
-            params=params  # 🔥 Передаём адаптированные параметры
-        )
+    for level in selected_variants:
+        new_name     = dataset_names[level]
+        level_params = variants_params[level]
+
+        print(f"\n{'─'*60}")
+        if len(selected_variants) > 1:
+            level_labels = {'weak': '🟡 СЛАБЫЙ', 'base': '🟢 БАЗОВЫЙ', 'strong': '🔴 СИЛЬНЫЙ'}
+            print(f"  Вариант: {level_labels.get(level, level.upper())}  →  {new_name}")
+        print(f"{'─'*60}")
+
+        if strategy['strategy'] == 'adaptive':
+            print("\n⏳ Применяю адаптивную предобработку...")
+            preprocessor.apply_adaptive_preprocessing(
+                source_dataset=dataset_name,
+                target_dataset=new_name,
+                clusters=strategy['clusters'],
+                image_metrics=image_metrics,
+                params=level_params
+            )
+        else:
+            print("\n⏳ Применяю глобальную предобработку...")
+            preprocessor.apply_global_preprocessing(
+                source_dataset=dataset_name,
+                target_dataset=new_name,
+                methods=methods,
+                params=level_params
+            )
 
     print(f"\n✅ Предобработка завершена!")
-    print(f"   Новый датасет: {new_name}")
     print(f"   Тип датасета: {modality_info['modality']}")
+    print(f"   Создано датасетов: {len(selected_variants)}")
+    for level in selected_variants:
+        print(f"      {level:6s} → {dataset_names[level]}")
 
     # ========================================================================
-    # ШАГ 9: АНАЛИЗ РЕЗУЛЬТАТА
+    # ШАГ 9: АНАЛИЗ РЕЗУЛЬТАТОВ (все созданные варианты)
     # ========================================================================
     print(f"\n{'='*80}")
-    print(f"ШАГ 9: АНАЛИЗ РЕЗУЛЬТАТА")
+    print(f"ШАГ 9: АНАЛИЗ РЕЗУЛЬТАТОВ")
     print(f"{'='*80}")
 
-    new_dataset_path = get_dataset_path(new_name)
-    
-    print("\n⏳ Анализирую предобработанный датасет...")
-    preprocessed_metrics, _ = analyzer.analyze_dataset(new_dataset_path, split='train')
+    all_preprocessed_metrics = {}
+
+    for level in selected_variants:
+        ds_name  = dataset_names[level]
+        ds_path  = get_dataset_path(ds_name)
+        lbl      = {'weak': '🟡 СЛАБЫЙ', 'base': '🟢 БАЗОВЫЙ', 'strong': '🔴 СИЛЬНЫЙ'}.get(level, level)
+        print(f"\n⏳ Анализирую {lbl} → '{ds_name}'...")
+        metrics, _ = analyzer.analyze_dataset(ds_path, split='train')
+        all_preprocessed_metrics[level] = metrics
 
     # ========================================================================
-    # ШАГ 10: СРАВНЕНИЕ
+    # ШАГ 10: СРАВНЕНИЕ ДО И ПОСЛЕ
     # ========================================================================
     print(f"\n{'='*80}")
     print(f"ШАГ 10: СРАВНЕНИЕ ДО И ПОСЛЕ")
     print(f"{'='*80}")
 
-    _print_comparison(dataset_metrics, preprocessed_metrics, modality_info)
+    _print_comparison_all(
+        original_metrics=dataset_metrics,
+        variants_metrics=all_preprocessed_metrics,
+        selected_variants=selected_variants,
+        modality_info=modality_info
+    )
+
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =============================================================================
+
+def _ask_intensity_variants() -> List[str]:
+    """
+    Спрашивает пользователя какие варианты интенсивности нужны.
+
+    Сначала спрашивает — нужны ли вообще дополнительные варианты (y/n).
+    Если нет — возвращает только ['base'].
+    Если да — спрашивает отдельно про слабый и сильный (y/n каждый).
+    Базовый включён всегда.
+    """
+    print(f"\n{'='*80}")
+    print(f"ШАГ 7.5: ВАРИАНТЫ ИНТЕНСИВНОСТИ ПРЕДОБРАБОТКИ")
+    print(f"{'='*80}")
+    print("""
+  Помимо базового варианта можно создать дополнительные с другой интенсивностью:
+    🟡 СЛАБЫЙ  (weak)   — параметры ×0.5 от базового
+    🟢 БАЗОВЫЙ (base)   — параметры как подобраны для типа датасета (всегда)
+    🔴 СИЛЬНЫЙ (strong) — параметры ×2.0 от базового
+
+  Это позволит эмпирически выбрать оптимальный вариант после обучения модели.
+  (Montaha et al., 2022: оптимум определяется только через сравнение на модели)
+    """)
+
+    ans = input("  Создать дополнительные варианты интенсивности? [y/n]: ").strip().lower()
+    if ans != 'y':
+        print("  → Будет создан только базовый вариант.")
+        return ['base']
+
+    selected = ['base']
+
+    ans_weak = input("\n  Создать 🟡 СЛАБЫЙ вариант (weak, ×0.5)? [y/n]: ").strip().lower()
+    if ans_weak == 'y':
+        selected.append('weak')
+
+    ans_strong = input("  Создать 🔴 СИЛЬНЫЙ вариант (strong, ×2.0)? [y/n]: ").strip().lower()
+    if ans_strong == 'y':
+        selected.append('strong')
+
+    ordered = [v for v in ['weak', 'base', 'strong'] if v in selected]
+    return ordered
+
+
+def _ask_dataset_names(base_name: str, variants: List[str]) -> Dict[str, str]:
+    """
+    Спрашивает имена датасетов для каждого варианта.
+    Если вариант один — имя без суффикса.
+    Если несколько — предлагает имена с суффиксами _weak / _base / _strong.
+    """
+    names = {}
+
+    if len(variants) == 1:
+        names[variants[0]] = base_name
+        return names
+
+    print(f"\n  Названия датасетов для каждого варианта.")
+    print(f"  (нажмите Enter, чтобы принять предложенное имя)\n")
+
+    for level in variants:
+        default = f"{base_name}_{level}"
+        ans = input(f"  [{level}] [{default}]: ").strip()
+        names[level] = ans if ans else default
+
+    return names
 
 
 def _build_params_for_modality(modality_info: Dict, selector: AdaptivePreprocessingSelector) -> Dict:
     """
-    Строит словарь параметров для методов на основе типа датасета
-    
-    Returns:
-        dict: {'denoise': {...}, 'contrast_enhancement': {...}, ...}
+    Строит словарь параметров для методов на основе типа датасета.
     """
     params = {}
-    
     methods = ['denoise', 'contrast_enhancement', 'brightness_correction', 'sharpening']
-    
     for method in methods:
         method_params = selector.get_method_params(method)
         if method_params:
             params[method] = method_params
-    
     return params
 
 
-def _print_comparison(
-    original_metrics, 
-    preprocessed_metrics, 
+def _print_comparison_all(
+    original_metrics,
+    variants_metrics: Dict,
+    selected_variants: List[str],
     modality_info: Dict
 ):
     """
-    Печатает сравнение метрик до и после предобработки
-    
-    Args:
-        original_metrics: Метрики оригинального датасета
-        preprocessed_metrics: Метрики предобработанного датасета
-        modality_info: Информация о типе датасета
+    Сравнение стандартных метрик оригинала с каждым вариантом предобработки.
+    Один блок на вариант. Только метрики из DatasetMetrics — без самописных.
+
+    Метрики:
+      - SNR (avg_snr, std_snr)          — стандартная метрика шума
+      - Контраст (avg_contrast,          — Michelson contrast
+                  std_contrast)          — вариативность контраста по изображениям
+      - Резкость (avg_sharpness)         — Laplacian variance
+      - blur_count                       — изображения ниже порога резкости
+      - Яркость (avg_brightness,
+                 std_brightness)
+      - noise_distribution['high']       — изображения с высоким шумом
     """
-    
-    print(f"\n📊 Сравнение метрик:")
-    print(f"   Тип датасета: {modality_info['modality'].upper()}")
-    print()
-    
-    # SNR
-    snr_before = original_metrics.avg_snr
-    snr_after = preprocessed_metrics.avg_snr
-    snr_change = snr_after - snr_before
-    
-    print(f"   SNR:")
-    print(f"      До:      {snr_before:6.2f} dB")
-    print(f"      После:   {snr_after:6.2f} dB")
-    print(f"      Изменение: {snr_change:+6.2f} dB {'✓' if snr_change > 0 else ''}")
-    
-    # Контраст
-    contrast_before = original_metrics.avg_contrast
-    contrast_after = preprocessed_metrics.avg_contrast
-    contrast_change = contrast_after - contrast_before
-    
-    print(f"\n   Контраст:")
-    print(f"      До:      {contrast_before:.4f}")
-    print(f"      После:   {contrast_after:.4f}")
-    print(f"      Изменение: {contrast_change:+.4f} {'✓' if contrast_change > 0 else ''}")
-    
-    # Яркость
-    brightness_before = original_metrics.avg_brightness
-    brightness_after = preprocessed_metrics.avg_brightness
-    brightness_change = brightness_after - brightness_before
-    
-    print(f"\n   Яркость:")
-    print(f"      До:      {brightness_before:.4f}")
-    print(f"      После:   {brightness_after:.4f}")
-    print(f"      Изменение: {brightness_change:+.4f}")
-    
-    # Однородность
-    if hasattr(original_metrics, 'homogeneity'):
-        homog_before = original_metrics.homogeneity
-        homog_after = preprocessed_metrics.homogeneity
-        homog_change = homog_after - homog_before
-        
-        print(f"\n   Однородность:")
-        print(f"      До:      {homog_before:.4f}")
-        print(f"      После:   {homog_after:.4f}")
-        print(f"      Изменение: {homog_change:+.4f} {'✓' if homog_change > 0 else ''}")
-    
-    # Проблемные изображения
-    if hasattr(original_metrics, 'noise_distribution'):
-        high_noise_before = original_metrics.noise_distribution.get('high', 0)
-        high_noise_after = preprocessed_metrics.noise_distribution.get('high', 0)
-        
-        print(f"\n   Изображения с высоким шумом:")
-        print(f"      До:      {high_noise_before}")
-        print(f"      После:   {high_noise_after}")
-        print(f"      Исправлено: {high_noise_before - high_noise_after} {'✓' if high_noise_after < high_noise_before else ''}")
-    
-    # Важное предупреждение для некоторых типов
-    if modality_info['modality'] in ['sar', 'medical_xray', 'microscopy']:
-        print(f"\n⚠️  ВАЖНО для типа '{modality_info['modality']}':")
-        
-        if modality_info['modality'] == 'sar':
-            print(f"   Яркость НЕ ДОЛЖНА сильно меняться (физическая характеристика)")
-            if abs(brightness_change) > 0.1:
-                print(f"   ❗ ВНИМАНИЕ: Яркость изменилась на {brightness_change:+.2f} - это может быть проблемой!")
-        
-        elif modality_info['modality'] == 'medical_xray':
-            print(f"   Диагностическая информация должна сохраниться")
-            
-        elif modality_info['modality'] == 'microscopy':
-            print(f"   Bimodal распределение (фон/объекты) должно сохраниться")
+    level_labels = {
+        'weak':   '🟡 СЛАБЫЙ   (weak)',
+        'base':   '🟢 БАЗОВЫЙ  (base)',
+        'strong': '🔴 СИЛЬНЫЙ  (strong)',
+    }
+    variants_order = [v for v in ['weak', 'base', 'strong'] if v in selected_variants]
+
+    print(f"\n  Тип датасета: {modality_info['modality'].upper()}")
+    print(f"  Изображений:  {original_metrics.num_images}")
+
+    for lv in variants_order:
+        var   = variants_metrics[lv]
+        label = level_labels.get(lv, lv.upper())
+
+        print(f"\n{'='*55}")
+        print(f"  {label}")
+        print(f"{'='*55}")
+
+        print(f"  Шум:")
+        _row("SNR среднее",       original_metrics.avg_snr,    var.avg_snr,    ".2f", " dB", '+')
+        _row("SNR разброс (std)", original_metrics.std_snr,    var.std_snr,    ".2f", " dB", '-')
+        _row_int("С высоким шумом",
+                 original_metrics.noise_distribution.get('high', 0),
+                 var.noise_distribution.get('high', 0), '-')
+
+        print(f"\n  Контраст и резкость:")
+        _row("avg_contrast",      original_metrics.avg_contrast,  var.avg_contrast,  ".4f")
+        _row("std_contrast",      original_metrics.std_contrast,  var.std_contrast,  ".4f")
+        _row("Резкость",          original_metrics.avg_sharpness, var.avg_sharpness, ".1f")
+        _row_int("Размытых",      original_metrics.blur_count,    var.blur_count,    '-')
+
+        print(f"\n  Яркость:")
+        _row("Среднее",           original_metrics.avg_brightness,     var.avg_brightness,     ".4f", good='~')
+        _row("Разброс (std)",     original_metrics.std_brightness,     var.std_brightness,     ".4f", '-')
+
+
+def _row(label: str, before: float, after: float,
+         fmt: str = ".4f", unit: str = "", good: str = '+'):
+    """Строка сравнения: название  до → после  (изменение ▲/▼ ✓)"""
+    change = after - before
+    if change > 1e-6:
+        arrow, mark = '▲', ('✓' if good == '+' else '')
+    elif change < -1e-6:
+        arrow, mark = '▼', ('✓' if good == '-' else '')
+    else:
+        arrow, mark = '—', ''
+    b = f"{before:{fmt}}{unit}"
+    a = f"{after:{fmt}}{unit}"
+    c = f"{change:+{fmt}}{unit}"
+    print(f"    {label:<22}  {b}  →  {a}  ({c} {arrow} {mark})")
+
+
+def _row_int(label: str, before, after, good: str = '-'):
+    """Строка сравнения для целочисленной метрики."""
+    before, after = int(before), int(after)
+    change = after - before
+    if change > 0:
+        arrow, mark = '▲', ('✓' if good == '+' else '')
+    elif change < 0:
+        arrow, mark = '▼', ('✓' if good == '-' else '')
+    else:
+        arrow, mark = '—', ''
+    print(f"    {label:<22}  {before}  →  {after}  ({change:+d} {arrow} {mark})")
 
 
 if __name__ == '__main__':

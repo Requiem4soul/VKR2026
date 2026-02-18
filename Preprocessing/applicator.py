@@ -91,7 +91,7 @@ class DatasetPreprocessor:
                 src_path, dst_path, split, methods, params
             )
 
-        print(f"✅ Готово! Датасет сохранён в {dst_path}")
+        print(f"\n Готово! Датасет сохранён в {dst_path}")
 
     def apply_adaptive_preprocessing(
             self,
@@ -182,7 +182,7 @@ class DatasetPreprocessor:
             if src_split.exists():
                 self._copy_split_as_is(src_path, dst_path, split)
 
-        print(f"✅ Готово! Датасет сохранён в {dst_path}")
+        print(f"\n Готово! Датасет сохранён в {dst_path}")
 
     def _process_split_global(
             self,
