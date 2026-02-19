@@ -14,6 +14,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 
+from ui.sidebar import render_sidebar
 from ui.state import (
     init_session_state,
     is_path_configured,
@@ -24,12 +25,7 @@ from ui.state import (
 st.set_page_config(page_title="Обучение — VKR2026", page_icon="🚀", layout="wide")
 init_session_state()
 
-with st.sidebar:
-    st.title("🔬 VKR2026")
-    if is_path_configured():
-        st.success("📁 Датасеты подключены")
-    else:
-        st.warning("⚠️ Путь не настроен")
+render_sidebar()
 
 if not is_path_configured():
     st.error("⚠️ Сначала настрой путь к датасетам в разделе **⚙️ Настройки**.")

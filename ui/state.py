@@ -11,8 +11,20 @@ from dotenv import load_dotenv, set_key, find_dotenv
 
 # Путь до .env в корне проекта (рядом с app.py)
 ENV_FILE = Path(__file__).parent.parent / ".env"
+ENV_EXAMPLE_FILE = Path(__file__).parent.parent / ".env.example"
 ENV_KEY = "DATASETS_GLOBAL_PATH"
-_DEFAULT_SENTINEL = ""
+_DEFAULT_SENTINEL = "YOUR_PATH_HERE"
+
+
+def _ensure_env_file_exists():
+    """Создаёт .env из .env.example если .env не существует."""
+    if not ENV_FILE.exists():
+        if ENV_EXAMPLE_FILE.exists():
+            import shutil
+            shutil.copy(ENV_EXAMPLE_FILE, ENV_FILE)
+        else:
+            # Создаём минимальный .env с заглушкой
+            ENV_FILE.write_text(f"{ENV_KEY}={_DEFAULT_SENTINEL}\n", encoding="utf-8")
 
 
 def init_session_state():
@@ -52,10 +64,11 @@ def init_session_state():
 
 def _load_path_from_env() -> Path | None:
     """Загружает путь из .env файла. Возвращает Path или None."""
+    _ensure_env_file_exists()
     if ENV_FILE.exists():
         load_dotenv(ENV_FILE, override=True)
-    raw = os.getenv(ENV_KEY, _DEFAULT_SENTINEL).strip()
-    if not raw:
+    raw = os.getenv(ENV_KEY, "").strip()
+    if not raw or raw == _DEFAULT_SENTINEL:
         return None
     p = Path(raw)
     return p if p.exists() else None

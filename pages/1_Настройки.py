@@ -1,8 +1,5 @@
 """
-pages/1_Setup.py — Настройка пути к датасетам
-
-Показывается при первом запуске или при необходимости изменить путь.
-Путь сохраняется в .env и не нужно вводить повторно.
+pages/1_Настройки.py — Настройка пути к датасетам
 """
 
 import streamlit as st
@@ -14,25 +11,16 @@ from ui.state import (
     is_path_configured,
     get_available_datasets,
 )
+from ui.sidebar import render_sidebar
 
 st.set_page_config(page_title="Настройки — VKR2026", page_icon="⚙️", layout="wide")
 init_session_state()
+render_sidebar()
 
-# ── Сайдбар ───────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.title("🔬 VKR2026")
-    if is_path_configured():
-        st.success("📁 Путь настроен")
-    else:
-        st.warning("⚠️ Требуется настройка")
-
-# ── Заголовок ─────────────────────────────────────────────────────────────
 st.title("⚙️ Настройки")
 st.markdown("Укажи путь к папке с датасетами. Это нужно сделать **только один раз** — путь сохранится в `.env` файл.")
-
 st.divider()
 
-# ── Текущий статус ─────────────────────────────────────────────────────────
 current_path = get_datasets_path()
 
 if current_path and current_path.exists():
@@ -48,15 +36,12 @@ else:
     st.info("Путь ещё не задан.")
 
 st.divider()
-
-# ── Форма ввода нового пути ────────────────────────────────────────────────
 st.subheader("Задать / изменить путь к датасетам")
 st.markdown(
     "Укажи **полный путь** до папки, внутри которой лежат подпапки с датасетами. "
     "Например: `N:\\VKR_Datasets` или `/home/user/datasets`"
 )
 
-# Предзаполняем текущим значением если есть
 default_val = str(current_path) if current_path else ""
 new_path_str = st.text_input(
     "Путь к папке с датасетами",
@@ -65,10 +50,8 @@ new_path_str = st.text_input(
 )
 
 col1, col2 = st.columns([1, 3])
-
 with col1:
     save_clicked = st.button("💾 Сохранить", type="primary", use_container_width=True)
-
 with col2:
     if current_path and is_path_configured():
         if st.button("🔄 Сбросить путь", use_container_width=True):
@@ -76,7 +59,6 @@ with col2:
             st.session_state["datasets_path"] = None
             st.rerun()
 
-# ── Обработка сохранения ───────────────────────────────────────────────────
 if save_clicked:
     if not new_path_str.strip():
         st.error("Путь не может быть пустым.")
@@ -97,8 +79,6 @@ if save_clicked:
             st.rerun()
 
 st.divider()
-
-# ── Подсказки ──────────────────────────────────────────────────────────────
 with st.expander("💡 Подсказки по структуре датасетов"):
     st.markdown("""
 Каждый датасет должен быть папкой внутри указанной директории и содержать структуру YOLO:

@@ -4,10 +4,9 @@ VKR2026 — Streamlit интерфейс
 """
 
 import streamlit as st
-from pathlib import Path
 from ui.state import init_session_state, get_datasets_path, is_path_configured
+from ui.sidebar import render_sidebar
 
-# ── Конфигурация страницы ──────────────────────────────────────────────────
 st.set_page_config(
     page_title="VKR2026 — Детекция объектов",
     page_icon="🔬",
@@ -16,28 +15,10 @@ st.set_page_config(
 )
 
 init_session_state()
+render_sidebar()
 
-# ── Сайдбар ───────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.title("🔬 VKR2026")
-    st.caption("Система детекции объектов")
-    st.divider()
-
-    if is_path_configured():
-        path = get_datasets_path()
-        st.success(f"📁 Датасеты подключены")
-        st.caption(str(path))
-    else:
-        st.warning("⚠️ Путь к датасетам не задан")
-        st.caption("Перейди в **Настройки** для настройки")
-
-    st.divider()
-    st.caption("Навигация через меню слева ↑")
-
-# ── Главная страница ───────────────────────────────────────────────────────
 st.title("🔬 Система анализа и обучения моделей детекции")
 st.markdown("**Дипломная работа (ВКР) 2026**")
-
 st.divider()
 
 if not is_path_configured():
@@ -48,7 +29,6 @@ if not is_path_configured():
     )
     st.stop()
 
-# ── Карточки выбора режима ─────────────────────────────────────────────────
 st.subheader("Выберите режим работы")
 st.markdown("Оба режима можно использовать независимо друг от друга.")
 
@@ -69,7 +49,7 @@ with col1:
         "- Создание предобработанных датасетов"
     )
     if st.button("🧪 Начать подбор предобработки", type="primary", use_container_width=True):
-        st.switch_page("pages/2_Preprocessing.py")
+        st.switch_page("pages/2_Предобработка.py")
 
 with col2:
     st.markdown("### 🚀 Обучение моделей")
@@ -85,11 +65,9 @@ with col2:
         "- Сравнение финальных метрик моделей"
     )
     if st.button("🚀 Перейти к обучению", type="primary", use_container_width=True):
-        st.switch_page("pages/3_Training.py")
+        st.switch_page("pages/3_Обучение.py")
 
 st.divider()
-
-# ── Статус системы ─────────────────────────────────────────────────────────
 st.subheader("📊 Статус системы")
 
 col_a, col_b, col_c = st.columns(3)
@@ -97,8 +75,7 @@ col_a, col_b, col_c = st.columns(3)
 with col_a:
     try:
         import torch
-        cuda_ok = torch.cuda.is_available()
-        if cuda_ok:
+        if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
             vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
             st.metric("🖥️ GPU", gpu_name[:25] + "..." if len(gpu_name) > 25 else gpu_name)

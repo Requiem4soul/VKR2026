@@ -13,6 +13,7 @@ import queue
 import streamlit as st
 from pathlib import Path
 
+from ui.sidebar import render_sidebar
 from ui.state import (
     init_session_state,
     is_path_configured,
@@ -24,12 +25,7 @@ st.set_page_config(page_title="Предобработка — VKR2026", page_ico
 init_session_state()
 
 # ── Сайдбар ───────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.title("🔬 VKR2026")
-    if is_path_configured():
-        st.success("📁 Датасеты подключены")
-    else:
-        st.warning("⚠️ Путь не настроен")
+render_sidebar()
 
 # ── Проверка конфигурации ──────────────────────────────────────────────────
 if not is_path_configured():
@@ -111,23 +107,34 @@ if st.session_state.prep_stage == "configure":
 
     st.divider()
     st.subheader("Шаг 3: Названия новых датасетов")
-    st.markdown(
-        "Задай базовое название — к нему будут добавлены суффиксы `_weak`, `_base`, `_strong`. "
-        "Можешь изменить каждое название отдельно."
-    )
 
-    # Дефолтное базовое имя
     default_base = f"{selected_dataset}_preprocessed"
-    base_name = st.text_input("Базовое название", value=default_base)
-
     dataset_names_input = {}
+
     if len(selected_variants) == 1:
-        custom = st.text_input("Название датасета", value=base_name, key="name_only")
+        # Только один вариант — одно простое поле
+        custom = st.text_input(
+            "Название нового датасета",
+            value=default_base,
+            key="name_only",
+            help="Под этим именем будет сохранён предобработанный датасет"
+        )
         dataset_names_input["base"] = custom
     else:
+        # Несколько вариантов — шаблон + отдельные поля
+        st.markdown(
+            "Задай базовое название — к нему автоматически добавятся суффиксы. "
+            "При желании можно изменить каждое название отдельно."
+        )
+        base_name = st.text_input("Базовое название (шаблон)", value=default_base, disabled=True)
+        st.caption("Итоговые названия датасетов:")
         for level in selected_variants:
-            default = base_name if len(selected_variants) == 1 else f"{base_name}_{level}"
-            custom = st.text_input(f"Название для '{level}'", value=default, key=f"name_{level}")
+            default = f"{base_name}_{level}"
+            custom = st.text_input(
+                f"{'🟡 Слабый' if level == 'weak' else '🟢 Базовый' if level == 'base' else '🔴 Сильный'}",
+                value=default,
+                key=f"name_{level}"
+            )
             dataset_names_input[level] = custom
 
     st.divider()
