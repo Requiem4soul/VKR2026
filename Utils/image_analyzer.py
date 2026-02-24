@@ -135,7 +135,10 @@ class UniversalImageAnalyzer:
     def estimate_noise_snr(self, image: np.ndarray) -> Tuple[float, float]:
         """Оценка уровня шума через SNR"""
         if len(image.shape) == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            if image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+            else:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
         signal = cv2.GaussianBlur(image, (5, 5), 1.0)
         noise = image - signal
@@ -172,7 +175,10 @@ class UniversalImageAnalyzer:
             'gaussian', 'salt_pepper', 'speckle', или 'unknown'
         """
         if len(image.shape) == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            if image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+            else:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
         # 1. Извлекаем шумовую компоненту
         signal = cv2.GaussianBlur(image, (5, 5), 1.0)
@@ -246,7 +252,10 @@ class UniversalImageAnalyzer:
     def measure_contrast(self, image: np.ndarray) -> Dict[str, float]:
         """Измерение контраста"""
         if len(image.shape) == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            if image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+            else:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
         i_max = image.max()
         i_min = image.min()
@@ -283,7 +292,10 @@ class UniversalImageAnalyzer:
     def measure_sharpness(self, image: np.ndarray) -> Tuple[float, bool]:
         """Измерение резкости через Laplacian variance"""
         if len(image.shape) == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            if image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+            else:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
         image_uint8 = (image * 255).astype(np.uint8)
         laplacian = cv2.Laplacian(image_uint8, cv2.CV_64F)
@@ -297,7 +309,10 @@ class UniversalImageAnalyzer:
     def analyze_histogram(self, image: np.ndarray) -> Dict:
         """Анализ гистограммы для диагностики проблем"""
         if len(image.shape) == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            if image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+            else:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
         hist, bins = np.histogram(image.flatten(), bins=256, range=[0, 1])
 
@@ -328,8 +343,12 @@ class UniversalImageAnalyzer:
         if image is None:
             raise ValueError(f"Не удалось загрузить {image_path}")
 
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Приводим к grayscale если нужно
+        if len(image.shape) == 3:
+            if image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            else:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         image_norm, metadata = self.normalize_image(image)
 

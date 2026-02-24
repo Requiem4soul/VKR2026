@@ -29,10 +29,10 @@ render_sidebar()
 
 # ── Проверка конфигурации ──────────────────────────────────────────────────
 if not is_path_configured():
-    st.error("⚠️ Сначала настрой путь к датасетам в разделе **⚙️ Настройки**.")
+    st.error("Сначала настрой путь к датасетам в разделе **Настройки**.")
     st.stop()
 
-st.title("🧪 Подбор и применение предобработки")
+st.title("Подбор и применение предобработки")
 st.markdown(
     "Система автоматически определит тип датасета и подберёт оптимальную стратегию предобработки. "
     "При необходимости можно создать несколько вариантов интенсивности для последующего сравнения."
@@ -139,7 +139,7 @@ if st.session_state.prep_stage == "configure":
 
     st.divider()
 
-    if st.button("🚀 Запустить подбор предобработки", type="primary", use_container_width=True):
+    if st.button("Запустить подбор предобработки", type="primary", use_container_width=True):
         # Сохраняем параметры в session_state и переходим к запуску
         st.session_state.prep_selected_dataset = selected_dataset
         st.session_state.prep_selected_variants = selected_variants
@@ -154,7 +154,7 @@ if st.session_state.prep_stage == "configure":
 # ── ЭТАП 2: Выполнение с выводом лога ─────────────────────────────────────
 elif st.session_state.prep_stage == "running":
 
-    st.subheader("⏳ Выполняется подбор предобработки...")
+    st.subheader("Выполняется подбор предобработки...")
     dataset_nm = st.session_state.prep_selected_dataset
     variants = st.session_state.prep_selected_variants
     ds_names = st.session_state.prep_dataset_names
@@ -301,7 +301,7 @@ elif st.session_state.prep_stage == "running":
                     modality_info=modality_info
                 )
 
-                q.put(("done", "✅ Предобработка завершена успешно!"))
+                q.put(("done", "Предобработка завершена"))
 
             except Exception as e:
                 import traceback
@@ -333,7 +333,7 @@ elif st.session_state.prep_stage == "running":
                     break
                 elif msg_type == "error":
                     st.session_state.prep_error = msg
-                    st.session_state.prep_log_lines.append(f"❌ {msg}")
+                    st.session_state.prep_log_lines.append(f"{msg}")
                     st.session_state.prep_thread_done = True
                     st.session_state.prep_stage = "done"
                     st.session_state.prep_output_queue = None
@@ -353,7 +353,7 @@ elif st.session_state.prep_stage == "running":
 
     if not st.session_state.prep_thread_done:
         with status_placeholder:
-            st.info("🔄 Выполняется... страница обновляется автоматически.")
+            st.info("Выполняется... страница обновляется автоматически.")
         time.sleep(1.5)
         st.rerun()
     else:
@@ -363,23 +363,23 @@ elif st.session_state.prep_stage == "running":
 elif st.session_state.prep_stage == "done":
 
     if st.session_state.prep_error:
-        st.error("❌ Во время предобработки возникла ошибка:")
+        st.error("Во время предобработки возникла ошибка:")
         st.code(st.session_state.prep_error)
     else:
-        st.success("✅ Предобработка завершена успешно!")
+        st.success("Предобработка завершена")
         result_names = st.session_state.prep_result_names
         st.markdown(f"**Создано датасетов: {len(result_names)}**")
         for name in result_names:
             st.markdown(f"  - `{name}`")
 
     # Полный лог
-    with st.expander("📋 Полный лог выполнения", expanded=False):
+    with st.expander("Полный лог выполнения", expanded=False):
         full_log = "\n".join(st.session_state.prep_log_lines)
         st.code(full_log, language=None)
 
         # Кнопка сохранения лога
         st.download_button(
-            label="💾 Скачать лог предобработки",
+            label="Скачать лог предобработки",
             data=full_log,
             file_name=f"preprocessing_log_{st.session_state.prep_selected_dataset}.txt",
             mime="text/plain",
@@ -390,7 +390,7 @@ elif st.session_state.prep_stage == "done":
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🧪 Подобрать предобработку ещё раз", use_container_width=True):
+        if st.button("Подобрать предобработку ещё раз", use_container_width=True):
             # Сброс состояния
             st.session_state.prep_stage = "configure"
             st.session_state.prep_log_lines = []
@@ -398,5 +398,5 @@ elif st.session_state.prep_stage == "done":
             st.session_state.prep_error = None
             st.rerun()
     with col2:
-        if st.button("🚀 Перейти к обучению моделей", type="primary", use_container_width=True):
-            st.switch_page("pages/3_Training.py")
+        if st.button("Перейти к обучению моделей", type="primary", use_container_width=True):
+            st.switch_page("pages/3_Обучение.py")

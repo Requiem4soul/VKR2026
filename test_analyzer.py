@@ -29,10 +29,10 @@ def main():
     dataset_path = get_dataset_path(dataset_name)
 
     if not dataset_path.exists():
-        print(f"❌ Датасет '{dataset_name}' не найден!")
+        print(f"Датасет '{dataset_name}' не найден")
         return
 
-    print(f"\n✅ Выбран датасет: {dataset_name}")
+    print(f"\nВыбран датасет: {dataset_name}")
 
     # Создаём анализатор
     analyzer = UniversalImageAnalyzer(verbose=False)
@@ -57,11 +57,11 @@ def main():
     strategy = selector.select_strategy(dataset_path, split='train')
 
     if strategy['strategy'] == 'global':
-        print("\n📌 Рекомендация: ГЛОБАЛЬНАЯ предобработка")
+        print("\nРекомендация: ГЛОБАЛЬНАЯ предобработка")
         print(f"   Методы: {', '.join(strategy['methods']) if strategy['methods'] else 'не требуется'}")
 
     else:
-        print("\n📌 Рекомендация: АДАПТИВНАЯ предобработка")
+        print("\nРекомендация: АДАПТИВНАЯ предобработка")
         print(f"   Кластеров: {strategy['n_clusters']}")
         for cluster_id, cluster_info in strategy['clusters'].items():
             print(f"\n   Кластер {cluster_id}:")

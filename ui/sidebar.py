@@ -11,7 +11,7 @@ from ui.state import is_path_configured, get_datasets_path
 def render_sidebar():
     """Отрисовывает общий сайдбар. Вызывать на каждой странице."""
     with st.sidebar:
-        st.title("🔬 VKR2026")
+        st.title("VKR2026")
         st.caption("Система детекции объектов")
         st.divider()
 

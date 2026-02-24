@@ -1,14 +1,6 @@
 """
-Адаптивный выбор стратегии предобработки с учётом типа датасета
-
-КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ (v2.0):
-- Добавлена классификация типа датасета (SAR/Medical/Natural/Infrared/Microscopy)
-- Учитываются правила предобработки для каждого типа
-- Блокируются опасные методы (например, brightness_correction для SAR)
-- Параметры методов адаптируются под тип датасета
-
-Автор: Система адаптивной предобработки
-Дата: 2025
+Адаптивный выбор стратегии предобработки с учётом типа датасета.
+Поддерживает типы: SAR, Medical X-ray, Natural Photo, Infrared, Microscopy.
 """
 
 import numpy as np
@@ -21,14 +13,7 @@ from Utils.image_analyzer import UniversalImageAnalyzer, ImageMetrics
 
 
 class AdaptivePreprocessingSelector:
-    """
-    Выбирает стратегию предобработки на основе анализа датасета
-    
-    НОВОЕ в v2.0:
-    - Принимает информацию о типе датасета (modality_info)
-    - Применяет правила из PreprocessingRules
-    - Блокирует неподходящие методы
-    """
+    """Выбирает стратегию предобработки на основе анализа датасета и типа изображений."""
 
     def __init__(
         self, 
@@ -182,18 +167,9 @@ class AdaptivePreprocessingSelector:
     
     def _filter_methods_by_modality(self, methods: List[str]) -> List[str]:
         """
-        🔥 НОВАЯ ФУНКЦИЯ: Фильтрует методы согласно правилам типа датасета
-        
-        Блокирует опасные методы:
-        - brightness_correction для SAR (искажает физическую информацию)
-        - brightness_correction для medical_xray (диагностически важна)
-        - brightness_correction для microscopy (разрушает bimodal распределение)
-        
-        Args:
-            methods: Список рекомендованных методов
-            
-        Returns:
-            list: Отфильтрованный список методов
+        Фильтрует методы согласно правилам типа датасета.
+        Блокирует методы, недопустимые для конкретной модальности
+        (например, brightness_correction для SAR и медицинских снимков).
         """
         # Импортируем правила
         from Utils.preprocessing_rules import PreprocessingRules
@@ -210,23 +186,16 @@ class AdaptivePreprocessingSelector:
         
         # Логируем заблокированные методы
         if blocked_methods:
-            print(f"\n⚠️  ВНИМАНИЕ: Заблокированы методы для типа '{modality}':")
+            print(f"\nЗаблокированы методы для типа '{modality}':")
             for method in blocked_methods:
                 rationale = PreprocessingRules.get_rationale(modality, method)
-                print(f"   ❌ {method}")
-                print(f"      Причина: {rationale}")
+                print(f"   - {method}: {rationale}")
         
         return filtered_methods
     
     def get_method_params(self, method: str) -> Dict:
         """
-        🔥 НОВАЯ ФУНКЦИЯ: Возвращает параметры метода для типа датасета
-        
-        Args:
-            method: Название метода ('denoise', 'contrast_enhancement', и т.д.)
-            
-        Returns:
-            dict: Параметры для данного метода и типа датасета
+        Возвращает рекомендуемые параметры метода для текущего типа датасета.
         """
         from Utils.preprocessing_rules import PreprocessingRules
         
@@ -313,9 +282,9 @@ def demonstrate_selector():
     # Симулируем рекомендации
     recommended_methods = ['denoise', 'brightness_correction', 'contrast_enhancement']
     filtered_methods = selector_sar._filter_methods_by_modality(recommended_methods)
-    
-    print(f"\n✅ Рекомендовано: {recommended_methods}")
-    print(f"✅ После фильтрации: {filtered_methods}")
+
+    print(f"\n  Рекомендовано: {recommended_methods}")
+    print(f"  После фильтрации: {filtered_methods}")
     
     # Пример 2: Natural Photo
     print("\n" + "="*70)
@@ -335,9 +304,9 @@ def demonstrate_selector():
     
     recommended_methods = ['denoise', 'brightness_correction', 'contrast_enhancement']
     filtered_methods = selector_natural._filter_methods_by_modality(recommended_methods)
-    
-    print(f"\n✅ Рекомендовано: {recommended_methods}")
-    print(f"✅ После фильтрации: {filtered_methods}")
+
+    print(f"\n  Рекомендовано: {recommended_methods}")
+    print(f"  После фильтрации: {filtered_methods}")
 
 
 if __name__ == '__main__':

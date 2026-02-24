@@ -171,7 +171,7 @@ class PreprocessingRules:
                 'enabled': True,
                 'method': 'clahe',
                 'params': {
-                    'clip_limit': 3.0,  # АГРЕССИВНО!
+                    'clip_limit': 3.0,  # повышенное значение для низкоконтрастных снимков
                     'tile_grid_size': (8, 8)
                 },
                 'rationale': 'Низкий естественный контраст требует агрессивного улучшения. '
@@ -313,11 +313,11 @@ class PreprocessingRules:
         print(f"\n{'='*70}")
         print(f"ПРАВИЛА ПРЕДОБРАБОТКИ: {modality.upper()}")
         print(f"{'='*70}")
-        
-        print(f"\n📝 Описание: {rules.get('description', 'Нет описания')}")
-        print(f"📚 Источник: {rules.get('source', 'Нет источника')}")
-        
-        print(f"\n🔧 Методы предобработки:")
+
+        print(f"\n  Описание: {rules.get('description', '')}")
+        print(f"  Источник: {rules.get('source', '')}")
+
+        print(f"\n  Методы предобработки:")
         
         methods = ['denoise', 'brightness_correction', 'contrast_enhancement', 'sharpening']
         
@@ -328,7 +328,7 @@ class PreprocessingRules:
             method_info = rules[method]
             enabled = method_info.get('enabled', True)
             
-            status = "✅ РАЗРЕШЁН" if enabled else "❌ ЗАПРЕЩЁН"
+            status = "разрешён" if enabled else "запрещён"
             print(f"\n   {method.upper()}: {status}")
             
             if enabled and 'method' in method_info:

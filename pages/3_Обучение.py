@@ -22,7 +22,7 @@ from ui.state import (
     get_datasets_path,
 )
 
-st.set_page_config(page_title="Обучение — VKR2026", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Обучение — VKR2026", page_icon=None, layout="wide")
 init_session_state()
 
 render_sidebar()
@@ -31,7 +31,7 @@ if not is_path_configured():
     st.error("⚠️ Сначала настрой путь к датасетам в разделе **⚙️ Настройки**.")
     st.stop()
 
-st.title("🚀 Обучение моделей детекции")
+st.title("Обучение моделей детекции")
 st.markdown(
     "Выбери датасеты, модели и настрой гиперпараметры. "
     "Значения по умолчанию подобраны автоматически с учётом доступной VRAM."
@@ -246,7 +246,7 @@ if st.session_state.train_stage == "configure":
     st.divider()
     st.subheader("Шаг 4: Дополнительные параметры")
 
-    with st.expander("💾 Чекпоинты", expanded=True):
+    with st.expander("Чекпоинты", expanded=True):
         st.markdown("Сохранение весов модели каждые N эпох.")
         checkpoint_interval = st.number_input(
             "Интервал чекпоинтов (эпох)",
@@ -297,7 +297,7 @@ if st.session_state.train_stage == "configure":
         st.warning("Выбери хотя бы один датасет и хотя бы одну модель.")
 
     if st.button(
-        "🚀 Начать обучение",
+        "Начать обучение",
         type="primary",
         use_container_width=True,
         disabled=launch_disabled,
@@ -324,7 +324,7 @@ elif st.session_state.train_stage == "running":
     datasets_sel = st.session_state.train_selected_datasets
     model_cfgs = st.session_state.train_model_configs_data
 
-    st.subheader("⏳ Выполняется обучение...")
+    st.subheader("Выполняется обучение...")
     st.info(
         f"**Датасеты:** {', '.join(datasets_sel)}  \n"
         f"**Модели:** {', '.join(m['name'] for m in model_cfgs)}"
@@ -393,7 +393,7 @@ elif st.session_state.train_stage == "running":
                 # Отправляем путь к результатам
                 q.put(("results_dir", trainer.results_dir))
                 q.put(("metrics", json.dumps(trainer.metrics_history)))
-                q.put(("done", "✅ Обучение завершено!"))
+                q.put(("done", "Обучение завершено!"))
 
             except Exception as e:
                 import traceback
@@ -468,10 +468,10 @@ elif st.session_state.train_stage == "done":
         st.error("❌ Во время обучения возникла ошибка:")
         st.code(st.session_state.train_error)
     else:
-        st.success("✅ Обучение завершено успешно!")
+        st.success("Обучение завершено")
 
         # ── Финальные метрики в таблице ────────────────────────────────────
-        st.subheader("📊 Финальные метрики")
+        st.subheader("Финальные метрики")
 
         st.warning(
             "⚠️ **Важное замечание:** `train_loss` и `val_loss` вычисляются по-разному "
@@ -500,16 +500,16 @@ elif st.session_state.train_stage == "done":
                 st.info("Метрики ещё не записаны (возможно, обучение завершилось слишком быстро).")
 
         # ── Полный лог ─────────────────────────────────────────────────────
-        with st.expander("📋 Полный лог обучения", expanded=False):
+        with st.expander("Полный лог обучения", expanded=False):
             full_log = "\n".join(st.session_state.train_log_lines)
             st.code(full_log, language=None)
 
         # ── Сохранение логов ───────────────────────────────────────────────
-        st.subheader("💾 Сохранение результатов")
+        st.subheader("Сохранение результатов")
 
         full_log_text = "\n".join(st.session_state.train_log_lines)
         st.download_button(
-            label="💾 Скачать лог обучения (.txt)",
+            label="Скачать лог обучения (.txt)",
             data=full_log_text,
             file_name="training_log.txt",
             mime="text/plain",
@@ -518,7 +518,7 @@ elif st.session_state.train_stage == "done":
         if st.session_state.train_metrics_data:
             metrics_json = json.dumps(st.session_state.train_metrics_data, indent=2, ensure_ascii=False)
             st.download_button(
-                label="📈 Скачать метрики (.json)",
+                label="Скачать метрики (.json)",
                 data=metrics_json,
                 file_name="metrics.json",
                 mime="application/json",
@@ -533,10 +533,10 @@ elif st.session_state.train_stage == "done":
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🧪 Подобрать предобработку", use_container_width=True):
+        if st.button("Подобрать предобработку", use_container_width=True):
             st.switch_page("pages/2_Preprocessing.py")
     with col2:
-        if st.button("🔁 Обучить модели ещё раз", use_container_width=True):
+        if st.button("Обучить модели ещё раз", use_container_width=True):
             st.session_state.train_stage = "configure"
             st.session_state.train_log_lines = []
             st.session_state.train_output_queue = None
