@@ -17,14 +17,14 @@ st.set_page_config(page_title="Настройки — VKR2026", page_icon="⚙�
 init_session_state()
 render_sidebar()
 
-st.title("⚙️ Настройки")
+st.title("Настройки")
 st.markdown("Укажи путь к папке с датасетами. Это нужно сделать **только один раз** — путь сохранится в `.env` файл.")
 st.divider()
 
 current_path = get_datasets_path()
 
 if current_path and current_path.exists():
-    st.success(f"✅ Текущий путь: `{current_path}`")
+    st.success(f"Текущий путь: `{current_path}`")
     datasets = get_available_datasets()
     if datasets:
         st.info(f"Найдено датасетов: **{len(datasets)}**\n\n" + ", ".join(f"`{d}`" for d in datasets))
@@ -51,10 +51,10 @@ new_path_str = st.text_input(
 
 col1, col2 = st.columns([1, 3])
 with col1:
-    save_clicked = st.button("💾 Сохранить", type="primary", use_container_width=True)
+    save_clicked = st.button("Сохранить", type="primary", use_container_width=True)
 with col2:
     if current_path and is_path_configured():
-        if st.button("🔄 Сбросить путь", use_container_width=True):
+        if st.button("Сбросить путь", use_container_width=True):
             save_path_to_env(Path(""))
             st.session_state["datasets_path"] = None
             st.rerun()
@@ -71,7 +71,7 @@ if save_clicked:
         else:
             save_path_to_env(p)
             datasets = [d.name for d in p.iterdir() if d.is_dir()]
-            st.success(f"✅ Путь сохранён! Найдено датасетов: **{len(datasets)}**")
+            st.success(f"Путь сохранён. Найдено датасетов: **{len(datasets)}**")
             if datasets:
                 st.markdown("**Найденные датасеты:**")
                 for d in sorted(datasets):
@@ -79,7 +79,7 @@ if save_clicked:
             st.rerun()
 
 st.divider()
-with st.expander("💡 Подсказки по структуре датасетов"):
+with st.expander("Подсказки по структуре датасетов"):
     st.markdown("""
 Каждый датасет должен быть папкой внутри указанной директории и содержать структуру YOLO:
 

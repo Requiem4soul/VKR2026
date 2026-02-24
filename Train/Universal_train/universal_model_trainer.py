@@ -954,12 +954,12 @@ class UniversalModelTrainer:
         self.log_message("\n" + "=" * 80)
         self.log_message("КОНФИГУРАЦИЯ ОБУЧЕНИЯ")
         self.log_message("=" * 80)
-        self.log_message(f"Early Stopping: {'✅ Включен' if enable_early_stopping else '❌ Отключен'}")
+        self.log_message(f"Early Stopping: {'Включен' if enable_early_stopping else 'Отключен'}")
         if enable_early_stopping:
             self.log_message(f"  - Метрика: {early_stopping_metric}")
             self.log_message(f"  - Patience: {early_stopping_patience} эпох")
             self.log_message(f"  - Min delta: {early_stopping_min_delta}")
-        self.log_message(f"Ранний отбор: {'✅ Включен' if enable_early_selection else '❌ Отключен'}")
+        self.log_message(f"Ранний отбор: {'Включен' if enable_early_selection else 'Отключен'}")
         self.log_message("=" * 80)
     
     def clean_old_result_folders(self):

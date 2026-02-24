@@ -1,15 +1,12 @@
 """
-Классификация модальности изображений по метрикам
+Классификация модальности изображений по метрикам.
 
-Основано на научных источниках:
-- Oliver & Quegan (2004) - SAR характеристики
+Научные источники:
+- Oliver & Quegan (2004) - SAR
 - Pham et al. (2000) - Medical imaging
 - Gonzalez & Woods (2018) - Natural images
 - Vollmer & Möllmann (2017) - Infrared/Thermal
 - Sternberg (1983) - Microscopy
-
-Автор: Система адаптивной предобработки
-Дата: 2025
 """
 
 from typing import Dict, Tuple
@@ -209,13 +206,13 @@ class ImageModalityClassifier:
         print("\n" + "="*70)
         print("КЛАССИФИКАЦИЯ ТИПА ДАТАСЕТА")
         print("="*70)
-        
-        print(f"\n🎯 Определённый тип: {classification['modality'].upper()}")
-        print(f"   Уверенность: {classification['confidence']*100:.1f}%")
-        print(f"   Описание: {classification['description']}")
-        print(f"   Научная база: {classification['source']}")
-        
-        print(f"\n📊 Оценки для всех типов:")
+
+        print(f"\n  Тип: {classification['modality'].upper()}")
+        print(f"  Уверенность: {classification['confidence'] * 100:.1f}%")
+        print(f"  Описание: {classification['description']}")
+        print(f"  Источник: {classification['source']}")
+
+        print(f"\n  Оценки по всем типам:")
         sorted_scores = sorted(
             classification['all_scores'].items(), 
             key=lambda x: x[1], 
@@ -264,7 +261,7 @@ def demonstrate_classifier():
     print("="*70)
     
     # Пример 1: SAR изображение
-    print("\n1️⃣  Пример SAR датасета:")
+    print("\n1. SAR датасет:")
     sar_metrics = MockMetrics(
         contrast=0.92,
         brightness=0.15,
@@ -275,7 +272,7 @@ def demonstrate_classifier():
     classifier.print_classification_report(sar_result)
     
     # Пример 2: Natural Photo
-    print("\n2️⃣  Пример обычных фотографий:")
+    print("\n2. Обычные фотографии:")
     natural_metrics = MockMetrics(
         contrast=0.55,
         brightness=0.50,
@@ -285,7 +282,7 @@ def demonstrate_classifier():
     classifier.print_classification_report(natural_result)
     
     # Пример 3: Infrared
-    print("\n3️⃣  Пример тепловизионных изображений:")
+    print("\n3. Тепловизионные изображения:")
     infrared_metrics = MockMetrics(
         contrast=0.25,
         brightness=0.40,

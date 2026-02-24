@@ -1,13 +1,6 @@
 """
-Применение предобработки к датасету
-
-ИЗМЕНЕНИЯ в v2.0:
-- Поддержка параметров для разных типов датасетов
-- Автоматический выбор метода denoise на основе типа шума
-- Передача параметров из правил предобработки
-
-Автор: Система адаптивной предобработки
-Дата: 2025
+Применение предобработки к датасету.
+Поддерживает глобальную и адаптивную (кластерную) стратегии обработки.
 """
 
 import shutil
@@ -21,13 +14,7 @@ from Data.Datasets.dataset_work import get_dataset_path
 
 
 class DatasetPreprocessor:
-    """
-    Применяет предобработку к целому датасету
-    
-    НОВОЕ в v2.0:
-    - Принимает params для адаптации под тип датасета
-    - Передаёт специфичные параметры в методы
-    """
+    """Применяет предобработку к целому датасету."""
 
     def __init__(self):
         self.methods = PreprocessingMethods()
@@ -152,7 +139,6 @@ class DatasetPreprocessor:
                 image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
 
                 if methods:
-                    # 🔥 НОВОЕ: Строим параметры с учётом шума изображения
                     combined_params = self._build_params_for_image(
                         methods, 
                         img_metrics, 
@@ -202,12 +188,9 @@ class DatasetPreprocessor:
             # Загружаем
             image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
 
-            # Применяем pipeline
-            # 🔥 ИЗМЕНЕНО: Если params не указаны, используем безопасные дефолты
             if params is None:
                 params = {}
-            
-            # Для denoise используем median по умолчанию если метод не указан
+
             if 'denoise' in methods and 'denoise' not in params:
                 params['denoise'] = {'method': 'median'}
 
@@ -241,19 +224,8 @@ class DatasetPreprocessor:
         global_params: Optional[Dict]
     ) -> Dict:
         """
-        🔥 НОВАЯ ФУНКЦИЯ: Строит параметры с учётом характеристик конкретного изображения
-        
-        Объединяет:
-        1. Глобальные параметры из правил (global_params)
-        2. Информацию о шуме конкретного изображения
-        
-        Args:
-            methods: Список методов
-            img_metrics: Метрики изображения (содержит noise_type)
-            global_params: Глобальные параметры из правил типа датасета
-            
-        Returns:
-            dict: Параметры для apply_pipeline
+        Строит параметры с учётом характеристик конкретного изображения.
+        Объединяет глобальные параметры из правил с поправками на метрики изображения.
         """
         combined_params = global_params.copy() if global_params else {}
         

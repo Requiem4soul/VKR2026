@@ -68,7 +68,7 @@ def apply_preprocessing_with_modality_detection():
             print("Введите число!")
 
     dataset_path = get_dataset_path(dataset_name)
-    print(f"\n✅ Выбран датасет: {dataset_name}")
+    print(f"\nВыбран датасет: {dataset_name}")
 
     # ========================================================================
     # ШАГ 2: АНАЛИЗ ДАТАСЕТА
@@ -79,7 +79,7 @@ def apply_preprocessing_with_modality_detection():
 
     analyzer = UniversalImageAnalyzer(verbose=False)
 
-    print("\n⏳ Анализирую изображения...")
+    print("\nАнализ изображений...")
     dataset_metrics, image_metrics = analyzer.analyze_dataset(
         dataset_path,
         split='train'
@@ -131,7 +131,7 @@ def apply_preprocessing_with_modality_detection():
     # ШАГ 6: ПОДТВЕРЖДЕНИЕ
     # ========================================================================
     print(f"\n{'='*80}")
-    confirm = input("\n❓ Применить предобработку с учётом типа датасета? (y/n): ")
+    confirm = input("\nПрименить предобработку с учётом типа датасета? (y/n): ")
 
     if confirm.lower() != 'y':
         print("Отменено.")
@@ -179,12 +179,12 @@ def apply_preprocessing_with_modality_detection():
 
         print(f"\n{'─'*60}")
         if len(selected_variants) > 1:
-            level_labels = {'weak': '🟡 СЛАБЫЙ', 'base': '🟢 БАЗОВЫЙ', 'strong': '🔴 СИЛЬНЫЙ'}
-            print(f"  Вариант: {level_labels.get(level, level.upper())}  →  {new_name}")
+            level_labels = {'weak': 'слабый', 'base': 'базовый', 'strong': 'сильный'}
+            print(f"  Вариант: {level_labels.get(level, level.upper())}  ->  {new_name}")
         print(f"{'─'*60}")
 
         if strategy['strategy'] == 'adaptive':
-            print("\n⏳ Применяю адаптивную предобработку...")
+            print("\nПрименяю адаптивную предобработку...")
             preprocessor.apply_adaptive_preprocessing(
                 source_dataset=dataset_name,
                 target_dataset=new_name,
@@ -193,7 +193,7 @@ def apply_preprocessing_with_modality_detection():
                 params=level_params
             )
         else:
-            print("\n⏳ Применяю глобальную предобработку...")
+            print("\nПрименяю глобальную предобработку...")
             preprocessor.apply_global_preprocessing(
                 source_dataset=dataset_name,
                 target_dataset=new_name,
@@ -201,7 +201,7 @@ def apply_preprocessing_with_modality_detection():
                 params=level_params
             )
 
-    print(f"\n✅ Предобработка завершена!")
+    print(f"\nПредобработка завершена.")
     print(f"   Тип датасета: {modality_info['modality']}")
     print(f"   Создано датасетов: {len(selected_variants)}")
     for level in selected_variants:
@@ -272,11 +272,11 @@ def _ask_intensity_variants() -> List[str]:
 
     selected = ['base']
 
-    ans_weak = input("\n  Создать 🟡 СЛАБЫЙ вариант (weak, ×0.5)? [y/n]: ").strip().lower()
+    ans_weak = input("\n  Создать слабый вариант (weak, ×0.5)? [y/n]: ").strip().lower()
     if ans_weak == 'y':
         selected.append('weak')
 
-    ans_strong = input("  Создать 🔴 СИЛЬНЫЙ вариант (strong, ×2.0)? [y/n]: ").strip().lower()
+    ans_strong = input("  Создать сильный вариант (strong, ×2.0)? [y/n]: ").strip().lower()
     if ans_strong == 'y':
         selected.append('strong')
 
