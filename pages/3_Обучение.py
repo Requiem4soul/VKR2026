@@ -31,13 +31,6 @@ if not is_path_configured():
     st.error("⚠️ Сначала настрой путь к датасетам в разделе **⚙️ Настройки**.")
     st.stop()
 
-st.title("Обучение моделей детекции")
-st.markdown(
-    "Выбери датасеты, модели и настрой гиперпараметры. "
-    "Значения по умолчанию подобраны автоматически с учётом доступной VRAM."
-)
-st.divider()
-
 # ── Состояние страницы ─────────────────────────────────────────────────────
 if "train_stage" not in st.session_state:
     st.session_state.train_stage = "configure"
@@ -88,197 +81,213 @@ def suggest_batch(model_type: str, vram: float) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.train_stage == "configure":
 
+    st.title("Обучение моделей детекции")
+    st.markdown(
+        "Выбери датасеты, модели и настрой гиперпараметры. "
+        "Значения по умолчанию подобраны автоматически с учётом доступной VRAM."
+    )
+    st.divider()
+
     datasets = get_available_datasets()
     if not datasets:
         st.warning("Датасеты не найдены. Добавь датасеты или проверь путь в Настройках.")
         st.stop()
 
-    # ── Выбор датасетов ────────────────────────────────────────────────────
-    st.subheader("Шаг 1: Выберите датасеты для обучения")
-    selected_datasets = st.multiselect(
-        "Датасеты",
-        options=datasets,
-        help="Можно выбрать несколько. Каждая модель будет обучена на каждом датасете.",
-    )
-
-    st.divider()
-
-    # ── Выбор моделей ──────────────────────────────────────────────────────
-    st.subheader("Шаг 2: Выберите модели для обучения")
-    st.markdown("Отметь модели которые хочешь обучить:")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        use_yolo = st.checkbox("🟦 YOLOv8", value=True, help="Быстрая модель одноэтапной детекции")
-    with col2:
-        use_frcnn = st.checkbox("🟧 Faster R-CNN", value=False, help="Двухэтапная детекция, высокая точность")
-    with col3:
-        use_retina = st.checkbox("🟩 RetinaNet", value=False, help="Одноэтапная детекция с focal loss")
-
-    # ── Гиперпараметры ─────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Шаг 3: Гиперпараметры")
-
-    if vram_gb > 0:
-        st.caption(f"🖥️ Обнаружена VRAM: **{vram_gb:.1f} GB** — значения batch_size подобраны автоматически.")
-    else:
-        st.caption("⚠️ GPU не обнаружен, обучение будет на CPU.")
-
+    # Значения по умолчанию — нужны если expander свёрнут
+    selected_datasets = []
     model_configs = []
+    enable_selection = True
+    selection_ratio = 30
+    top_k = 50
+    checkpoint_interval = 5
 
-    # ─ YOLOv8 ────────────────────────────────────────────────────────────
-    if use_yolo:
-        with st.expander("🟦 Настройки YOLOv8", expanded=True):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                yolo_size = st.selectbox(
-                    "Размер модели",
-                    ["n", "s", "m", "l", "x"],
-                    index=1,
-                    format_func=lambda x: {
-                        "n": "nano (fastest)", "s": "small", "m": "medium",
-                        "l": "large", "x": "xlarge (best)"
-                    }[x],
-                    key="yolo_size"
-                )
-                yolo_epochs = st.number_input("Макс. эпох", min_value=1, max_value=500, value=80, key="yolo_epochs")
-            with col_b:
-                yolo_batch = st.number_input(
-                    "Batch size (-1 = авто)",
-                    min_value=-1, max_value=256,
-                    value=suggest_batch("yolo", vram_gb),
-                    key="yolo_batch"
-                )
-            st.caption("ℹ️ Размер изображений определяется автоматически из датасета.")
+    with st.expander("Настройки", expanded=True):
 
-            st.markdown("**Early Stopping:**")
-            col_c, col_d = st.columns(2)
-            with col_c:
-                yolo_es = st.checkbox("Включить Early Stopping", value=True, key="yolo_es")
-            with col_d:
-                yolo_patience = st.number_input(
-                    "Patience (эпох без улучшения)",
-                    min_value=1, max_value=100, value=15,
-                    disabled=not yolo_es,
-                    key="yolo_patience"
-                )
-
-            model_configs.append({
-                "type": "yolo",
-                "size": yolo_size,
-                "name": f"yolo_{yolo_size}",
-                "max_epochs": yolo_epochs,
-                "batch": yolo_batch,
-                "early_stopping": {"patience": yolo_patience, "metric": "mAP50-95"} if yolo_es else None,
-            })
-
-    # ─ Faster R-CNN ───────────────────────────────────────────────────────
-    if use_frcnn:
-        with st.expander("🟧 Настройки Faster R-CNN", expanded=True):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                frcnn_epochs = st.number_input("Макс. эпох", min_value=1, max_value=200, value=25, key="frcnn_epochs")
-                frcnn_pretrained = st.checkbox("Использовать предобученные веса", value=True, key="frcnn_pre")
-            with col_b:
-                frcnn_batch = st.number_input(
-                    "Batch size",
-                    min_value=1, max_value=64,
-                    value=suggest_batch("faster_rcnn", vram_gb),
-                    key="frcnn_batch"
-                )
-
-            col_c, col_d = st.columns(2)
-            with col_c:
-                frcnn_es = st.checkbox("Включить Early Stopping", value=True, key="frcnn_es")
-            with col_d:
-                frcnn_patience = st.number_input(
-                    "Patience",
-                    min_value=1, max_value=50, value=7,
-                    disabled=not frcnn_es,
-                    key="frcnn_patience"
-                )
-
-            model_configs.append({
-                "type": "faster_rcnn",
-                "pretrained": frcnn_pretrained,
-                "name": "faster_rcnn",
-                "max_epochs": frcnn_epochs,
-                "batch": frcnn_batch,
-                "early_stopping": {"patience": frcnn_patience, "metric": "mAP50-95"} if frcnn_es else None,
-            })
-
-    # ─ RetinaNet ──────────────────────────────────────────────────────────
-    if use_retina:
-        with st.expander("🟩 Настройки RetinaNet", expanded=True):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                ret_epochs = st.number_input("Макс. эпох", min_value=1, max_value=200, value=35, key="ret_epochs")
-                ret_pretrained = st.checkbox("Использовать предобученные веса", value=True, key="ret_pre")
-            with col_b:
-                ret_batch = st.number_input(
-                    "Batch size",
-                    min_value=1, max_value=64,
-                    value=suggest_batch("retinanet", vram_gb),
-                    key="ret_batch"
-                )
-
-            col_c, col_d = st.columns(2)
-            with col_c:
-                ret_es = st.checkbox("Включить Early Stopping", value=True, key="ret_es")
-            with col_d:
-                ret_patience = st.number_input(
-                    "Patience",
-                    min_value=1, max_value=50, value=10,
-                    disabled=not ret_es,
-                    key="ret_patience"
-                )
-
-            model_configs.append({
-                "type": "retinanet",
-                "pretrained": ret_pretrained,
-                "name": "retinanet",
-                "max_epochs": ret_epochs,
-                "batch": ret_batch,
-                "early_stopping": {"patience": ret_patience, "metric": "mAP50-95"} if ret_es else None,
-            })
-
-    # ── Ранний отбор моделей ───────────────────────────────────────────────
-    st.divider()
-    st.subheader("Шаг 4: Дополнительные параметры")
-
-    with st.expander("Чекпоинты", expanded=True):
-        st.markdown("Сохранение весов модели каждые N эпох.")
-        checkpoint_interval = st.number_input(
-            "Интервал чекпоинтов (эпох)",
-            min_value=1, max_value=50, value=5,
-            help="Чекпоинт сохраняется каждые N эпох. Рекомендуется значение кратное max_epochs каждой модели."
+        # ── Выбор датасетов ────────────────────────────────────────────────
+        st.subheader("Шаг 1: Выберите датасеты для обучения")
+        selected_datasets = st.multiselect(
+            "Датасеты",
+            options=datasets,
+            help="Можно выбрать несколько. Каждая модель будет обучена на каждом датасете.",
         )
-        # Предупреждение если интервал больше минимального max_epochs
-        if model_configs:
-            min_epochs = min(m.get("max_epochs", 40) for m in model_configs)
-            if checkpoint_interval > min_epochs:
-                st.warning(
-                    f"⚠️ Интервал {checkpoint_interval} больше чем max_epochs одной из моделей ({min_epochs}). "
-                    f"Для неё чекпоинт сохранится только в конце."
-                )
 
-    with st.expander("⚡ Ранний отбор моделей", expanded=True):
-        st.markdown(
-            "После первых N% эпох система предсказывает итоговое качество каждой модели. "
-            "Слабые модели останавливаются раньше, экономя время. *(Jamieson & Talwalkar, 2016)*"
-        )
-        col_a, col_b = st.columns(2)
-        with col_a:
-            enable_selection = st.checkbox("Включить ранний отбор", value=True)
-        with col_b:
-            selection_ratio = st.slider(
-                "Отбор после % эпох", 10, 50, 30,
-                disabled=not enable_selection
+        st.divider()
+
+        # ── Выбор моделей ──────────────────────────────────────────────────
+        st.subheader("Шаг 2: Выберите модели для обучения")
+        st.markdown("Отметь модели которые хочешь обучить:")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            use_yolo = st.checkbox("🟦 YOLOv8", value=True, help="Быстрая модель одноэтапной детекции")
+        with col2:
+            use_frcnn = st.checkbox("🟧 Faster R-CNN", value=False, help="Двухэтапная детекция, высокая точность")
+        with col3:
+            use_retina = st.checkbox("🟩 RetinaNet", value=False, help="Одноэтапная детекция с focal loss")
+
+        # ── Гиперпараметры ─────────────────────────────────────────────────
+        st.divider()
+        st.subheader("Шаг 3: Гиперпараметры")
+
+        if vram_gb > 0:
+            st.caption(f"🖥️ Обнаружена VRAM: **{vram_gb:.1f} GB** — значения batch_size подобраны автоматически.")
+        else:
+            st.caption("⚠️ GPU не обнаружен, обучение будет на CPU.")
+
+        model_configs = []
+
+        # ─ YOLOv8 ────────────────────────────────────────────────────────
+        if use_yolo:
+            with st.expander("🟦 Настройки YOLOv8", expanded=True):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    yolo_size = st.selectbox(
+                        "Размер модели",
+                        ["n", "s", "m", "l", "x"],
+                        index=1,
+                        format_func=lambda x: {
+                            "n": "nano (fastest)", "s": "small", "m": "medium",
+                            "l": "large", "x": "xlarge (best)"
+                        }[x],
+                        key="yolo_size"
+                    )
+                    yolo_epochs = st.number_input("Макс. эпох", min_value=1, max_value=500, value=80, key="yolo_epochs")
+                with col_b:
+                    yolo_batch = st.number_input(
+                        "Batch size (-1 = авто)",
+                        min_value=-1, max_value=256,
+                        value=suggest_batch("yolo", vram_gb),
+                        key="yolo_batch"
+                    )
+                st.caption("ℹ️ Размер изображений определяется автоматически из датасета.")
+
+                st.markdown("**Early Stopping:**")
+                col_c, col_d = st.columns(2)
+                with col_c:
+                    yolo_es = st.checkbox("Включить Early Stopping", value=True, key="yolo_es")
+                with col_d:
+                    yolo_patience = st.number_input(
+                        "Patience (эпох без улучшения)",
+                        min_value=1, max_value=100, value=15,
+                        disabled=not yolo_es,
+                        key="yolo_patience"
+                    )
+
+                model_configs.append({
+                    "type": "yolo",
+                    "size": yolo_size,
+                    "name": f"yolo_{yolo_size}",
+                    "max_epochs": yolo_epochs,
+                    "batch": yolo_batch,
+                    "early_stopping": {"patience": yolo_patience, "metric": "mAP50-95"} if yolo_es else None,
+                })
+
+        # ─ Faster R-CNN ───────────────────────────────────────────────────
+        if use_frcnn:
+            with st.expander("🟧 Настройки Faster R-CNN", expanded=True):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    frcnn_epochs = st.number_input("Макс. эпох", min_value=1, max_value=200, value=25, key="frcnn_epochs")
+                    frcnn_pretrained = st.checkbox("Использовать предобученные веса", value=True, key="frcnn_pre")
+                with col_b:
+                    frcnn_batch = st.number_input(
+                        "Batch size",
+                        min_value=1, max_value=64,
+                        value=suggest_batch("faster_rcnn", vram_gb),
+                        key="frcnn_batch"
+                    )
+
+                col_c, col_d = st.columns(2)
+                with col_c:
+                    frcnn_es = st.checkbox("Включить Early Stopping", value=True, key="frcnn_es")
+                with col_d:
+                    frcnn_patience = st.number_input(
+                        "Patience",
+                        min_value=1, max_value=50, value=7,
+                        disabled=not frcnn_es,
+                        key="frcnn_patience"
+                    )
+
+                model_configs.append({
+                    "type": "faster_rcnn",
+                    "pretrained": frcnn_pretrained,
+                    "name": "faster_rcnn",
+                    "max_epochs": frcnn_epochs,
+                    "batch": frcnn_batch,
+                    "early_stopping": {"patience": frcnn_patience, "metric": "mAP50-95"} if frcnn_es else None,
+                })
+
+        # ─ RetinaNet ──────────────────────────────────────────────────────
+        if use_retina:
+            with st.expander("🟩 Настройки RetinaNet", expanded=True):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    ret_epochs = st.number_input("Макс. эпох", min_value=1, max_value=200, value=35, key="ret_epochs")
+                    ret_pretrained = st.checkbox("Использовать предобученные веса", value=True, key="ret_pre")
+                with col_b:
+                    ret_batch = st.number_input(
+                        "Batch size",
+                        min_value=1, max_value=64,
+                        value=suggest_batch("retinanet", vram_gb),
+                        key="ret_batch"
+                    )
+
+                col_c, col_d = st.columns(2)
+                with col_c:
+                    ret_es = st.checkbox("Включить Early Stopping", value=True, key="ret_es")
+                with col_d:
+                    ret_patience = st.number_input(
+                        "Patience",
+                        min_value=1, max_value=50, value=10,
+                        disabled=not ret_es,
+                        key="ret_patience"
+                    )
+
+                model_configs.append({
+                    "type": "retinanet",
+                    "pretrained": ret_pretrained,
+                    "name": "retinanet",
+                    "max_epochs": ret_epochs,
+                    "batch": ret_batch,
+                    "early_stopping": {"patience": ret_patience, "metric": "mAP50-95"} if ret_es else None,
+                })
+
+        # ── Дополнительные параметры ───────────────────────────────────────
+        st.divider()
+        st.subheader("Шаг 4: Дополнительные параметры")
+
+        with st.expander("Чекпоинты", expanded=True):
+            st.markdown("Сохранение весов модели каждые N эпох.")
+            checkpoint_interval = st.number_input(
+                "Интервал чекпоинтов (эпох)",
+                min_value=1, max_value=50, value=5,
+                help="Чекпоинт сохраняется каждые N эпох. Рекомендуется значение кратное max_epochs каждой модели."
             )
-            top_k = st.slider(
-                "Оставить % лучших", 25, 75, 50,
-                disabled=not enable_selection
+            if model_configs:
+                min_epochs = min(m.get("max_epochs", 40) for m in model_configs)
+                if checkpoint_interval > min_epochs:
+                    st.warning(
+                        f"⚠️ Интервал {checkpoint_interval} больше чем max_epochs одной из моделей ({min_epochs}). "
+                        f"Для неё чекпоинт сохранится только в конце."
+                    )
+
+        with st.expander("⚡ Ранний отбор моделей", expanded=True):
+            st.markdown(
+                "После первых N% эпох система предсказывает итоговое качество каждой модели. "
+                "Слабые модели останавливаются раньше, экономя время. *(Jamieson & Talwalkar, 2016)*"
             )
+            col_a, col_b = st.columns(2)
+            with col_a:
+                enable_selection = st.checkbox("Включить ранний отбор", value=True)
+            with col_b:
+                selection_ratio = st.slider(
+                    "Отбор после % эпох", 10, 50, 30,
+                    disabled=not enable_selection
+                )
+                top_k = st.slider(
+                    "Оставить % лучших", 25, 75, 50,
+                    disabled=not enable_selection
+                )
 
     st.divider()
 
@@ -324,13 +333,12 @@ elif st.session_state.train_stage == "running":
     datasets_sel = st.session_state.train_selected_datasets
     model_cfgs = st.session_state.train_model_configs_data
 
-    st.subheader("Выполняется обучение...")
+    st.title("Выполняется обучение...")
     st.info(
         f"**Датасеты:** {', '.join(datasets_sel)}  \n"
         f"**Модели:** {', '.join(m['name'] for m in model_cfgs)}"
     )
 
-    log_placeholder = st.empty()
     progress_placeholder = st.empty()
 
     # Запускаем обучение в фоновом потоке
@@ -390,7 +398,6 @@ elif st.session_state.train_stage == "running":
 
                 trainer.run_training()
 
-                # Отправляем путь к результатам
                 q.put(("results_dir", trainer.results_dir))
                 q.put(("metrics", json.dumps(trainer.metrics_history)))
                 q.put(("done", "Обучение завершено!"))
@@ -445,15 +452,18 @@ elif st.session_state.train_stage == "running":
         except queue.Empty:
             pass
 
-    with log_placeholder.container():
+    st.markdown("**Лог обучения:**")
+    with st.container(height=500):
         lines = st.session_state.train_log_lines
-        log_text = "\n".join(lines[-300:]) if lines else "Ожидание вывода..."
-        st.markdown("**Лог обучения:**")
-        st.code(log_text, language=None)
+        if lines:
+            for line in lines[-300:]:
+                st.text(line)
+        else:
+            st.text("Ожидание вывода...")
 
     if not st.session_state.train_thread_done:
         with progress_placeholder:
-            st.info("🔄 Обучение выполняется... Страница обновляется автоматически.")
+            st.info("Обучение выполняется... Страница обновляется автоматически.")
         time.sleep(2.0)
         st.rerun()
     else:
@@ -465,10 +475,11 @@ elif st.session_state.train_stage == "running":
 elif st.session_state.train_stage == "done":
 
     if st.session_state.train_error:
-        st.error("❌ Во время обучения возникла ошибка:")
+        st.title("Обучение завершено с ошибкой")
+        st.error("Во время обучения возникла ошибка:")
         st.code(st.session_state.train_error)
     else:
-        st.success("Обучение завершено")
+        st.title("Обучение завершено")
 
         # ── Финальные метрики в таблице ────────────────────────────────────
         st.subheader("Финальные метрики")
@@ -481,7 +492,6 @@ elif st.session_state.train_stage == "done":
 
         metrics_data = st.session_state.train_metrics_data
         if metrics_data:
-            # Строим сводную таблицу последних метрик каждой комбинации
             rows = []
             for key, history in metrics_data.items():
                 if not history:
@@ -525,8 +535,10 @@ elif st.session_state.train_stage == "done":
             )
 
         if st.session_state.train_results_dir:
-            st.info(f"📁 Папка с результатами: `{st.session_state.train_results_dir}`\n\n"
-                    f"Там находятся чекпоинты моделей и полные логи.")
+            st.info(
+                f"📁 Папка с результатами: `{st.session_state.train_results_dir}`\n\n"
+                f"Там находятся чекпоинты моделей и полные логи."
+            )
 
     st.divider()
     st.subheader("Что дальше?")

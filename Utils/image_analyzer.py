@@ -136,9 +136,11 @@ class UniversalImageAnalyzer:
         """Оценка уровня шума через SNR"""
         if len(image.shape) == 3:
             if image.shape[2] == 4:
-                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            elif image.shape[2] == 1:
+                image = image[:, :, 0]
             else:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         signal = cv2.GaussianBlur(image, (5, 5), 1.0)
         noise = image - signal
@@ -176,9 +178,11 @@ class UniversalImageAnalyzer:
         """
         if len(image.shape) == 3:
             if image.shape[2] == 4:
-                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            elif image.shape[2] == 1:
+                image = image[:, :, 0]
             else:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         # 1. Извлекаем шумовую компоненту
         signal = cv2.GaussianBlur(image, (5, 5), 1.0)
@@ -253,9 +257,11 @@ class UniversalImageAnalyzer:
         """Измерение контраста"""
         if len(image.shape) == 3:
             if image.shape[2] == 4:
-                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            elif image.shape[2] == 1:
+                image = image[:, :, 0]
             else:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         i_max = image.max()
         i_min = image.min()
@@ -293,9 +299,11 @@ class UniversalImageAnalyzer:
         """Измерение резкости через Laplacian variance"""
         if len(image.shape) == 3:
             if image.shape[2] == 4:
-                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            elif image.shape[2] == 1:
+                image = image[:, :, 0]
             else:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         image_uint8 = (image * 255).astype(np.uint8)
         laplacian = cv2.Laplacian(image_uint8, cv2.CV_64F)
@@ -310,9 +318,11 @@ class UniversalImageAnalyzer:
         """Анализ гистограммы для диагностики проблем"""
         if len(image.shape) == 3:
             if image.shape[2] == 4:
-                image = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            elif image.shape[2] == 1:
+                image = image[:, :, 0]
             else:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         hist, bins = np.histogram(image.flatten(), bins=256, range=[0, 1])
 
@@ -347,6 +357,8 @@ class UniversalImageAnalyzer:
         if len(image.shape) == 3:
             if image.shape[2] == 4:
                 image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            elif image.shape[2] == 1:
+                image = image[:, :, 0]
             else:
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
