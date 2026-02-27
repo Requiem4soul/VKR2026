@@ -32,16 +32,7 @@ if not is_path_configured():
     st.error("Сначала настрой путь к датасетам в разделе **Настройки**.")
     st.stop()
 
-st.title("Подбор и применение предобработки")
-st.markdown(
-    "Система автоматически определит тип датасета и подберёт оптимальную стратегию предобработки. "
-    "При необходимости можно создать несколько вариантов интенсивности для последующего сравнения."
-)
-st.divider()
-
 # ── Состояние страницы ─────────────────────────────────────────────────────
-# Используем ключи с префиксом 'prep_' в session_state
-
 if "prep_stage" not in st.session_state:
     st.session_state.prep_stage = "configure"  # configure | running | done
 
@@ -60,112 +51,128 @@ if "prep_thread_done" not in st.session_state:
 if "prep_error" not in st.session_state:
     st.session_state.prep_error = None
 
+if "prep_selected_dataset" not in st.session_state:
+    st.session_state.prep_selected_dataset = None
+
 # ── ЭТАП 1: Конфигурация ───────────────────────────────────────────────────
 if st.session_state.prep_stage == "configure":
 
-    st.subheader("Шаг 1: Выберите датасет")
-    datasets = get_available_datasets()
+    st.title("Подбор и применение предобработки")
+    st.markdown(
+        "Система автоматически определит тип датасета и подберёт оптимальную стратегию предобработки. "
+        "При необходимости можно создать несколько вариантов интенсивности для последующего сравнения."
+    )
+    st.divider()
 
+    datasets = get_available_datasets()
     if not datasets:
         st.warning("В указанной папке не найдено датасетов. Проверь путь в Настройках.")
         st.stop()
 
-    selected_dataset = st.selectbox(
-        "Датасет для анализа и предобработки",
-        options=datasets,
-        help="Выбери датасет, для которого нужно подобрать предобработку"
-    )
+    with st.expander("Настройки", expanded=True):
 
-    st.divider()
-    st.subheader("Шаг 2: Варианты интенсивности")
-    st.markdown(
-        "Помимо базового варианта можно создать дополнительные с другой интенсивностью. "
-        "Это позволит эмпирически выбрать лучший после обучения модели *(Montaha et al., 2022)*."
-    )
+        st.subheader("Шаг 1: Выберите датасет")
+        # Восстанавливаем выбранный датасет после rerun
+        saved = st.session_state.prep_selected_dataset
+        default_idx = datasets.index(saved) if saved in datasets else 0
 
-    col1, col2 = st.columns(2)
-    with col1:
-        create_weak = st.checkbox(
-            "🟡 Слабый вариант (×0.5)",
-            help="Параметры предобработки уменьшены в 2 раза от базового"
+        selected_dataset = st.selectbox(
+            "Датасет для анализа и предобработки",
+            options=datasets,
+            index=default_idx,
+            key="prep_dataset_select",
+            help="Выбери датасет, для которого нужно подобрать предобработку"
         )
-    with col2:
-        create_strong = st.checkbox(
-            "🔴 Сильный вариант (×2.0)",
-            help="Параметры предобработки увеличены в 2 раза от базового"
-        )
-
-    # Базовый вариант всегда создаётся
-    selected_variants = []
-    if create_weak:
-        selected_variants.append("weak")
-    selected_variants.append("base")  # базовый всегда
-    if create_strong:
-        selected_variants.append("strong")
-
-    st.info(f"Будет создано вариантов: **{len(selected_variants)}** — {', '.join(selected_variants)}")
-
-    st.divider()
-    st.subheader("Шаг 3: Названия новых датасетов")
-
-    default_base = f"{selected_dataset}_preprocessed"
-    dataset_names_input = {}
-
-    if len(selected_variants) == 1:
-        # Только один вариант — одно простое поле
-        custom = st.text_input(
-            "Название нового датасета",
-            value=default_base,
-            key="name_only",
-            help="Под этим именем будет сохранён предобработанный датасет"
-        )
-        dataset_names_input["base"] = custom
-    else:
-        # Несколько вариантов — шаблон + отдельные поля
-        st.markdown(
-            "Задай базовое название — к нему автоматически добавятся суффиксы. "
-            "При желании можно изменить каждое название отдельно."
-        )
-        base_name = st.text_input("Базовое название (шаблон)", value=default_base, disabled=True)
-        st.caption("Итоговые названия датасетов:")
-        for level in selected_variants:
-            default = f"{base_name}_{level}"
-            custom = st.text_input(
-                f"{'🟡 Слабый' if level == 'weak' else '🟢 Базовый' if level == 'base' else '🔴 Сильный'}",
-                value=default,
-                key=f"name_{level}"
-            )
-            dataset_names_input[level] = custom
-
-    st.divider()
-
-    if st.button("Запустить подбор предобработки", type="primary", use_container_width=True):
-        # Сохраняем параметры в session_state и переходим к запуску
         st.session_state.prep_selected_dataset = selected_dataset
-        st.session_state.prep_selected_variants = selected_variants
-        st.session_state.prep_dataset_names = dataset_names_input
-        st.session_state.prep_stage = "running"
-        st.session_state.prep_log_lines = []
-        st.session_state.prep_thread_done = False
-        st.session_state.prep_error = None
-        st.session_state.prep_result_names = list(dataset_names_input.values())
-        st.rerun()
+
+        st.divider()
+        st.subheader("Шаг 2: Варианты интенсивности")
+        st.markdown(
+            "Помимо базового варианта можно создать дополнительные с другой интенсивностью. "
+            "Это позволит эмпирически выбрать лучший после обучения модели *(Montaha et al., 2022)*."
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            create_weak = st.checkbox(
+                "🟡 Слабый вариант (×0.5)",
+                help="Параметры предобработки уменьшены в 2 раза от базового"
+            )
+        with col2:
+            create_strong = st.checkbox(
+                "🔴 Сильный вариант (×2.0)",
+                help="Параметры предобработки увеличены в 2 раза от базового"
+            )
+
+        # Базовый вариант всегда создаётся
+        selected_variants = []
+        if create_weak:
+            selected_variants.append("weak")
+        selected_variants.append("base")  # базовый всегда
+        if create_strong:
+            selected_variants.append("strong")
+
+        st.info(f"Будет создано вариантов: **{len(selected_variants)}** — {', '.join(selected_variants)}")
+
+        st.divider()
+        st.subheader("Шаг 3: Названия новых датасетов")
+
+        default_base = f"{selected_dataset}_preprocessed"
+        dataset_names_input = {}
+
+        if len(selected_variants) == 1:
+            custom = st.text_input(
+                "Название нового датасета",
+                value=default_base,
+                key="name_only",
+                help="Под этим именем будет сохранён предобработанный датасет"
+            )
+            dataset_names_input["base"] = custom
+        else:
+            st.markdown(
+                "Задай базовое название — к нему автоматически добавятся суффиксы. "
+                "При желании можно изменить каждое название отдельно."
+            )
+            base_name = st.text_input("Базовое название (шаблон)", value=default_base, disabled=True)
+            st.caption("Итоговые названия датасетов:")
+            for level in selected_variants:
+                default = f"{base_name}_{level}"
+                custom = st.text_input(
+                    f"{'🟡 Слабый' if level == 'weak' else '🟢 Базовый' if level == 'base' else '🔴 Сильный'}",
+                    value=default,
+                    key=f"name_{level}"
+                )
+                dataset_names_input[level] = custom
+
+    st.divider()
+
+    if not st.session_state.get("prep_launching", False):
+        if st.button("Запустить подбор предобработки", type="primary", use_container_width=True):
+            st.session_state.prep_launching = True
+            st.session_state.prep_selected_dataset = selected_dataset
+            st.session_state.prep_selected_variants = selected_variants
+            st.session_state.prep_dataset_names = dataset_names_input
+            st.session_state.prep_stage = "running"
+            st.session_state.prep_log_lines = []
+            st.session_state.prep_thread_done = False
+            st.session_state.prep_error = None
+            st.session_state.prep_result_names = list(dataset_names_input.values())
+            st.rerun()
 
 # ── ЭТАП 2: Выполнение с выводом лога ─────────────────────────────────────
 elif st.session_state.prep_stage == "running":
 
-    st.subheader("Выполняется подбор предобработки...")
     dataset_nm = st.session_state.prep_selected_dataset
     variants = st.session_state.prep_selected_variants
     ds_names = st.session_state.prep_dataset_names
 
+    st.title("Выполняется подбор предобработки...")
     st.info(
         f"**Датасет:** `{dataset_nm}` | "
         f"**Варианты:** {', '.join(variants)} | "
         f"**Новые датасеты:** {', '.join(ds_names.values())}"
     )
 
-    log_placeholder = st.empty()
     status_placeholder = st.empty()
 
     # Запускаем фоновый поток если ещё не запущен
@@ -174,7 +181,6 @@ elif st.session_state.prep_stage == "running":
         st.session_state.prep_output_queue = q
 
         def run_preprocessing(q, dataset_name, selected_variants, dataset_names, datasets_path):
-            """Запускает предобработку в отдельном потоке, перехватывает вывод."""
             import io
 
             class QueueWriter(io.TextIOBase):
@@ -191,13 +197,11 @@ elif st.session_state.prep_stage == "running":
             sys.stderr = QueueWriter()
 
             try:
-                # Добавляем корень проекта в путь для импортов
                 import os
                 project_root = str(Path(__file__).parent.parent)
                 if project_root not in sys.path:
                     sys.path.insert(0, project_root)
 
-                # Устанавливаем переменную окружения для config.py
                 os.environ["DATASETS_GLOBAL_PATH"] = str(datasets_path)
 
                 from Data.Datasets.dataset_work import get_dataset_path
@@ -207,6 +211,7 @@ elif st.session_state.prep_stage == "running":
                 from Utils.preprocessing_selector import AdaptivePreprocessingSelector
                 from Utils.intensity_variants import generate_intensity_variants, print_variants_comparison
                 from Preprocessing.applicator import DatasetPreprocessor
+                from apply_preprocessing import _build_params_for_modality, _print_comparison_all
 
                 dataset_path = get_dataset_path(dataset_name)
 
@@ -239,8 +244,7 @@ elif st.session_state.prep_stage == "running":
                 strategy = selector.select_strategy(dataset_path, split='train')
                 selector.print_strategy_info(strategy)
 
-                # Шаг 6-7: Параметры и варианты
-                from apply_preprocessing import _build_params_for_modality
+                # Шаг 6-7: Параметры и варианты интенсивности
                 base_params = _build_params_for_modality(modality_info, selector)
                 methods = strategy.get('methods', [])
 
@@ -280,7 +284,7 @@ elif st.session_state.prep_stage == "running":
                             params=level_params
                         )
 
-                # Шаг 9-10: Анализ результатов
+                # Шаг 9-10: Анализ и сравнение результатов
                 q.put(("log", "=" * 70))
                 q.put(("log", "ШАГ 9-10: АНАЛИЗ И СРАВНЕНИЕ РЕЗУЛЬТАТОВ"))
                 q.put(("log", "=" * 70))
@@ -293,7 +297,6 @@ elif st.session_state.prep_stage == "running":
                     metrics, _ = analyzer.analyze_dataset(ds_path, split='train')
                     all_preprocessed_metrics[level] = metrics
 
-                from apply_preprocessing import _print_comparison_all
                 _print_comparison_all(
                     original_metrics=dataset_metrics,
                     variants_metrics=all_preprocessed_metrics,
@@ -301,7 +304,7 @@ elif st.session_state.prep_stage == "running":
                     modality_info=modality_info
                 )
 
-                q.put(("done", "Предобработка завершена"))
+                q.put(("done", "Предобработка завершена успешно."))
 
             except Exception as e:
                 import traceback
@@ -341,15 +344,14 @@ elif st.session_state.prep_stage == "running":
         except queue.Empty:
             pass
 
-    # Отображаем лог — используем st.code для надёжного обновления
-    with log_placeholder.container():
+    st.markdown("**Вывод процесса:**")
+    with st.container(height=500):
         lines = st.session_state.prep_log_lines
         if lines:
-            log_text = "\n".join(lines[-200:])
+            for line in lines[-200:]:
+                st.text(line)
         else:
-            log_text = "Ожидание вывода..."
-        st.markdown("**Вывод процесса:**")
-        st.code(log_text, language=None)
+            st.text("Ожидание вывода...")
 
     if not st.session_state.prep_thread_done:
         with status_placeholder:
@@ -363,21 +365,20 @@ elif st.session_state.prep_stage == "running":
 elif st.session_state.prep_stage == "done":
 
     if st.session_state.prep_error:
+        st.title("Предобработка завершена с ошибкой")
         st.error("Во время предобработки возникла ошибка:")
         st.code(st.session_state.prep_error)
     else:
-        st.success("Предобработка завершена")
+        st.title("Предобработка завершена")
         result_names = st.session_state.prep_result_names
         st.markdown(f"**Создано датасетов: {len(result_names)}**")
         for name in result_names:
             st.markdown(f"  - `{name}`")
 
-    # Полный лог
     with st.expander("Полный лог выполнения", expanded=False):
         full_log = "\n".join(st.session_state.prep_log_lines)
         st.code(full_log, language=None)
 
-        # Кнопка сохранения лога
         st.download_button(
             label="Скачать лог предобработки",
             data=full_log,
@@ -391,8 +392,8 @@ elif st.session_state.prep_stage == "done":
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Подобрать предобработку ещё раз", use_container_width=True):
-            # Сброс состояния
             st.session_state.prep_stage = "configure"
+            st.session_state.prep_launching = False
             st.session_state.prep_log_lines = []
             st.session_state.prep_output_queue = None
             st.session_state.prep_error = None
