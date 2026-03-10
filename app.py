@@ -30,16 +30,15 @@ if not is_path_configured():
     st.stop()
 
 st.subheader("Выберите режим работы")
-st.markdown("Оба режима можно использовать независимо друг от друга.")
+st.markdown("Все три модуля можно использовать независимо друг от друга.")
 
-col1, col2 = st.columns(2, gap="large")
+col1, col2, col3 = st.columns(3, gap="large")
 
 with col1:
     st.markdown("### Подбор предобработки")
     st.markdown(
         "Автоматический анализ датасета, определение типа изображений "
-        "и подбор оптимальных методов предобработки. Создаёт один или "
-        "несколько вариантов предобработанного датасета (слабый / базовый / сильный)."
+        "и подбор оптимальных методов предобработки."
     )
     st.markdown("**Что произойдёт:**")
     st.markdown(
@@ -55,7 +54,7 @@ with col2:
     st.markdown("### Обучение моделей")
     st.markdown(
         "Обучение нескольких моделей детекции (YOLOv8, Faster R-CNN, RetinaNet) "
-        "на выбранных датасетах. Поддерживает Early Stopping и ранний отбор моделей."
+        "на выбранных датасетах. Поддерживает Early Stopping."
     )
     st.markdown("**Что произойдёт:**")
     st.markdown(
@@ -66,6 +65,22 @@ with col2:
     )
     if st.button("Перейти к обучению", type="primary", use_container_width=True):
         st.switch_page("pages/3_Обучение.py")
+
+with col3:
+    st.markdown("### Автоподбор пайплайна")
+    st.markdown(
+        "**Модуль 3:** автоматический поиск оптимального пайплайна предобработки "
+        "алгоритмом **SFS+SHA**."
+    )
+    st.markdown("**Что произойдёт:**")
+    st.markdown(
+        "- Формирование пула из 13 кандидатов\n"
+        "- Быстрое обучение (30% эпох) для отсева\n"
+        "- Successive Halving: top-⌈N/η⌉ на каждом шаге\n"
+        "- Финальное обучение победителя (100% эпох)"
+    )
+    if st.button("Запустить автоподбор", type="primary", use_container_width=True):
+        st.switch_page("pages/4_Подбор_пайплайна.py")
 
 st.divider()
 st.subheader("Статус системы")
