@@ -1,9 +1,13 @@
 """
-pages/4_Подбор_пайплайна.py -- Модуль 3: Автоматический подбор пайплайна предобработки
+pages/4_Подбор_пайплайна.py — Модуль 3: Автоматический подбор пайплайна предобработки
 
 Алгоритм SFS+SHA:
 - SFS: Kohavi & John (1997) Artificial Intelligence, 97, 273-324
 - SHA: Jamieson & Talwalkar (2016) AISTATS, 240-248
+
+Поддерживает задачи:
+- Детекция:       YOLOv8, Faster R-CNN, RetinaNet
+- Классификация:  ResNet-18, ResNet-50, EfficientNet-B0
 """
 
 import sys
@@ -25,7 +29,7 @@ from ui.state import (
 )
 
 st.set_page_config(
-    page_title="Подбор пайплайна -- VKR2026",
+    page_title="Подбор пайплайна — VKR2026",
     page_icon=None,
     layout="wide",
 )
@@ -36,9 +40,10 @@ if not is_path_configured():
     st.error("Сначала настрой путь к датасетам в разделе **Настройки**.")
     st.stop()
 
-# ── Состояние страницы ────────────────────────────────────────────────────
+# ── Состояние страницы ─────────────────────────────────────────────────────
 _KEYS = {
     'm3_stage': 'configure',
+    'm3_task': 'detection',
     'm3_log_lines': [],
     'm3_output_queue': None,
     'm3_thread_done': False,
@@ -47,21 +52,18 @@ _KEYS = {
     'm3_dataset': None,
     'm3_model_type': 'yolo',
     'm3_yolo_size': 'n',
+    'm3_cls_model': 'resnet18',
+    'm3_cls_imgsz': 224,
     'm3_epochs': 30,
     'm3_patience': 10,
+    'm3_seed': 42,
 }
 for k, v in _KEYS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _log(msg: str):
-    st.session_state.m3_log_lines.append(str(msg))
-
+# ── Вспомогательные функции ───────────────────────────────────────────────
 
 def _reset():
     for k, v in _KEYS.items():
@@ -71,173 +73,97 @@ def _reset():
 def _render_log_box():
     lines = st.session_state.m3_log_lines
     if lines:
-        log_text = '\n'.join(lines[-300:])
-        st.code(log_text, language=None)
+        st.code('\n'.join(lines[-300:]), language=None)
 
 
 def _render_result(result_dict: dict):
-    """Отображает результаты поиска."""
     best = result_dict.get('best_pipeline', {})
     final_metrics_test = result_dict.get('final_metrics_test', {})
-    final_map = result_dict.get('final_map_100pct', 0.0)
-    fast_map = result_dict.get('best_map_fast', 0.0)
-    stop_reason = result_dict.get('stop_reason', '--')
+    stop_reason = result_dict.get('stop_reason', '—')
     iters = result_dict.get('total_iterations', 0)
     history = result_dict.get('history', [])
+    task = result_dict.get('task', 'detection')
 
     st.success("Поиск завершён!")
-    st.info("Финальные метрики получены на test split -- независимая оценка.")
+    st.info("Финальные метрики получены на test split — независимая оценка.")
 
-    winner_path = result_dict.get('winner_dataset_path')
-    if winner_path:
-        st.success(f"Датасет-победитель сохранён: `{winner_path}`")
-
-    st.divider()
-
-    # Финальные метрики (все, из test split)
-    st.subheader("Финальные метрики (test split)")
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2 = st.columns(2)
     with col1:
-        st.metric("mAP50-95", f"{final_metrics_test.get('mAP50-95', final_map):.4f}")
+        st.markdown("**Лучший пайплайн:**")
+        st.code(
+            best.get('display_name') or best.get('name') or str(best),
+            language=None,
+        )
+        st.caption(f"Итераций SFS: {iters} | Причина остановки: {stop_reason}")
+
     with col2:
-        st.metric("mAP50", f"{final_metrics_test.get('mAP50', 0.0):.4f}")
-    with col3:
-        st.metric("F1", f"{final_metrics_test.get('f1', 0.0):.4f}")
-    with col4:
-        st.metric("val_loss", f"{final_metrics_test.get('val_loss', 0.0):.4f}")
-    with col5:
-        st.metric("mAP (поиск SHA)", f"{fast_map:.4f}")
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.metric("Итераций SFS", iters)
-    with col_b:
-        st.metric("Причина стопа",
-                  stop_reason[:25] + '...' if len(stop_reason) > 25 else stop_reason)
-
-    st.divider()
-
-    # Лучший пайплайн
-    st.subheader("Лучший пайплайн")
-    col_p1, col_p2 = st.columns(2)
-    with col_p1:
-        st.markdown(f"**Название:** `{best.get('display_name', '--')}`")
-        steps = best.get('steps', [])
-        if steps:
-            steps_str = ' -> '.join(steps)
-            st.markdown(f"**Шаги:** {steps_str}")
+        st.markdown("**Финальные метрики (test):**")
+        if task == 'classification':
+            for metric in ['val_auc', 'val_acc', 'val_loss']:
+                val = final_metrics_test.get(metric, final_metrics_test.get(f'test_{metric}', None))
+                if val is not None:
+                    label = {'val_auc': 'AUC', 'val_acc': 'ACC', 'val_loss': 'Loss'}.get(metric, metric)
+                    st.metric(label, f"{val:.4f}")
         else:
-            st.markdown("**Шаги:** Оригинал (без предобработки)")
+            for metric in ['mAP50-95', 'mAP50', 'f1']:
+                val = final_metrics_test.get(metric)
+                if val is not None:
+                    st.metric(metric, f"{val:.4f}")
 
-        methods = best.get('methods', [])
-        if methods:
-            st.markdown(f"**Методы:** `{', '.join(methods)}`")
-
-    with col_p2:
-        params = best.get('params', {})
-        if params:
-            st.markdown("**Параметры:**")
-            st.json(params)
-        else:
-            st.markdown("**Параметры:** нет (оригинал)")
-
-    # История итераций
     if history:
-        st.divider()
-        st.subheader("История итераций")
         import pandas as pd
-
+        st.markdown("**История итераций SFS:**")
         rows = []
-        for item in history:
-            rows.append({
-                'Итерация': item['iteration'],
-                'Кандидатов': item['n_candidates'],
-                'Выживших': item['n_survivors'],
-                'Лучший': item['best_pipeline'],
-                'mAP50-95': round(item['best_map'], 4),
-            })
-
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        try:
-            import plotly.graph_objects as go
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=[r['Итерация'] for r in rows],
-                y=[r['mAP50-95'] for r in rows],
-                mode='lines+markers',
-                name='mAP50-95',
-                line=dict(color='#2196F3', width=2),
-                marker=dict(size=8),
-            ))
-            fig.update_layout(
-                title='Прогресс поиска: лучший mAP по итерациям',
-                xaxis_title='Итерация',
-                yaxis_title='mAP50-95',
-                height=350,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        except ImportError:
-            pass
-
-        with st.expander("Детали по каждой итерации"):
-            for item in history:
-                st.markdown(f"**Итерация {item['iteration']}**")
-                cands = item.get('candidates', [])
-                if cands:
-                    c_df = pd.DataFrame(cands)
-                    c_df.columns = ['Пайплайн', 'mAP50-95']
-                    st.dataframe(c_df, use_container_width=True, hide_index=True)
-
-    st.divider()
-    with st.expander("Полный JSON результата"):
-        st.json(result_dict)
+        for h in history:
+            if isinstance(h, dict):
+                rows.append({
+                    'Итерация': h.get('iteration', '—'),
+                    'Пайплайн': h.get('pipeline', '—'),
+                    'mAP/AUC (быстрый)': f"{h.get('map_fast', 0):.4f}",
+                })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ФОНОВЫЙ ПОИСК
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Фоновые функции поиска ────────────────────────────────────────────────
 
-def _run_search_thread(
-    dataset_path: Path,
-    model_config: dict,
-    epochs: int,
-    patience: int,
-    q: queue.Queue,
-    datasets_global_path: str,
-):
-    """Фоновый поток для запуска поиска."""
+def _run_detection_search_thread(dataset_path, model_config, epochs, patience, q, datasets_path, seed):
     import io, os
 
-    class QueueWriter(io.TextIOBase):
+    class QWriter(io.TextIOBase):
         def write(self, text):
             if text.strip():
                 q.put(('log', text.rstrip()))
             return len(text)
-        def flush(self):
-            pass
+        def flush(self): pass
 
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    sys.stdout = QueueWriter()
-    sys.stderr = QueueWriter()
+    old = sys.stdout
+    sys.stdout = QWriter()
 
     try:
-        os.environ['DATASETS_GLOBAL_PATH'] = datasets_global_path
-
         project_root = str(Path(__file__).parent.parent)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
+
+        os.environ['DATASETS_GLOBAL_PATH'] = str(datasets_path)
+
+        # Фиксируем seed
+        import random, numpy as np, torch
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ['PYTHONHASHSEED'] = str(seed)
 
         from module3_preprocessing_search import run_sfs_sha_search
 
         def progress_cb(iteration, total, stage, message):
             q.put(('progress', {
-                'iteration': iteration,
-                'total': total,
-                'stage': stage,
-                'message': message,
+                'iteration': iteration, 'total': total,
+                'stage': stage, 'message': message,
             }))
 
         result = run_sfs_sha_search(
@@ -245,59 +171,139 @@ def _run_search_thread(
             model_config=model_config,
             max_epochs=epochs,
             early_stopping_patience=patience,
-            datasets_global_path=Path(datasets_global_path),
-            log_fn=lambda msg: q.put(('log', msg)),
+            datasets_global_path=Path(datasets_path),
+            log_fn=lambda msg: q.put(('log', str(msg))),
             progress_callback=progress_cb,
         )
 
         result_dict = {
+            'task': 'detection',
             'best_pipeline': {
-                'display_name': result.best_pipeline.display_name,
-                'steps': result.best_pipeline.steps,
-                'methods': result.best_pipeline.methods,
-                'params': result.best_pipeline.params,
+                'display_name': result.best_pipeline.display_name
+                if hasattr(result.best_pipeline, 'display_name')
+                else str(result.best_pipeline),
             },
-            'best_map_fast': round(result.best_map, 4),
-            'final_map_100pct': round(result.final_map, 4),
-            'final_metrics_test': {k: round(v, 4) for k, v in result.final_metrics_test.items()},
-            'stop_reason': result.stop_reason,
-            'total_iterations': result.total_iterations,
+            'best_map_fast': result.best_map,
+            'final_map_100pct': result.final_map,
+            'final_metrics_test': result.final_metrics_test,
             'history': result.history,
-            'winner_dataset_path': str(result.winner_dataset_path) if result.winner_dataset_path else None,
+            'total_iterations': result.total_iterations,
+            'stop_reason': result.stop_reason,
+            'winner_dataset_path': str(result.winner_dataset_path)
+            if result.winner_dataset_path else None,
         }
-
         q.put(('result', result_dict))
-        q.put(('done', 'Поиск завершён успешно.'))
+        q.put(('done', 'Поиск завершён'))
 
     except Exception as e:
         q.put(('error', f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
-        q.put(('done', 'Ошибка при поиске.'))
+        q.put(('done', 'Ошибка!'))
     finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
+        sys.stdout = old
+
+
+def _run_classification_search_thread(
+    dataset_path, cls_model_type, cls_imgsz, epochs, patience, q, datasets_path, seed
+):
+    """
+    Поиск оптимального пайплайна предобработки с proxy-моделью классификации.
+    Использует ClassificationTrainer как proxy вместо детекции.
+    """
+    import io, os
+
+    class QWriter(io.TextIOBase):
+        def write(self, text):
+            if text.strip():
+                q.put(('log', text.rstrip()))
+            return len(text)
+        def flush(self): pass
+
+    old = sys.stdout
+    sys.stdout = QWriter()
+
+    try:
+        project_root = str(Path(__file__).parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+        os.environ['DATASETS_GLOBAL_PATH'] = str(datasets_path)
+
+        import random, numpy as np, torch
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ['PYTHONHASHSEED'] = str(seed)
+
+        # Для классификации передаём model_config с типом классификационной модели
+        # в run_sfs_sha_search — она использует его как proxy.
+        # Модуль 3 уже умеет работать с любым model_config через _run_training,
+        # поэтому достаточно передать правильный тип.
+        from module3_preprocessing_search import run_sfs_sha_search
+
+        model_config = {
+            'type': cls_model_type,
+            'image_size': cls_imgsz,
+            'pretrained': True,
+        }
+
+        def progress_cb(iteration, total, stage, message):
+            q.put(('progress', {
+                'iteration': iteration, 'total': total,
+                'stage': stage, 'message': message,
+            }))
+
+        result = run_sfs_sha_search(
+            source_dataset_path=dataset_path,
+            model_config=model_config,
+            max_epochs=epochs,
+            early_stopping_patience=patience,
+            datasets_global_path=Path(datasets_path),
+            log_fn=lambda msg: q.put(('log', str(msg))),
+            progress_callback=progress_cb,
+        )
+
+        result_dict = {
+            'task': 'classification',
+            'best_pipeline': {
+                'display_name': result.best_pipeline.display_name
+                if hasattr(result.best_pipeline, 'display_name')
+                else str(result.best_pipeline),
+            },
+            'best_map_fast': result.best_map,
+            'final_map_100pct': result.final_map,
+            'final_metrics_test': result.final_metrics_test,
+            'history': result.history,
+            'total_iterations': result.total_iterations,
+            'stop_reason': result.stop_reason,
+            'winner_dataset_path': str(result.winner_dataset_path)
+            if result.winner_dataset_path else None,
+        }
+        q.put(('result', result_dict))
+        q.put(('done', 'Поиск завершён'))
+
+    except Exception as e:
+        q.put(('error', f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
+        q.put(('done', 'Ошибка!'))
+    finally:
+        sys.stdout = old
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ЭТАПЫ UI
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-
-
+# ЭТАП 1: Конфигурация
 # ══════════════════════════════════════════════════════════════════════════════
-# ЭТАПЫ UI
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── ЭТАП 1: Конфигурация ──────────────────────────────────────────────────
 if st.session_state.m3_stage == 'configure':
 
-    st.title("🔬 Подбор пайплайна предобработки")
+    st.title("Подбор пайплайна предобработки")
     st.markdown(
         "**Модуль 3** автоматически подбирает оптимальный пайплайн предобработки "
-        "с помощью алгоритма **SFS+SHA** -- гибрида последовательного отбора признаков "
-        "и метода successive halving."
+        "с помощью алгоритма **SFS+SHA**."
     )
 
-    with st.expander("ℹ️ Как работает алгоритм", expanded=False):
+    with st.expander("Как работает алгоритм", expanded=False):
         st.markdown("""
 **Sequential Forward Selection (SFS)** итеративно строит пайплайн,
 добавляя по одному методу предобработки.
@@ -305,14 +311,8 @@ if st.session_state.m3_stage == 'configure':
 **Successive Halving (SHA)** на каждом шаге отсевает слабых кандидатов
 через быстрое частичное обучение (30% эпох).
 
-**Пул методов (13 кандидатов):**
-- Оригинал (baseline)
-- Median filter: ksize=3, 5
-- Gaussian blur: 3x3, 5x5
-- Bilateral filter: sigma=75, sigma=150
-- CLAHE: clip=1.0, clip=2.0
-- Unsharp mask: amount=0.5, 1.0
-- Нормализация: Z-score, Min-Max
+**Пул методов (13 кандидатов):** Оригинал, Median filter (×2), Gaussian blur (×2),
+Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
 
 *Источники: Kohavi & John (1997); Jamieson & Talwalkar (2016)*
         """)
@@ -324,95 +324,121 @@ if st.session_state.m3_stage == 'configure':
         st.warning("Датасеты не найдены. Проверь путь в Настройках.")
         st.stop()
 
+    # ── Выбор задачи ──────────────────────────────────────────────────────
+    st.subheader("0. Тип задачи")
+    task = st.radio(
+        "Задача",
+        options=["detection", "classification"],
+        format_func=lambda x: "🔍 Детекция" if x == "detection" else "🏷️ Классификация",
+        index=0 if st.session_state.m3_task == "detection" else 1,
+        key="m3_task_radio",
+        horizontal=True,
+    )
+    st.session_state.m3_task = task
+    st.divider()
+
     col_left, col_right = st.columns(2, gap="large")
 
     with col_left:
         st.subheader("1. Датасет")
         selected_dataset = st.selectbox(
-            "Датасет для поиска",
-            options=datasets,
-            index=0,
-            key='m3_ds_select',
+            "Датасет для поиска", options=datasets, index=0, key='m3_ds_select',
         )
 
     with col_right:
         st.subheader("2. Proxy-модель")
 
-        model_type = st.selectbox(
-            "Тип модели",
-            options=['yolo', 'faster_rcnn', 'retinanet'],
-            format_func=lambda x: {
-                'yolo': 'YOLOv8',
-                'faster_rcnn': 'Faster R-CNN',
-                'retinanet': 'RetinaNet',
-            }[x],
-            key='m3_model_select',
-        )
-
-        yolo_size = 'n'
-        if model_type == 'yolo':
-            yolo_size = st.selectbox(
-                "Размер YOLOv8",
-                options=['n', 's', 'm', 'l', 'x'],
+        if task == "detection":
+            model_type = st.selectbox(
+                "Тип модели",
+                options=['yolo', 'faster_rcnn', 'retinanet'],
                 format_func=lambda x: {
-                    'n': 'nano (быстрее всего)',
-                    's': 'small',
-                    'm': 'medium',
-                    'l': 'large',
-                    'x': 'xlarge (медленнее всего)',
+                    'yolo': 'YOLOv8', 'faster_rcnn': 'Faster R-CNN', 'retinanet': 'RetinaNet',
                 }[x],
-                index=0,
-                key='m3_yolo_size_select',
+                key='m3_model_select',
+            )
+            yolo_size = 'n'
+            if model_type == 'yolo':
+                yolo_size = st.selectbox(
+                    "Размер YOLOv8",
+                    options=['n', 's', 'm', 'l', 'x'],
+                    format_func=lambda x: {'n': 'nano', 's': 'small', 'm': 'medium',
+                                            'l': 'large', 'x': 'xlarge'}[x],
+                    index=0,
+                    key='m3_yolo_size_select',
+                )
+            cls_model = 'resnet18'
+            cls_imgsz = 224
+        else:
+            model_type = 'cls'
+            yolo_size = 'n'
+            cls_model = st.selectbox(
+                "Архитектура",
+                options=['resnet18', 'resnet50', 'efficientnet_b0'],
+                format_func=lambda x: {
+                    'resnet18': 'ResNet-18 (быстрее)',
+                    'resnet50': 'ResNet-50',
+                    'efficientnet_b0': 'EfficientNet-B0 (лёгкий)',
+                }[x],
+                key='m3_cls_model_select',
+            )
+            cls_imgsz = st.selectbox(
+                "Размер изображений", [28, 224], index=1,
+                help="28 = как в MedMNIST; 224 = ImageNet-стандарт",
+                key='m3_cls_imgsz',
+            )
+            st.caption(
+                "Для SHA-сравнения пайплайнов используется 30% эпох без Early Stopping, "
+                "финальное обучение победителя — 100% с ES."
             )
 
         st.subheader("3. Параметры обучения")
+        default_epochs = 30 if task == "detection" else 50
         epochs = st.number_input(
-            "Эпох финального обучения",
-            min_value=5,
-            max_value=300,
-            value=30,
-            step=5,
-            help="Столько эпох займёт финальное обучение победителя. Для SHA-сравнения кандидатов используется 30% от этого числа.",
-            key='m3_epochs_input',
+            "Эпох финального обучения", 5, 300, default_epochs, step=5, key='m3_epochs_input',
         )
-
         patience = st.number_input(
-            "Early stopping patience (финал)",
-            min_value=3,
-            max_value=50,
-            value=10,
-            help="Только для финального обучения победителя. "
-                 "Быстрые 30% эпох -- всегда без early stopping.",
-            key='m3_patience_input',
+            "Early stopping patience (финал)", 3, 50, 10, key='m3_patience_input',
         )
-
         fast_ep = max(1, int(epochs * 0.30))
         st.caption(
-            f"Быстрое: {fast_ep} эп. без ES (честное сравнение SHA) | "
-            f"Финал: {epochs} эп. + ES (patience={patience})"
+            f"Быстрое SHA: {fast_ep} эп. без ES | Финал: {epochs} эп. + ES (patience={patience})"
         )
 
-        # VRAM info
         try:
             import torch
             if torch.cuda.is_available():
-                vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
-                st.info(f"GPU доступен: {vram:.1f} GB VRAM")
+                vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+                st.info(f"GPU: {vram:.1f} GB VRAM")
             else:
-                st.warning("GPU не обнаружен -- обучение на CPU (медленно)")
+                st.warning("GPU не обнаружен — CPU (медленно)")
         except Exception:
             pass
 
     st.divider()
 
+    # ── Воспроизводимость ─────────────────────────────────────────────────
+    with st.expander("🎲 Воспроизводимость (Seed)", expanded=False):
+        st.markdown(
+            "Фиксирует все источники случайности для идентичных результатов "
+            "при повторном запуске с тем же seed."
+        )
+        seed = st.number_input(
+            "Random seed", 0, 2 ** 31 - 1, value=42, key='m3_seed_input',
+        )
+    st.session_state.m3_seed = seed if 'm3_seed_input' in st.session_state else 42
+
+    # ── Оценка времени ─────────────────────────────────────────────────────
     n_candidates = 13
     n_iters_est = 4
-    time_per_candidate_min = {'yolo': 2, 'faster_rcnn': 5, 'retinanet': 4}.get(model_type, 3)
-    total_est = n_candidates * n_iters_est * time_per_candidate_min
+    if task == "detection":
+        time_per = {'yolo': 2, 'faster_rcnn': 5, 'retinanet': 4}.get(model_type, 3)
+    else:
+        time_per = {'resnet18': 3, 'resnet50': 5, 'efficientnet_b0': 3}.get(cls_model, 4)
+    total_est = n_candidates * n_iters_est * time_per
 
     st.info(
-        f"Примерное время: {total_est}--{total_est*2} мин "
-        f"(зависит от датасета и GPU). "
+        f"Примерное время: {total_est}–{total_est * 2} мин. "
         f"Всего обучений: ~{n_candidates * n_iters_est}"
     )
 
@@ -420,8 +446,11 @@ if st.session_state.m3_stage == 'configure':
         st.session_state.m3_dataset = selected_dataset
         st.session_state.m3_model_type = model_type
         st.session_state.m3_yolo_size = yolo_size
+        st.session_state.m3_cls_model = cls_model
+        st.session_state.m3_cls_imgsz = cls_imgsz
         st.session_state.m3_epochs = epochs
         st.session_state.m3_patience = patience
+        st.session_state.m3_seed = seed
         st.session_state.m3_log_lines = []
         st.session_state.m3_error = None
         st.session_state.m3_result = None
@@ -430,16 +459,23 @@ if st.session_state.m3_stage == 'configure':
         st.rerun()
 
 
-# ── ЭТАП 2: Запуск и мониторинг ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ЭТАП 2: Запуск и мониторинг
+# ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.m3_stage == 'running':
 
-    st.title("🔬 Поиск пайплайна -- выполняется...")
+    task = st.session_state.m3_task
+    task_label = "классификации" if task == "classification" else "детекции"
+    st.title(f"Поиск пайплайна ({task_label}) — выполняется...")
 
     dataset_name = st.session_state.m3_dataset
     model_type = st.session_state.m3_model_type
     yolo_size = st.session_state.m3_yolo_size
+    cls_model = st.session_state.m3_cls_model
+    cls_imgsz = st.session_state.m3_cls_imgsz
     epochs = st.session_state.m3_epochs
     patience = st.session_state.m3_patience
+    seed = st.session_state.m3_seed
     datasets_path = str(get_datasets_path())
 
     try:
@@ -451,27 +487,30 @@ elif st.session_state.m3_stage == 'running':
     except Exception:
         dataset_path = get_datasets_path() / dataset_name
 
-    model_config = {
-        'type': model_type,
-        'size': yolo_size,
-    }
-
     if st.session_state.m3_output_queue is None:
         q = queue.Queue()
         st.session_state.m3_output_queue = q
 
-        thread = threading.Thread(
-            target=_run_search_thread,
-            args=(dataset_path, model_config, epochs, patience, q, datasets_path),
-            daemon=True,
-        )
+        if task == "detection":
+            model_config = {'type': model_type, 'size': yolo_size}
+            thread = threading.Thread(
+                target=_run_detection_search_thread,
+                args=(dataset_path, model_config, epochs, patience, q, datasets_path, seed),
+                daemon=True,
+            )
+        else:
+            thread = threading.Thread(
+                target=_run_classification_search_thread,
+                args=(dataset_path, cls_model, cls_imgsz, epochs, patience,
+                      q, datasets_path, seed),
+                daemon=True,
+            )
         thread.start()
 
     if st.button("Остановить поиск"):
         st.session_state.m3_stage = 'configure'
         st.session_state.m3_output_queue = None
         st.warning("Поиск прерван пользователем.")
-        st.rerun()
 
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
@@ -488,8 +527,7 @@ elif st.session_state.m3_stage == 'running':
                     pct = int(payload['iteration'] / max(payload['total'], 1) * 100)
                     progress_bar.progress(pct)
                     status_placeholder.info(
-                        f"Итерация {payload['iteration']}/{payload['total']}: "
-                        f"{payload['message']}"
+                        f"Итерация {payload['iteration']}/{payload['total']}: {payload['message']}"
                     )
                 elif msg_type == 'result':
                     st.session_state.m3_result = payload
@@ -508,33 +546,32 @@ elif st.session_state.m3_stage == 'running':
     if st.session_state.m3_thread_done:
         st.session_state.m3_stage = 'done'
         st.rerun()
-
-    if not st.session_state.m3_thread_done:
+    else:
         time.sleep(1.5)
         st.rerun()
 
 
-# ── ЭТАП 3: Результаты ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ЭТАП 3: Результаты
+# ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.m3_stage == 'done':
 
-    st.title("🔬 Подбор пайплайна -- завершён")
+    task = st.session_state.m3_task
+    task_label = "классификации" if task == "classification" else "детекции"
+    st.title(f"Подбор пайплайна ({task_label}) — завершён")
 
     if st.session_state.m3_error:
         st.error(f"Ошибка:\n```\n{st.session_state.m3_error}\n```")
-        st.info("Проверь лог ниже для деталей.")
-
         with st.expander("Лог выполнения"):
             _render_log_box()
-
         if st.button("Назад к настройкам", use_container_width=True):
             _reset()
             st.rerun()
-
     else:
         if st.session_state.m3_result:
             _render_result(st.session_state.m3_result)
         else:
-            st.warning("Результат не получен. Возможно, поиск был прерван.")
+            st.warning("Результат не получен. Поиск мог быть прерван.")
 
         with st.expander("Лог выполнения"):
             _render_log_box()

@@ -7,6 +7,7 @@ Universal Model Trainer - ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ
 3. ✅ Ранний отбор моделей (Jamieson & Talwalkar, 2016)
 4. ✅ Критическая очистка памяти GPU после каждого чекпоинта
 5. ✅ Индивидуальные max_epochs для каждой модели
+6. ✅ Воспроизводимость через seed (Dodge & Karam, 2017) [НОВОЕ]
 
 ИСПРАВЛЕНИЯ из оригинала:
 - RetinaNet: score_threshold=0.1 (было 0.5)
@@ -17,6 +18,7 @@ Universal Model Trainer - ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ
 - Early Stopping с настраиваемыми параметрами
 - Интеграция с модулем early_model_selection
 - Автоматическое восстановление лучших весов
+- seed: глобальная фиксация torch/numpy/random/cudnn
 
 Автор: VKR2026 (финальная версия)
 Дата: 2026-02-17
@@ -25,6 +27,7 @@ Universal Model Trainer - ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ
 import os
 import json
 import gc
+import random
 import torch
 import time
 from datetime import datetime
@@ -384,66 +387,50 @@ def compute_detection_metrics(model, dataloader, device,
         true_positives = 0
         false_positives = 0
         false_negatives = 0
-        total_iou = 0
+        total_iou = 0.0
         iou_count = 0
         
         for pred, target in zip(all_predictions, all_targets):
-            pred_boxes = pred.get('boxes', torch.tensor([]))
-            pred_labels = pred.get('labels', torch.tensor([]))
-            pred_scores = pred.get('scores', torch.tensor([]))
+            pred_boxes = pred.get('boxes', torch.zeros((0, 4)))
+            pred_scores = pred.get('scores', torch.zeros(0))
+            gt_boxes = target.get('boxes', torch.zeros((0, 4)))
             
-            target_boxes = target.get('boxes', torch.tensor([]))
-            target_labels = target.get('labels', torch.tensor([]))
+            mask = pred_scores > score_threshold
+            pred_boxes = pred_boxes[mask]
             
-            if len(pred_boxes) == 0 and len(target_boxes) == 0:
+            if len(gt_boxes) == 0 and len(pred_boxes) == 0:
+                continue
+            elif len(gt_boxes) == 0:
+                false_positives += len(pred_boxes)
+                continue
+            elif len(pred_boxes) == 0:
+                false_negatives += len(gt_boxes)
                 continue
             
-            if len(target_boxes) > 0 and len(pred_boxes) == 0:
-                false_negatives += len(target_boxes)
-                continue
-            
-            if len(pred_scores) > 0:
-                keep = pred_scores > score_threshold
-                pred_boxes = pred_boxes[keep]
-                pred_labels = pred_labels[keep]
-                pred_scores = pred_scores[keep]
-            
-            if len(pred_boxes) == 0:
-                if len(target_boxes) > 0:
-                    false_negatives += len(target_boxes)
-                continue
-            
-            matched_targets = set()
-            
-            for pred_box, pred_label in zip(pred_boxes, pred_labels):
+            matched_gt = set()
+            for pb in pred_boxes:
                 best_iou = 0
-                best_target_idx = -1
-                
-                for target_idx, (target_box, target_label) in enumerate(
-                    zip(target_boxes, target_labels)
-                ):
-                    if target_idx in matched_targets:
+                best_gt_idx = -1
+                for gt_idx, gb in enumerate(gt_boxes):
+                    if gt_idx in matched_gt:
                         continue
-                    if pred_label != target_label:
-                        continue
-                    
-                    iou = compute_iou(pred_box, target_box)
+                    iou = compute_iou(pb.numpy(), gb.numpy())
                     if iou > best_iou:
                         best_iou = iou
-                        best_target_idx = target_idx
+                        best_gt_idx = gt_idx
                 
-                if best_iou >= iou_threshold:
+                if best_iou >= iou_threshold and best_gt_idx >= 0:
                     true_positives += 1
-                    matched_targets.add(best_target_idx)
+                    matched_gt.add(best_gt_idx)
                     total_iou += best_iou
                     iou_count += 1
                 else:
                     false_positives += 1
             
-            false_negatives += (len(target_boxes) - len(matched_targets))
+            false_negatives += len(gt_boxes) - len(matched_gt)
         
-        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
+        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
         
         map_results.append(precision)
     
@@ -531,7 +518,8 @@ class YOLOWrapper(BaseModelWrapper):
             exist_ok=True,
             workers=1,
             cache=False,
-            verbose=False
+            verbose=False,
+            seed=kwargs.get('seed', 0),   # ← ДОБАВЛЕНО: seed для воспроизводимости YOLO
         )
         
         return self.extract_metrics()
@@ -540,69 +528,51 @@ class YOLOWrapper(BaseModelWrapper):
         return self.extract_metrics()
     
     def extract_metrics(self) -> Dict[str, float]:
-        """ИСПРАВЛЕНА: Читает loss из CSV + добавлен F1"""
-        try:
-            if self.results is None:
-                return {
-                    'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0,
-                    'mAP50-95': 0.0, 'f1': 0.0, 'train_loss': 0.0, 'val_loss': 0.0
-                }
-            
-            metrics_box = self.results.results_dict
-            
-            precision = metrics_box.get('metrics/precision(B)', 0.0)
-            recall = metrics_box.get('metrics/recall(B)', 0.0)
-            mAP50 = metrics_box.get('metrics/mAP50(B)', 0.0)
-            mAP50_95 = metrics_box.get('metrics/mAP50-95(B)', 0.0)
-            
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            
-            train_loss = 0.0
-            val_loss = 0.0
-            
-            if self.last_project_path:
-                csv_path = self.last_project_path / 'results.csv'
-                if csv_path.exists():
-                    try:
-                        import pandas as pd
-                        df = pd.read_csv(csv_path)
-                        df.columns = df.columns.str.strip()
-                        
-                        if 'train/box_loss' in df.columns:
-                            train_loss = float(df['train/box_loss'].iloc[-1])
-                        if 'val/box_loss' in df.columns:
-                            val_loss = float(df['val/box_loss'].iloc[-1])
-                    except Exception:
-                        pass
-            
-            return {
-                'precision': float(precision),
-                'recall': float(recall),
-                'mAP50': float(mAP50),
-                'mAP50-95': float(mAP50_95),
-                'f1': float(f1),
-                'train_loss': float(train_loss),
-                'val_loss': float(val_loss)
-            }
+        """Извлекает метрики из результатов YOLO обучения"""
+        if self.results is None:
+            return {'mAP50': 0.0, 'mAP50-95': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'train_loss': 1.0, 'val_loss': 1.0}
         
-        except Exception as e:
-            print(f"[WARNING] Ошибка извлечения метрик YOLO: {e}")
+        try:
+            results_dict = self.results.results_dict
+            
+            map50 = float(results_dict.get('metrics/mAP50(B)', 0.0))
+            map50_95 = float(results_dict.get('metrics/mAP50-95(B)', 0.0))
+            precision = float(results_dict.get('metrics/precision(B)', 0.0))
+            recall = float(results_dict.get('metrics/recall(B)', 0.0))
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+            
+            train_loss = float(results_dict.get('train/box_loss', results_dict.get('train/cls_loss', 1.0)))
+            val_loss = float(results_dict.get('val/box_loss', results_dict.get('val/cls_loss', 1.0)))
+            
             return {
-                'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0,
-                'mAP50-95': 0.0, 'f1': 0.0, 'train_loss': 0.0, 'val_loss': 0.0
+                'mAP50': map50,
+                'mAP50-95': map50_95,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'train_loss': train_loss,
+                'val_loss': val_loss
             }
+        except Exception as e:
+            print(f"[WARNING] Не удалось извлечь метрики YOLO: {e}")
+            return {'mAP50': 0.0, 'mAP50-95': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'train_loss': 1.0, 'val_loss': 1.0}
     
     def save(self, path: str):
-        self.model.save(path)
+        if self.model and self.last_project_path:
+            best_weights = Path(self.last_project_path) / 'weights' / 'best.pt'
+            if best_weights.exists():
+                import shutil
+                shutil.copy(best_weights, path)
     
     def load(self, path: str):
-        self.model = YOLO(path)
+        if os.path.exists(path):
+            self.model = YOLO(path)
 
 
-# ===================== FASTER R-CNN WRAPPER (ИСПРАВЛЕННЫЙ) =====================
+# ===================== FASTER R-CNN WRAPPER (ОРИГИНАЛЬНЫЙ) =====================
 
 class FasterRCNNWrapper(BaseModelWrapper):
-    """Обертка для Faster R-CNN - ИСПРАВЛЕНА"""
+    """Обертка для Faster R-CNN"""
     
     def __init__(self, pretrained: bool = True):
         super().__init__(task_type='detection')
@@ -756,7 +726,7 @@ class RetinaNetWrapper(BaseModelWrapper):
         return {'train_loss': avg_loss}
     
     def validate(self, dataloader, device, **kwargs):
-        """Валидация с расчетом метрик - ИСПРАВЛЕНА"""
+        """Валидация RetinaNet - ИСПРАВЛЕНА (score_threshold=0.1)"""
         self.model.to(device)
         self.model.eval()
         
@@ -768,35 +738,17 @@ class RetinaNetWrapper(BaseModelWrapper):
                 images = [img.to(device) for img in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                 
-                try:
-                    self.model.train()
-                    loss_dict = self.model(images, targets)
-                    self.model.eval()
-                    
-                    cls_loss = loss_dict.get('classification', torch.tensor(0.0))
-                    box_loss = loss_dict.get('bbox_regression', torch.tensor(0.0))
-                    losses = cls_loss + box_loss
-                    
-                    if torch.isnan(losses) or torch.isinf(losses):
-                        continue
-                    
-                    total_loss += losses.item()
-                    num_batches += 1
-                    
-                except Exception as e:
-                    print(f"[WARNING] Ошибка при расчете loss: {e}")
-                    continue
+                self.model.train()
+                loss_dict = self.model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+                self.model.eval()
+                
+                total_loss += losses.item()
+                num_batches += 1
         
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
         
-        try:
-            metrics = compute_detection_metrics(self.model, dataloader, device, score_threshold=0.1)
-        except Exception as e:
-            print(f"[WARNING] Ошибка при расчете метрик: {e}")
-            metrics = {
-                'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0,
-                'mAP50-95': 0.0, 'f1': 0.0
-            }
+        metrics = compute_detection_metrics(self.model, dataloader, device, score_threshold=0.1)
         
         return {
             'val_loss': avg_loss,
@@ -844,6 +796,7 @@ class UniversalModelTrainer:
     - Early Stopping для каждой модели
     - Ранний отбор моделей (опционально)
     - Критическую очистку памяти
+    - Воспроизводимость через seed [НОВОЕ]
     """
     
     def __init__(
@@ -852,6 +805,9 @@ class UniversalModelTrainer:
         dataset_names: List[str],
         max_epochs: int = 40,
         checkpoint_interval: int = 10,
+        
+        # ── Воспроизводимость ──────────────────────────────────────────────
+        seed: int = 42,                        # ← НОВЫЙ ПАРАМЕТР
         
         # Early Stopping
         enable_early_stopping: bool = False,
@@ -870,6 +826,20 @@ class UniversalModelTrainer:
         self.dataset_names = dataset_names
         self.max_epochs = max_epochs
         self.checkpoint_interval = checkpoint_interval
+
+        # ── Воспроизводимость (Dodge & Karam, 2017) ───────────────────────
+        # Фиксируем seed ДО создания любых моделей и DataLoader'ов.
+        # Результаты идентичны при одинаковом seed на одинаковом оборудовании.
+        self.seed = seed
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        # ──────────────────────────────────────────────────────────────────
         
         # Early Stopping
         self.enable_early_stopping = enable_early_stopping
@@ -954,6 +924,7 @@ class UniversalModelTrainer:
         self.log_message("\n" + "=" * 80)
         self.log_message("КОНФИГУРАЦИЯ ОБУЧЕНИЯ")
         self.log_message("=" * 80)
+        self.log_message(f"Seed: {seed} (воспроизводимость включена)")
         self.log_message(f"Early Stopping: {'Включен' if enable_early_stopping else 'Отключен'}")
         if enable_early_stopping:
             self.log_message(f"  - Метрика: {early_stopping_metric}")
@@ -993,12 +964,17 @@ class UniversalModelTrainer:
             train_dataset = YOLOToFasterRCNNDataset(dataset_path, split='train')
             val_dataset = YOLOToFasterRCNNDataset(dataset_path, split='valid')
             
+            # Generator с фиксированным seed для воспроизводимости shuffle
+            g = torch.Generator()
+            g.manual_seed(self.seed)
+            
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=batch_size,
                 shuffle=True,
                 num_workers=0,
-                collate_fn=self.collate_fn
+                collate_fn=self.collate_fn,
+                generator=g,
             )
             
             val_loader = DataLoader(
@@ -1025,56 +1001,53 @@ class UniversalModelTrainer:
         if model_type == 'yolo':
             wrapper = YOLOWrapper(model_size=model_config.get('size', 'n'))
             wrapper.initialize(num_classes=num_classes)
+            return wrapper
         
         elif model_type == 'faster_rcnn':
-            wrapper = FasterRCNNWrapper(pretrained=model_config.get('pretrained', True))
+            pretrained = model_config.get('pretrained', True)
+            wrapper = FasterRCNNWrapper(pretrained=pretrained)
             wrapper.initialize(num_classes=num_classes)
+            return wrapper
         
         elif model_type == 'retinanet':
-            wrapper = RetinaNetWrapper(pretrained=model_config.get('pretrained', True))
+            pretrained = model_config.get('pretrained', True)
+            wrapper = RetinaNetWrapper(pretrained=pretrained)
             wrapper.initialize(num_classes=num_classes)
+            return wrapper
         
         else:
-            raise ValueError(f"Неподдерживаемый тип модели: {model_type}")
-        
-        assert wrapper.task_type == 'detection', \
-            f"ОШИБКА: Ожидается только detection, получено {wrapper.task_type}"
-        
-        return wrapper
+            raise ValueError(f"Неизвестный тип модели: {model_type}")
     
-    def create_early_stopper(self, model_key: str, model_config: Dict) -> EarlyStopping:
-        """Создаёт Early Stopper для модели"""
-        if 'early_stopping' in model_config and isinstance(model_config['early_stopping'], dict):
-            es_params = model_config['early_stopping']
+    def create_early_stopper(self, key: str, model_config: Dict[str, Any]) -> EarlyStopping:
+        es_params = model_config.get('early_stopping')
+        if es_params:
+            metric = es_params.get('metric', 'mAP50-95')
             config = EarlyStoppingConfig(
                 patience=es_params.get('patience', self.default_es_config.patience),
                 min_delta=es_params.get('min_delta', self.default_es_config.min_delta),
-                metric=es_params.get('metric', self.default_es_config.metric),
-                mode=es_params.get('mode', self.default_es_config.mode),
-                restore_best=es_params.get('restore_best', self.default_es_config.restore_best)
-            )
-            self.log_message(
-                f"[EARLY_STOP] {model_key}: Индивидуальная конфигурация "
-                f"(patience={config.patience}, metric={config.metric})"
+                metric=metric,
+                mode='min' if 'loss' in metric.lower() else 'max',
+                restore_best=True
             )
         else:
             config = self.default_es_config
         
-        return EarlyStopping(config, model_key)
+        return EarlyStopping(config, key)
     
-    def _save_model_checkpoint(self, key: str, epoch: int, metrics: Dict) -> str:
-        """Сохраняет чекпоинт модели (для early stopping)"""
-        checkpoint_path = os.path.join(self.checkpoint_dir, f"{key}_best_epoch_{epoch}.pt")
+    def save_checkpoint_with_metrics(self, key: str, epoch: int, metrics: Dict[str, float]) -> str:
+        checkpoint_path = os.path.join(
+            self.checkpoint_dir,
+            f"{key}_epoch_{epoch}_best.pt"
+        )
         
-        if key in self.models and self.models[key] is not None:
-            if hasattr(self.models[key], 'save'):
-                self.models[key].save(checkpoint_path)
-            else:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.models[key].state_dict() if hasattr(self.models[key], 'state_dict') else None,
-                    'metrics': metrics
-                }, checkpoint_path)
+        model = self.models.get(key)
+        if model and hasattr(model, 'model') and model.model is not None:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.model.state_dict() if hasattr(model.model, 'state_dict') else None,
+                'metrics': metrics,
+                'seed': self.seed,
+            }, checkpoint_path)
         
         return checkpoint_path
     
@@ -1133,8 +1106,9 @@ class UniversalModelTrainer:
                     dataset_path=dataset_path,
                     epochs=epochs_to_train,
                     device=device,
-                    batch=-1,
-                    imgsz=imgsz
+                    batch=model_config.get('batch', -1),
+                    imgsz=imgsz,
+                    seed=self.seed,   # ← ДОБАВЛЕНО: передаём seed в YOLO
                 )
             
             elif model_type in ['faster_rcnn', 'retinanet']:
@@ -1190,21 +1164,21 @@ class UniversalModelTrainer:
                 )
                 self.models[key].save(checkpoint_path)
                 self.log_message(f"Сохранен чекпоинт: {checkpoint_path}")
-                
-                del self.models[key]
-                self.models[key] = None
-                
-                if model_type in ['faster_rcnn', 'retinanet'] and key in self.dataloaders:
-                    del self.dataloaders[key]
-                
-                # ========== КРИТИЧЕСКАЯ ОЧИСТКА ПАМЯТИ (ОРИГИНАЛ) ==========
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                
-                gc.collect()
-                
-                self.log_message(f"[MEM] Память очищена после {key}")
+            
+            # ========== КРИТИЧЕСКАЯ ОЧИСТКА ПАМЯТИ (ОРИГИНАЛ) ==========
+            del self.models[key]
+            self.models[key] = None
+            
+            if model_type in ['faster_rcnn', 'retinanet'] and key in self.dataloaders:
+                del self.dataloaders[key]
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            gc.collect()
+            
+            self.log_message(f"[MEM] Память очищена после {key}")
             
             return metrics
         
@@ -1290,93 +1264,60 @@ class UniversalModelTrainer:
                     model_max_epochs = model_config.get('max_epochs', self.max_epochs)
                     if start_epoch >= model_max_epochs:
                         self.training_active[key] = False
-                        self.stop_reasons[key] = f"Достигнут max_epochs={model_max_epochs}"
                         continue
                     
-                    actual_end_epoch = min(end_epoch, model_max_epochs)
                     metrics = self.train_model_segment(
-                        model_config,
-                        dataset_name,
-                        start_epoch,
-                        actual_end_epoch
+                        model_config, dataset_name, start_epoch, end_epoch
                     )
                     
                     if metrics is None:
                         continue
                     
-                    # ========== EARLY STOPPING ==========
-                    if self.enable_early_stopping and key in self.early_stoppers:
-                        es = self.early_stoppers[key]
-                        save_fn = lambda e, m: self._save_model_checkpoint(key, e, m)
-                        
-                        should_continue, reason = es.step(
-                            metrics=metrics,
-                            epoch=actual_end_epoch,
-                            model_save_fn=save_fn
-                        )
-                        
-                        self.log_message(f"[EARLY_STOP] {key}: {reason}")
-                        
-                        if not should_continue:
-                            self.training_active[key] = False
-                            self.stop_reasons[key] = reason
+                    # Early Stopping проверка
+                    if self.enable_early_stopping and self.early_stoppers:
+                        stopper = self.early_stoppers.get(key)
+                        if stopper:
+                            def save_fn(ep, mtr):
+                                return self.save_checkpoint_with_metrics(key, ep, mtr)
                             
-                            if key in self.models and self.models[key] is not None:
-                                del self.models[key]
-                                self.models[key] = None
+                            should_continue, reason = stopper.step(metrics, end_epoch, save_fn)
+                            self.log_message(f"[ES] {key}: {reason}")
                             
-                            if key in self.dataloaders:
-                                del self.dataloaders[key]
-                            
-                            torch.cuda.empty_cache()
-                            gc.collect()
-                            continue
-            
-            # ========== РАННИЙ ОТБОР ==========
-            if self.enable_early_selection and self.early_selector:
-                # Проверяем каждую модель индивидуально
-                for model_config in self.model_configs:
-                    for dataset_name in self.dataset_names:
-                        key = f"{model_config['name']}_{dataset_name}"
-
-                        if not self.training_active.get(key, False):
-                            continue
-
-                        model_max_epochs = model_config.get('max_epochs', self.max_epochs)
-
-                        # Вызываем метод для каждой модели
-                        should_continue, reason = self.early_selector.should_continue_training(
+                            if not should_continue:
+                                self.training_active[key] = False
+                                self.stop_reasons[key] = reason
+                                self.log_message(f"[ES] Остановлено обучение {key}")
+                    
+                    # Ранний отбор
+                    if self.enable_early_selection and self.early_selector:
+                        should_continue_sel, sel_reason = self.early_selector.should_continue_training(
                             model_key=key,
                             current_metrics=self.metrics_history,
                             current_epoch=end_epoch,
-                            max_epochs=model_max_epochs
+                            max_epochs=max_epochs_global
                         )
-
-                        if not should_continue:
+                        
+                        if not should_continue_sel:
                             self.training_active[key] = False
-                            self.stop_reasons[key] = f"Ранний отбор: {reason}"
-                            self.log_message(f"[EARLY_SELECT] {key}: {reason}")
-
-                            if key in self.models and self.models[key] is not None:
-                                del self.models[key]
-                                self.models[key] = None
-
-                            if key in self.dataloaders:
-                                del self.dataloaders[key]
-
-                            torch.cuda.empty_cache()
-                            gc.collect()
-
+                            self.stop_reasons[key] = sel_reason
+                            self.log_message(f"[EARLY_SEL] Остановлено: {key} - {sel_reason}")
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            gc.collect()
+            
             self.compare_models(end_epoch)
-
+            
             with open(self.metrics_file, 'w', encoding='utf-8') as f:
                 json.dump(self.metrics_history, f, indent=2)
-
+            
             active_count = sum(1 for active in self.training_active.values() if active)
             if active_count == 0:
                 self.log_message("\n[INFO] Все модели завершили обучение")
                 break
-
+        
         self.log_message("\n" + "=" * 80)
         self.log_message("ОБУЧЕНИЕ ЗАВЕРШЕНО")
         self.log_message("=" * 80)
@@ -1415,7 +1356,9 @@ if __name__ == "__main__":
     trainer = UniversalModelTrainer(
         model_configs=model_configs,
         dataset_names=dataset_names,
+        max_epochs=max(m.get('max_epochs', 40) for m in model_configs),
         checkpoint_interval=5,
+        seed=42,                           # ← задаётся здесь
 
         # Early Stopping
         enable_early_stopping=True,
