@@ -109,6 +109,15 @@ def _apply_intensity_to_params(base: Dict, method: str, level: str) -> Dict:
 
     mults = _MULTIPLIERS.get(level, {}).get(method, {})
     result = copy.deepcopy(base)
+
+    # Если base пустой, но для метода есть дефолтные значения параметров —
+    # инициализируем их, чтобы было что масштабировать
+    _DEFAULTS = {
+        'brightness_correction': {'target_brightness': 0.5},
+    }
+    if not result and method in _DEFAULTS:
+        result = copy.deepcopy(_DEFAULTS[method])
+
     for param, mult in mults.items():
         if param in result:
             result[param] = _scale_param(param, result[param], mult)

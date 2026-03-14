@@ -102,12 +102,13 @@ def calculate_optimal_batch_size_cls(
     if vram_gb <= 0:
         return 16  # CPU-fallback
 
-    # Базовые значения для 8 GB GPU при image_size=224
-    base = {
-        "resnet18":       128,
-        "resnet50":       64,
+    # Научно обоснованные максимумы: Yang et al. (2021) MedMNIST
+    max_batch = {
+        "resnet18":        128,
+        "resnet50":        64,
         "efficientnet_b0": 96,
     }.get(model_type, 64)
+    base = max_batch
 
     # Масштабирование под размер изображения
     size_scale = (224 / max(image_size, 1)) ** 2
@@ -116,7 +117,7 @@ def calculate_optimal_batch_size_cls(
     vram_scale = vram_gb / 8.0
 
     batch = int(base * size_scale * vram_scale * safety_margin)
-    return max(1, batch)
+    return max(1, min(max_batch, batch))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
