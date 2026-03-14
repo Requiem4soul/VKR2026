@@ -29,20 +29,19 @@ init_session_state()
 render_sidebar()
 
 if not is_path_configured():
-    st.error("⚠️ Сначала настрой путь к датасетам в разделе **⚙️ Настройки**.")
+    st.error("Сначала настрой путь к датасетам в разделе **Настройки**.")
     st.stop()
 
 # ── Состояние страницы ─────────────────────────────────────────────────────
 _state_defaults = {
     "train_stage": "configure",
-    "train_task": "detection",          # "detection" | "classification"
+    "train_task": "detection",
     "train_log_lines": [],
     "train_output_queue": None,
     "train_thread_done": False,
     "train_error": None,
     "train_metrics_data": {},
     "train_results_dir": None,
-    # Сохраняем параметры для фонового потока
     "train_selected_datasets": [],
     "train_model_configs_data": [],
     "train_enable_selection": True,
@@ -82,13 +81,21 @@ def suggest_batch_detection(model_type: str, vram: float) -> int:
 
 
 def suggest_batch_classification(model_type: str, vram: float, image_size: int = 224) -> int:
-    """Подсказывает batch_size для классификации на основе VRAM."""
+    """Подсказывает batch_size для классификации на основе VRAM.
+
+    Верхняя граница зафиксирована на уровне значений из Yang et al. (2021) MedMNIST:
+    batch=128 для ResNet-18/50, batch=96 для EfficientNet-B0.
+    При нехватке VRAM значение масштабируется вниз пропорционально.
+    """
     if vram <= 0:
         return 16
-    base = {"resnet18": 128, "resnet50": 64, "efficientnet_b0": 96}.get(model_type, 64)
+    # Максимумы из Yang et al. (2021)
+    max_batch = {"resnet18": 128, "resnet50": 64, "efficientnet_b0": 96}.get(model_type, 64)
+    base = max_batch
     size_scale = (224 / max(image_size, 1)) ** 2
     vram_scale = vram / 8.0
-    return max(1, int(base * size_scale * vram_scale * 0.75))
+    batch = int(base * size_scale * vram_scale * 0.75)
+    return max(1, min(max_batch, batch))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,7 +125,6 @@ def _run_detection_thread(q, datasets, model_configs, datasets_path,
 
         os.environ["DATASETS_GLOBAL_PATH"] = str(datasets_path)
 
-        # Фиксируем seed для воспроизводимости
         import random, numpy as np, torch
         random.seed(seed)
         np.random.seed(seed)
@@ -243,9 +249,9 @@ if st.session_state.train_stage == "configure":
     )
 
     if vram_gb > 0:
-        st.caption(f"🖥️ Обнаружена VRAM: **{vram_gb:.1f} GB**")
+        st.caption(f"Обнаружена VRAM: **{vram_gb:.1f} GB**")
     else:
-        st.caption("⚠️ GPU не обнаружен — обучение на CPU.")
+        st.caption("GPU не обнаружен — обучение на CPU.")
 
     st.divider()
 
@@ -254,9 +260,9 @@ if st.session_state.train_stage == "configure":
     task = st.radio(
         "Выберите задачу",
         options=["detection", "classification"],
-        format_func=lambda x: "🔍 Детекция объектов (YOLOv8, Faster R-CNN, RetinaNet)"
+        format_func=lambda x: "Детекция объектов (YOLOv8, Faster R-CNN, RetinaNet)"
                                if x == "detection"
-                               else "🏷️ Классификация изображений (ResNet-18, ResNet-50, EfficientNet-B0)",
+                               else "Классификация изображений (ResNet-18, ResNet-50, EfficientNet-B0)",
         index=0 if st.session_state.train_task == "detection" else 1,
         key="task_radio",
         horizontal=True,
@@ -286,6 +292,7 @@ if st.session_state.train_stage == "configure":
             options=datasets,
             help="Каждая модель будет обучена на каждом датасете.",
         )
+
         st.divider()
 
         # ══════════════════════════════════════════════════════════════════
@@ -293,27 +300,28 @@ if st.session_state.train_stage == "configure":
         # ══════════════════════════════════════════════════════════════════
         if task == "detection":
             st.subheader("Шаг 2: Модели детекции")
+
             col1, col2, col3 = st.columns(3)
             with col1:
-                use_yolo = st.checkbox("🟦 YOLOv8", value=True)
+                use_yolo = st.checkbox("YOLOv8", value=True)
             with col2:
-                use_frcnn = st.checkbox("🟧 Faster R-CNN", value=False)
+                use_frcnn = st.checkbox("Faster R-CNN", value=False)
             with col3:
-                use_retina = st.checkbox("🟩 RetinaNet", value=False)
+                use_retina = st.checkbox("RetinaNet", value=False)
 
             st.divider()
             st.subheader("Шаг 3: Гиперпараметры")
 
             if use_yolo:
-                with st.expander("🟦 YOLOv8", expanded=True):
+                with st.expander("YOLOv8", expanded=True):
                     col_a, col_b = st.columns(2)
                     with col_a:
                         yolo_size = st.selectbox(
                             "Размер модели",
-                            ["n", "s", "m", "l", "x"],
-                            index=1,
+                            options=["n", "s", "m", "l", "x"],
                             format_func=lambda x: {"n": "nano", "s": "small", "m": "medium",
                                                     "l": "large", "x": "xlarge"}[x],
+                            index=0,
                             key="yolo_size",
                         )
                         yolo_epochs = st.number_input("Макс. эпох", 1, 500, 80, key="yolo_epochs")
@@ -335,7 +343,7 @@ if st.session_state.train_stage == "configure":
                     })
 
             if use_frcnn:
-                with st.expander("🟧 Faster R-CNN", expanded=True):
+                with st.expander("Faster R-CNN", expanded=True):
                     col_a, col_b = st.columns(2)
                     with col_a:
                         frcnn_epochs = st.number_input("Макс. эпох", 1, 200, 25, key="frcnn_epochs")
@@ -358,7 +366,7 @@ if st.session_state.train_stage == "configure":
                     })
 
             if use_retina:
-                with st.expander("🟩 RetinaNet", expanded=True):
+                with st.expander("RetinaNet", expanded=True):
                     col_a, col_b = st.columns(2)
                     with col_a:
                         ret_epochs = st.number_input("Макс. эпох", 1, 200, 35, key="ret_epochs")
@@ -392,20 +400,20 @@ if st.session_state.train_stage == "configure":
 
             col1, col2, col3 = st.columns(3)
             with col1:
-                use_rn18 = st.checkbox("🔵 ResNet-18", value=True,
+                use_rn18 = st.checkbox("ResNet-18", value=True,
                                         help="He et al. (2016), CVPR. ~11M параметров.")
             with col2:
-                use_rn50 = st.checkbox("🟠 ResNet-50", value=False,
+                use_rn50 = st.checkbox("ResNet-50", value=False,
                                         help="He et al. (2016), CVPR. ~25M параметров.")
             with col3:
-                use_eff = st.checkbox("🟢 EfficientNet-B0", value=False,
+                use_eff = st.checkbox("EfficientNet-B0", value=False,
                                        help="Tan & Le (2019), ICML. ~5M параметров.")
 
             st.divider()
             st.subheader("Шаг 3: Гиперпараметры")
 
             if use_rn18:
-                with st.expander("🔵 ResNet-18", expanded=True):
+                with st.expander("ResNet-18", expanded=True):
                     col_a, col_b = st.columns(2)
                     with col_a:
                         rn18_imgsz = st.selectbox(
@@ -422,7 +430,7 @@ if st.session_state.train_stage == "configure":
                     with col_b:
                         rn18_batch = st.number_input(
                             "Batch size", 1, 512,
-                            value=suggest_batch_classification("resnet18", vram_gb, rn18_imgsz),
+                            value=min(512, suggest_batch_classification("resnet18", vram_gb, rn18_imgsz)),
                             help="128 — значение из Yang et al. (2021), масштабируется под VRAM",
                             key="rn18_batch",
                         )
@@ -440,7 +448,7 @@ if st.session_state.train_stage == "configure":
                     })
 
             if use_rn50:
-                with st.expander("🟠 ResNet-50", expanded=True):
+                with st.expander("ResNet-50", expanded=True):
                     col_a, col_b = st.columns(2)
                     with col_a:
                         rn50_imgsz = st.selectbox(
@@ -451,7 +459,7 @@ if st.session_state.train_stage == "configure":
                     with col_b:
                         rn50_batch = st.number_input(
                             "Batch size", 1, 512,
-                            value=suggest_batch_classification("resnet50", vram_gb),
+                            value=min(512, suggest_batch_classification("resnet50", vram_gb, rn50_imgsz)),
                             key="rn50_batch",
                         )
                     col_c, col_d = st.columns(2)
@@ -468,7 +476,7 @@ if st.session_state.train_stage == "configure":
                     })
 
             if use_eff:
-                with st.expander("🟢 EfficientNet-B0", expanded=True):
+                with st.expander("EfficientNet-B0", expanded=True):
                     col_a, col_b = st.columns(2)
                     with col_a:
                         eff_imgsz = st.selectbox(
@@ -481,7 +489,7 @@ if st.session_state.train_stage == "configure":
                     with col_b:
                         eff_batch = st.number_input(
                             "Batch size", 1, 512,
-                            value=suggest_batch_classification("efficientnet_b0", vram_gb),
+                            value=min(512, suggest_batch_classification("efficientnet_b0", vram_gb, eff_imgsz)),
                             key="eff_batch",
                         )
                     col_c, col_d = st.columns(2)
@@ -497,7 +505,7 @@ if st.session_state.train_stage == "configure":
                         "early_stopping": {"patience": eff_patience, "metric": "val_auc"} if eff_es else None,
                     })
 
-        # ── Дополнительные параметры (общие для обеих задач) ─────────────
+        # ── Дополнительные параметры ──────────────────────────────────────
         st.divider()
         st.subheader("Шаг 4: Дополнительные параметры")
 
@@ -511,11 +519,11 @@ if st.session_state.train_stage == "configure":
                 min_ep = min(m.get("max_epochs", 40) for m in model_configs)
                 if checkpoint_interval > min_ep:
                     st.warning(
-                        f"⚠️ Интервал {checkpoint_interval} > max_epochs одной модели ({min_ep}). "
+                        f"Интервал {checkpoint_interval} > max_epochs одной модели ({min_ep}). "
                         "Чекпоинт сохранится только в конце."
                     )
 
-        with st.expander("🎲 Воспроизводимость (Seed)", expanded=True):
+        with st.expander("Воспроизводимость (Seed)", expanded=True):
             st.markdown(
                 "Фиксация seed гарантирует одинаковые результаты при повторных запусках. "
                 "Передай значение другому пользователю — он получит идентичные метрики "
@@ -526,27 +534,27 @@ if st.session_state.train_stage == "configure":
                 help="Фиксирует: torch, numpy, random, cudnn.deterministic=True",
             )
 
-        with st.expander("⚡ Ранний отбор моделей", expanded=True):
+        with st.expander("Ранний отбор моделей", expanded=True):
             st.markdown(
                 "После первых N% эпох слабые модели останавливаются раньше. "
-                "*(Jamieson & Talwalkar, 2016)*"
+                "Экономит время при обучении нескольких моделей одновременно."
             )
-            col_a, col_b = st.columns(2)
-            with col_a:
-                enable_selection = st.checkbox("Включить ранний отбор", value=False)
-            with col_b:
-                selection_ratio = st.slider("Отбор после % эпох", 10, 50, 30,
-                                             disabled=not enable_selection)
-                top_k = st.slider("Оставить % лучших", 25, 75, 50,
-                                   disabled=not enable_selection)
+            enable_selection = st.checkbox("Включить ранний отбор", value=True)
+            col_sel1, col_sel2 = st.columns(2)
+            with col_sel1:
+                selection_ratio = st.slider(
+                    "Отбор после (% эпох)", 10, 90, 30, disabled=not enable_selection,
+                )
+            with col_sel2:
+                top_k = st.slider(
+                    "Оставить лучших (%)", 10, 90, 50, disabled=not enable_selection,
+                )
 
-    st.divider()
-
+    # ── Итог и запуск ────────────────────────────────────────────────────
     if selected_datasets and model_configs:
-        total_runs = len(selected_datasets) * len(model_configs)
-        st.info(
-            f"**Будет выполнено:** {total_runs} комбинаций "
-            f"({len(model_configs)} мод. × {len(selected_datasets)} датасет.) | "
+        st.caption(
+            f"Будет запущено: {len(model_configs)} модель(ей) "
+            f"x {len(selected_datasets)} датасет(ов) | "
             f"Seed: {seed}"
         )
 
@@ -676,7 +684,7 @@ elif st.session_state.train_stage == "done":
 
         if task == "detection":
             st.warning(
-                "⚠️ `train_loss` и `val_loss` вычисляются по-разному для YOLO, "
+                "`train_loss` и `val_loss` вычисляются по-разному для YOLO, "
                 "Faster R-CNN и RetinaNet — сравнивать модели по loss некорректно. "
                 "Используй **mAP50** и **mAP50-95**."
             )
@@ -699,7 +707,6 @@ elif st.session_state.train_stage == "done":
                         for metric in ["mAP50", "mAP50-95", "precision", "recall", "f1"]:
                             row[metric] = f"{last.get(metric, 0):.4f}" if metric in last else "—"
                     else:
-                        # Ищем лучший по val_auc среди всей истории
                         best = max(history, key=lambda x: x.get("val_auc", x.get("val_acc", 0)))
                         for metric in ["val_auc", "val_acc", "val_loss"]:
                             row[metric + " (best)"] = f"{best.get(metric, 0):.4f}"
@@ -726,7 +733,7 @@ elif st.session_state.train_stage == "done":
                                 file_name="metrics.json", mime="application/json")
 
         if st.session_state.train_results_dir:
-            st.info(f"📁 Папка с результатами: `{st.session_state.train_results_dir}`")
+            st.info(f"Папка с результатами: `{st.session_state.train_results_dir}`")
 
     st.divider()
     st.subheader("Что дальше?")

@@ -1,6 +1,9 @@
 """
 Применение предобработки к датасету.
 Поддерживает глобальную и адаптивную (кластерную) стратегии обработки.
+Поддерживает два формата датасетов:
+- YOLO: split/images/*.jpg + split/labels/*.txt + data.yaml
+- Классификация: split/class_name/*.jpg (ImageFolder)
 """
 
 import shutil
@@ -11,6 +14,76 @@ from typing import Dict, List, Any, Optional
 
 from Preprocessing.methods import PreprocessingMethods
 from Data.Datasets.dataset_work import get_dataset_path
+
+
+def _detect_dataset_type(dataset_path: Path) -> str:
+    """
+    Определяет тип датасета по структуре папок.
+    Возвращает 'yolo' или 'classification'.
+    """
+    if (dataset_path / 'data.yaml').exists():
+        return 'yolo'
+    train_path = dataset_path / 'train'
+    if train_path.exists():
+        if (train_path / 'images').exists():
+            return 'yolo'
+        subdirs = [d for d in train_path.iterdir() if d.is_dir()]
+        if subdirs:
+            return 'classification'
+    return 'yolo'
+
+
+def _collect_image_files(split_dir: Path) -> List[Path]:
+    """Собирает все файлы изображений из split-папки (YOLO или классификация)."""
+    images_dir = split_dir / 'images'
+    if images_dir.exists():
+        return sorted(
+            list(images_dir.glob('*.jpg')) +
+            list(images_dir.glob('*.jpeg')) +
+            list(images_dir.glob('*.png'))
+        )
+    # Классификация: рекурсивно из подпапок и самой папки
+    files = []
+    for ext in ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff'):
+        files.extend(split_dir.rglob(ext))
+    return sorted(files)
+
+
+def _create_dst_structure(src_path: Path, dst_path: Path,
+                           splits: List[str], dataset_type: str):
+    """Создаёт структуру целевой папки, зеркалируя структуру источника."""
+    if dataset_type == 'yolo':
+        for split in splits:
+            (dst_path / split / 'images').mkdir(parents=True, exist_ok=True)
+            (dst_path / split / 'labels').mkdir(parents=True, exist_ok=True)
+        if (src_path / 'data.yaml').exists():
+            shutil.copy(src_path / 'data.yaml', dst_path / 'data.yaml')
+    else:
+        # Классификация: копируем дерево подпапок (классы)
+        for split in splits:
+            src_split = src_path / split
+            if not src_split.exists():
+                continue
+            subdirs = [d for d in src_split.iterdir() if d.is_dir()]
+            if subdirs:
+                for cls_dir in subdirs:
+                    (dst_path / split / cls_dir.name).mkdir(parents=True, exist_ok=True)
+            else:
+                (dst_path / split).mkdir(parents=True, exist_ok=True)
+        if (src_path / 'dataset_info.json').exists():
+            shutil.copy(src_path / 'dataset_info.json',
+                        dst_path / 'dataset_info.json')
+
+
+def _dst_image_path(src_img: Path, src_split_dir: Path,
+                     dst_split_dir: Path) -> Path:
+    """
+    Вычисляет путь назначения для изображения, сохраняя относительную структуру.
+    Для YOLO: dst/split/images/file.jpg
+    Для классификации: dst/split/class_name/file.jpg
+    """
+    rel = src_img.relative_to(src_split_dir)
+    return dst_split_dir / rel
 
 
 class DatasetPreprocessor:
@@ -28,8 +101,8 @@ class DatasetPreprocessor:
             splits: List[str] = ['train', 'valid', 'test']
     ):
         """
-        Применяет одну и ту же предобработку ко всем изображениям
-        
+        Применяет одну и ту же предобработку ко всем изображениям.
+
         Args:
             source_dataset: Название исходного датасета
             target_dataset: Название нового датасета
@@ -43,42 +116,60 @@ class DatasetPreprocessor:
         """
         src_path = get_dataset_path(source_dataset)
         dst_path = get_dataset_path(target_dataset)
+        dataset_type = _detect_dataset_type(src_path)
 
         print(f"\nПрименяем глобальную предобработку:")
+        print(f"  Тип датасета: {dataset_type}")
         print(f"  Методы: {', '.join(methods)}")
-        print(f"  {source_dataset} → {target_dataset}")
-        
+        print(f"  {source_dataset} -> {target_dataset}")
+
         if params:
             print(f"  Параметры:")
             for method, method_params in params.items():
                 if method in methods:
-                    print(f"     {method}: {method_params}")
+                    print(f"    {method}: {method_params}")
 
-        # Удаляем старую версию если есть
         if dst_path.exists():
             shutil.rmtree(dst_path)
 
-        # Создаём структуру папок
-        for split in splits:
-            for subfolder in ['images', 'labels']:
-                (dst_path / split / subfolder).mkdir(parents=True, exist_ok=True)
+        _create_dst_structure(src_path, dst_path, splits, dataset_type)
 
-        # Копируем data.yaml
-        if (src_path / 'data.yaml').exists():
-            shutil.copy(src_path / 'data.yaml', dst_path / 'data.yaml')
-
-        # Обрабатываем каждый split
         for split in splits:
-            images_dir = src_path / split / 'images'
-            if not images_dir.exists():
+            src_split_dir = src_path / split
+            dst_split_dir = dst_path / split
+            if not src_split_dir.exists():
                 print(f"  Пропускаем {split} (не найден)")
                 continue
 
-            self._process_split_global(
-                src_path, dst_path, split, methods, params
-            )
+            image_files = _collect_image_files(src_split_dir)
+            if not image_files:
+                print(f"  Пропускаем {split} (нет изображений)")
+                continue
 
-        print(f"\n Готово! Датасет сохранён в {dst_path}")
+            print(f"  Обрабатываем {split}: {len(image_files)} изображений")
+
+            _params = params.copy() if params else {}
+            if 'denoise' in methods and 'denoise' not in _params:
+                _params['denoise'] = {'method': 'median'}
+
+            for img_path in tqdm(image_files, desc=f"Processing {split}"):
+                image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    continue
+                processed = self.methods.apply_pipeline(image, methods, _params)
+
+                out_path = _dst_image_path(img_path, src_split_dir, dst_split_dir)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out_path), processed)
+
+                # Копируем label только для YOLO
+                if dataset_type == 'yolo':
+                    label_src = src_split_dir / 'labels' / (img_path.stem + '.txt')
+                    if label_src.exists():
+                        label_dst = dst_split_dir / 'labels' / label_src.name
+                        shutil.copy(label_src, label_dst)
+
+        print(f"\nГотово! Датасет сохранён в {dst_path}")
 
     def apply_adaptive_preprocessing(
             self,
@@ -90,8 +181,8 @@ class DatasetPreprocessor:
             splits: List[str] = ['train', 'valid', 'test']
     ):
         """
-        Применяет разную предобработку к разным кластерам
-        
+        Применяет разную предобработку к разным кластерам.
+
         Args:
             source_dataset: Название исходного датасета
             target_dataset: Название нового датасета
@@ -102,121 +193,86 @@ class DatasetPreprocessor:
         """
         src_path = get_dataset_path(source_dataset)
         dst_path = get_dataset_path(target_dataset)
+        dataset_type = _detect_dataset_type(src_path)
 
         print(f"\nПрименяем адаптивную предобработку:")
+        print(f"  Тип датасета: {dataset_type}")
         print(f"  Кластеров: {len(clusters)}")
 
-        # Удаляем старую версию
         if dst_path.exists():
             shutil.rmtree(dst_path)
 
-        # Создаём структуру
-        for split in splits:
-            for subfolder in ['images', 'labels']:
-                (dst_path / split / subfolder).mkdir(parents=True, exist_ok=True)
-
-        # Копируем data.yaml
-        if (src_path / 'data.yaml').exists():
-            shutil.copy(src_path / 'data.yaml', dst_path / 'data.yaml')
+        _create_dst_structure(src_path, dst_path, splits, dataset_type)
 
         # Обрабатываем train split по кластерам
-        images_dir = src_path / 'train' / 'images'
-        image_files = sorted(list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png")))
+        src_train_dir = src_path / 'train'
+        dst_train_dir = dst_path / 'train'
+        image_files = _collect_image_files(src_train_dir)
 
-        # Обрабатываем по кластерам
         for cluster_id, cluster_info in clusters.items():
-            methods = cluster_info['preprocessing']
+            cluster_methods = cluster_info['preprocessing']
             indices = cluster_info['image_indices']
 
             print(f"\nКластер {cluster_id}: {len(indices)} изображений")
-            print(f"  Методы: {', '.join(methods) if methods else 'нет обработки'}")
+            print(f"  Методы: {', '.join(cluster_methods) if cluster_methods else 'нет обработки'}")
 
             for idx in tqdm(indices, desc=f"Cluster {cluster_id}"):
                 img_path = image_files[idx]
                 img_metrics = image_metrics[idx]
 
-                # Загружаем и обрабатываем
                 image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    continue
 
-                if methods:
+                if cluster_methods:
                     combined_params = self._build_params_for_image(
-                        methods, 
-                        img_metrics, 
+                        cluster_methods,
+                        img_metrics,
                         params
                     )
-                    
-                    processed = self.methods.apply_pipeline(image, methods, combined_params)
+                    processed = self.methods.apply_pipeline(image, cluster_methods, combined_params)
                 else:
                     processed = image
 
-                # Сохраняем
-                target_img = dst_path / 'train' / 'images' / img_path.name
-                cv2.imwrite(str(target_img), processed)
+                out_path = _dst_image_path(img_path, src_train_dir, dst_train_dir)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out_path), processed)
 
-                # Копируем label
-                label_src = src_path / 'train' / 'labels' / (img_path.stem + '.txt')
-                label_dst = dst_path / 'train' / 'labels' / (img_path.stem + '.txt')
-                if label_src.exists():
-                    shutil.copy(label_src, label_dst)
+                # Копируем label только для YOLO
+                if dataset_type == 'yolo':
+                    label_src = src_train_dir / 'labels' / (img_path.stem + '.txt')
+                    if label_src.exists():
+                        label_dst = dst_train_dir / 'labels' / label_src.name
+                        shutil.copy(label_src, label_dst)
 
         # Копируем valid и test без изменений
         for split in ['valid', 'test']:
-            if split == 'train':
-                continue
-
             src_split = src_path / split
             if src_split.exists():
-                self._copy_split_as_is(src_path, dst_path, split)
+                self._copy_split_as_is(src_path, dst_path, split, dataset_type)
 
-        print(f"\n Готово! Датасет сохранён в {dst_path}")
+        print(f"\nГотово! Датасет сохранён в {dst_path}")
 
-    def _process_split_global(
-            self,
-            src_path: Path,
-            dst_path: Path,
-            split: str,
-            methods: List[str],
-            params: Optional[Dict]
-    ):
-        """Обрабатывает один split с глобальными параметрами"""
-        images_dir = src_path / split / 'images'
-        labels_dir = src_path / split / 'labels'
+    def _copy_split_as_is(self, src_path: Path, dst_path: Path,
+                           split: str, dataset_type: str = 'yolo'):
+        """Копирует split без изменений."""
+        if dataset_type == 'yolo':
+            for subfolder in ['images', 'labels']:
+                src_dir = src_path / split / subfolder
+                dst_dir = dst_path / split / subfolder
+                if src_dir.exists():
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                    for file in src_dir.iterdir():
+                        shutil.copy(file, dst_dir / file.name)
+        else:
+            # Классификация: копируем всё дерево рекурсивно
+            src_split_dir = src_path / split
+            dst_split_dir = dst_path / split
+            if src_split_dir.exists():
+                if dst_split_dir.exists():
+                    shutil.rmtree(dst_split_dir)
+                shutil.copytree(src_split_dir, dst_split_dir)
 
-        image_files = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png"))
-
-        for img_path in tqdm(image_files, desc=f"Processing {split}"):
-            # Загружаем
-            image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-
-            if params is None:
-                params = {}
-
-            if 'denoise' in methods and 'denoise' not in params:
-                params['denoise'] = {'method': 'median'}
-
-            processed = self.methods.apply_pipeline(image, methods, params)
-
-            # Сохраняем
-            target_img = dst_path / split / 'images' / img_path.name
-            cv2.imwrite(str(target_img), processed)
-
-            # Копируем label
-            label_path = labels_dir / (img_path.stem + '.txt')
-            target_label = dst_path / split / 'labels' / (img_path.stem + '.txt')
-
-            if label_path.exists():
-                shutil.copy(label_path, target_label)
-
-    def _copy_split_as_is(self, src_path: Path, dst_path: Path, split: str):
-        """Копирует split без изменений"""
-        for subfolder in ['images', 'labels']:
-            src_dir = src_path / split / subfolder
-            dst_dir = dst_path / split / subfolder
-
-            if src_dir.exists():
-                for file in src_dir.iterdir():
-                    shutil.copy(file, dst_dir / file.name)
-    
     def _build_params_for_image(
         self,
         methods: List[str],
@@ -228,20 +284,15 @@ class DatasetPreprocessor:
         Объединяет глобальные параметры из правил с поправками на метрики изображения.
         """
         combined_params = global_params.copy() if global_params else {}
-        
-        # Для denoise объединяем параметры правильно
+
         if 'denoise' in methods:
             if 'denoise' not in combined_params:
                 combined_params['denoise'] = {}
-            
-            # Добавляем тип шума из метрик изображения
+
             combined_params['denoise']['noise_type'] = img_metrics.noise_type
             combined_params['denoise']['noise_level'] = img_metrics.noise_level
-            
-            # ВАЖНО: Если в global_params уже есть 'method', НЕ перезаписываем
-            # Иначе выбираем автоматически на основе типа шума
+
             if 'method' not in combined_params['denoise']:
-                # Автоматический выбор метода на основе типа шума
                 noise_to_method = {
                     'gaussian': 'bilateral',
                     'salt_pepper': 'median',
@@ -249,9 +300,8 @@ class DatasetPreprocessor:
                     'speckle': 'median'
                 }
                 combined_params['denoise']['method'] = noise_to_method.get(
-                    img_metrics.noise_type, 
-                    'median'  # Безопасный дефолт
+                    img_metrics.noise_type,
+                    'median'
                 )
-            # Если метод уже указан в global_params - используем его
-        
+
         return combined_params

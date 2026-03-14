@@ -147,7 +147,6 @@ def _run_detection_search_thread(dataset_path, model_config, epochs, patience, q
 
         os.environ['DATASETS_GLOBAL_PATH'] = str(datasets_path)
 
-        # Фиксируем seed
         import random, numpy as np, torch
         random.seed(seed)
         np.random.seed(seed)
@@ -238,10 +237,6 @@ def _run_classification_search_thread(
         torch.backends.cudnn.benchmark = False
         os.environ['PYTHONHASHSEED'] = str(seed)
 
-        # Для классификации передаём model_config с типом классификационной модели
-        # в run_sfs_sha_search — она использует его как proxy.
-        # Модуль 3 уже умеет работать с любым model_config через _run_training,
-        # поэтому достаточно передать правильный тип.
         from module3_preprocessing_search import run_sfs_sha_search
 
         model_config = {
@@ -311,8 +306,8 @@ if st.session_state.m3_stage == 'configure':
 **Successive Halving (SHA)** на каждом шаге отсевает слабых кандидатов
 через быстрое частичное обучение (30% эпох).
 
-**Пул методов (13 кандидатов):** Оригинал, Median filter (×2), Gaussian blur (×2),
-Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
+**Пул методов (13 кандидатов):** Оригинал, Median filter (x2), Gaussian blur (x2),
+Bilateral filter (x2), CLAHE (x2), Unsharp mask (x2), Z-score, Min-Max.
 
 *Источники: Kohavi & John (1997); Jamieson & Talwalkar (2016)*
         """)
@@ -329,7 +324,7 @@ Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
     task = st.radio(
         "Задача",
         options=["detection", "classification"],
-        format_func=lambda x: "🔍 Детекция" if x == "detection" else "🏷️ Классификация",
+        format_func=lambda x: "Детекция" if x == "detection" else "Классификация",
         index=0 if st.session_state.m3_task == "detection" else 1,
         key="m3_task_radio",
         horizontal=True,
@@ -378,10 +373,13 @@ Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
                 format_func=lambda x: {
                     'resnet18': 'ResNet-18 (быстрее)',
                     'resnet50': 'ResNet-50',
-                    'efficientnet_b0': 'EfficientNet-B0 (лёгкий)',
+                    'efficientnet_b0': 'EfficientNet-B0',
                 }[x],
                 key='m3_cls_model_select',
             )
+            # Виджет записывает значение в session_state[key] автоматически.
+            # Не присваивать session_state.m3_cls_imgsz вручную после этого —
+            # это вызывает StreamlitAPIException в Streamlit 1.5+.
             cls_imgsz = st.selectbox(
                 "Размер изображений", [28, 224], index=1,
                 help="28 = как в MedMNIST; 224 = ImageNet-стандарт",
@@ -418,7 +416,7 @@ Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
     st.divider()
 
     # ── Воспроизводимость ─────────────────────────────────────────────────
-    with st.expander("🎲 Воспроизводимость (Seed)", expanded=False):
+    with st.expander("Воспроизводимость (Seed)", expanded=False):
         st.markdown(
             "Фиксирует все источники случайности для идентичных результатов "
             "при повторном запуске с тем же seed."
@@ -426,7 +424,6 @@ Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
         seed = st.number_input(
             "Random seed", 0, 2 ** 31 - 1, value=42, key='m3_seed_input',
         )
-    st.session_state.m3_seed = seed if 'm3_seed_input' in st.session_state else 42
 
     # ── Оценка времени ─────────────────────────────────────────────────────
     n_candidates = 13
@@ -438,7 +435,7 @@ Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
     total_est = n_candidates * n_iters_est * time_per
 
     st.info(
-        f"Примерное время: {total_est}–{total_est * 2} мин. "
+        f"Примерное время: {total_est}–{total_est * 2} мин. | "
         f"Всего обучений: ~{n_candidates * n_iters_est}"
     )
 
@@ -447,10 +444,11 @@ Bilateral filter (×2), CLAHE (×2), Unsharp mask (×2), Z-score, Min-Max.
         st.session_state.m3_model_type = model_type
         st.session_state.m3_yolo_size = yolo_size
         st.session_state.m3_cls_model = cls_model
-        st.session_state.m3_cls_imgsz = cls_imgsz
+        # m3_cls_imgsz уже записан в session_state виджетом через key='m3_cls_imgsz'.
+        # Повторное присвоение вызывает StreamlitAPIException — не трогаем.
         st.session_state.m3_epochs = epochs
         st.session_state.m3_patience = patience
-        st.session_state.m3_seed = seed
+        st.session_state.m3_seed = seed if 'm3_seed_input' in st.session_state else 42
         st.session_state.m3_log_lines = []
         st.session_state.m3_error = None
         st.session_state.m3_result = None

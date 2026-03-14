@@ -165,9 +165,9 @@ class UniversalImageAnalyzer:
         Основано на статистическом анализе шумовой компоненты.
 
         Научное обоснование:
-        - Gaussian noise: симметричное распределение (skewness ≈ 0, kurtosis ≈ 3)
+        - Gaussian noise: симметричное распределение (skewness ~ 0, kurtosis ~ 3)
         - Salt & Pepper: тяжёлые хвосты (high kurtosis > 5)
-        - Speckle: мультипликативный (σ растёт с интенсивностью)
+        - Speckle: мультипликативный (sigma растёт с интенсивностью)
 
         References:
         - Gonzalez & Woods, "Digital Image Processing" (2018)
@@ -184,69 +184,48 @@ class UniversalImageAnalyzer:
             else:
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # 1. Извлекаем шумовую компоненту
         signal = cv2.GaussianBlur(image, (5, 5), 1.0)
         noise = image - signal
         noise_flat = noise.flatten()
 
-        # 2. Статистические характеристики шума
         skewness = float(stats.skew(noise_flat))
         kurtosis_val = float(stats.kurtosis(noise_flat))
 
-        # 3. Проверка на мультипликативность (speckle)
         is_multiplicative = self._check_multiplicative_noise(image, noise)
 
-        # 4. Классификация на основе статистик
-
-        # Speckle (характерен для SAR, ультразвука)
         if is_multiplicative:
             return 'speckle'
-
-        # Salt & Pepper (импульсный шум)
-        # Характеризуется тяжёлыми хвостами распределения
-        if kurtosis_val > 5.0:
+        elif kurtosis_val > 5:
             return 'salt_pepper'
-
-        # Gaussian (аддитивный белый шум)
-        # Нормальное распределение: skewness ≈ 0, kurtosis ≈ 3
-        if abs(skewness) < 0.5 and abs(kurtosis_val - 3.0) < 2.0:
+        elif abs(skewness) < 0.5:
             return 'gaussian'
-
-        # Если не подходит под известные типы
-        return 'unknown'
+        else:
+            return 'unknown'
 
     def _check_multiplicative_noise(self, image: np.ndarray, noise: np.ndarray) -> bool:
         """
-        Проверяет является ли шум мультипликативным (speckle)
+        Проверяет является ли шум мультипликативным (speckle).
 
-        Speckle noise: σ_noise ∝ I_signal
-        (дисперсия шума растёт с интенсивностью сигнала)
-
-        Научное обоснование:
-        - Lee, J. S. (1980). "Digital image enhancement and noise filtering
-          by use of local statistics" IEEE TPAMI, 2(2), 165-168.
+        Основано на методе Lee (1980):
+        Lee, J.S. (1980). "Digital image enhancement and noise filtering
+        by use of local statistics" IEEE TPAMI, 2(2), 165-168.
 
         Returns:
             True если шум мультипликативный (speckle)
         """
-        # Разбиваем изображение на яркие и тёмные области
         percentile_75 = np.percentile(image, 75)
         percentile_25 = np.percentile(image, 25)
 
         bright_mask = image > percentile_75
         dark_mask = image < percentile_25
 
-        # Убеждаемся что есть достаточно пикселей
         if np.sum(bright_mask) < 100 or np.sum(dark_mask) < 100:
             return False
 
-        # Считаем стандартное отклонение шума в каждой области
         noise_std_bright = np.std(noise[bright_mask])
         noise_std_dark = np.std(noise[dark_mask])
 
-        # Если в ярких областях шум сильнее → мультипликативный
-        # Порог 1.5 основан на эмпирических данных из литературы по SAR
-        if noise_std_dark < 1e-10:  # Избегаем деления на 0
+        if noise_std_dark < 1e-10:
             return False
 
         ratio = noise_std_bright / noise_std_dark
@@ -353,7 +332,6 @@ class UniversalImageAnalyzer:
         if image is None:
             raise ValueError(f"Не удалось загрузить {image_path}")
 
-        # Приводим к grayscale если нужно
         if len(image.shape) == 3:
             if image.shape[2] == 4:
                 image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
@@ -475,13 +453,35 @@ class UniversalImageAnalyzer:
             sample_size: Optional[int] = None,
             split: str = 'train'
     ) -> Tuple[DatasetMetrics, List[ImageMetrics]]:
-        """Анализ всего датасета"""
-        images_dir = dataset_path / split / "images"
+        """Анализ всего датасета.
 
-        if not images_dir.exists():
-            raise ValueError(f"Директория {images_dir} не найдена")
+        Поддерживает структуры:
+        1. YOLO: <split>/images/*.jpg
+        2. Классификация ImageFolder: <split>/<class_name>/*.jpg
+        3. Классификация flat: <split>/*.jpg
+        """
+        split_dir = dataset_path / split
 
-        image_files = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png"))
+        if not split_dir.exists():
+            raise ValueError(f"Директория {split_dir} не найдена")
+
+        # Формат 1: YOLO (split/images/)
+        images_dir = split_dir / "images"
+        if images_dir.exists() and images_dir.is_dir():
+            image_files = list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.png"))
+        else:
+            # Форматы 2 & 3: Классификация — ImageFolder или flat.
+            # rglob собирает файлы из подпапок (class_name/) и из самой split/
+            image_files = []
+            for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff"):
+                image_files.extend(split_dir.rglob(ext))
+
+        if not image_files:
+            raise ValueError(
+                f"Изображения не найдены в {split_dir}. "
+                "Ожидается YOLO (split/images/) или классификация "
+                "(split/class/ или split/*.jpg)."
+            )
 
         if sample_size and sample_size < len(image_files):
             import random
@@ -562,7 +562,7 @@ class UniversalImageAnalyzer:
         if 'low_contrast' in dominant_issues:
             recommended_global.append('contrast_enhancement')
         if 'dark_images' in dominant_issues or 'bright_images' in dominant_issues:
-            recommended_global.append('brightness_normalization')
+            recommended_global.append('brightness_correction')
 
         needs_adaptive = homogeneity < 0.7
 
@@ -597,49 +597,49 @@ class UniversalImageAnalyzer:
         )
 
     def print_dataset_report(self, dataset_metrics: DatasetMetrics):
-        """Красивый вывод отчёта по датасету"""
+        """Вывод отчёта по датасету"""
         print("\n" + "=" * 70)
         print("ОТЧЁТ ПО АНАЛИЗУ ДАТАСЕТА")
         print("=" * 70)
 
-        print(f"\n📊 Общая информация:")
+        print(f"\nОбщая информация:")
         print(f"  Проанализировано изображений: {dataset_metrics.num_images}")
         print(f"  Однородность датасета: {dataset_metrics.dataset_homogeneity:.2%}")
 
-        print(f"\n🔊 Шум:")
-        print(f"  Средний SNR: {dataset_metrics.avg_snr:.1f} dB (±{dataset_metrics.std_snr:.1f})")
+        print(f"\nШум:")
+        print(f"  Средний SNR: {dataset_metrics.avg_snr:.1f} dB (+-{dataset_metrics.std_snr:.1f})")
         print(f"  Распределение:")
         for level, count in dataset_metrics.noise_distribution.items():
             pct = count / dataset_metrics.num_images * 100
             print(f"    {level}: {count} ({pct:.1f}%)")
 
-        print(f"\n🎨 Контраст:")
-        print(f"  Средний контраст: {dataset_metrics.avg_contrast:.3f} (±{dataset_metrics.std_contrast:.3f})")
+        print(f"\nКонтраст:")
+        print(f"  Средний контраст: {dataset_metrics.avg_contrast:.3f} (+-{dataset_metrics.std_contrast:.3f})")
         print(f"  Распределение:")
         for level, count in dataset_metrics.contrast_distribution.items():
             pct = count / dataset_metrics.num_images * 100
             print(f"    {level}: {count} ({pct:.1f}%)")
 
-        print(f"\n💡 Яркость:")
-        print(f"  Средняя яркость: {dataset_metrics.avg_brightness:.3f} (±{dataset_metrics.std_brightness:.3f})")
+        print(f"\nЯркость:")
+        print(f"  Средняя яркость: {dataset_metrics.avg_brightness:.3f} (+-{dataset_metrics.std_brightness:.3f})")
         print(f"  Распределение:")
         for level, count in dataset_metrics.brightness_distribution.items():
             pct = count / dataset_metrics.num_images * 100
             print(f"    {level}: {count} ({pct:.1f}%)")
 
-        print(f"\n🔍 Резкость:")
+        print(f"\nРезкость:")
         print(f"  Средний score: {dataset_metrics.avg_sharpness:.1f}")
         blur_pct = dataset_metrics.blur_count / dataset_metrics.num_images * 100
         print(f"  Размытых изображений: {dataset_metrics.blur_count} ({blur_pct:.1f}%)")
 
-        print(f"\n⚠️  Доминирующие проблемы:")
+        print(f"\nДоминирующие проблемы:")
         if dataset_metrics.dominant_issues:
             for issue in dataset_metrics.dominant_issues:
                 print(f"  - {issue}")
         else:
-            print("  Проблем не обнаружено ✅")
+            print("  Проблем не обнаружено")
 
-        print(f"\n💊 Рекомендации:")
+        print(f"\nРекомендации:")
         print(
             f"  Глобальная предобработка: {', '.join(dataset_metrics.recommended_global_preprocessing) or 'не требуется'}")
         print(f"  Адаптивная предобработка: {'ДА' if dataset_metrics.needs_adaptive_preprocessing else 'НЕТ'}")
