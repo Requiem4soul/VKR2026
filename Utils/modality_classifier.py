@@ -7,6 +7,15 @@
 - Gonzalez & Woods (2018) - Natural images
 - Vollmer & Möllmann (2017) - Infrared/Thermal
 - Sternberg (1983) - Microscopy
+
+ЦВЕТОВОЙ ФИЛЬТР (добавлен):
+    SAR и рентген физически не могут давать цветные изображения.
+    Если датасет определён как цветной (is_color_dataset=True),
+    типы 'sar' и 'medical_xray' исключаются до скоринга.
+    Это жёсткое ограничение, основанное на физической природе модальностей:
+    - Oliver & Quegan (2004) — SAR всегда grayscale
+    - Pham et al. (2000) — рентген всегда grayscale
+    - Gonzalez & Woods (2018) — цветность как первичный признак классификации
 """
 
 from typing import Dict, Tuple
@@ -68,38 +77,60 @@ class ImageModalityClassifier:
         }
     }
     
+    # Типы, которые физически не могут давать цветные изображения.
+    # Источники: Oliver & Quegan (2004) для SAR,
+    #            Pham et al. (2000) для рентгена.
+    _GRAYSCALE_ONLY_MODALITIES = {'sar', 'medical_xray'}
+
     def classify(self, dataset_metrics) -> Dict:
         """
-        Классифицирует тип датасета на основе его метрик
-        
+        Классифицирует тип датасета на основе его метрик.
+
+        Если датасет цветной (is_color_dataset=True), типы 'sar' и 'medical_xray'
+        исключаются из рассмотрения как физически невозможные.
+        Источники: Oliver & Quegan (2004), Pham et al. (2000),
+                   Gonzalez & Woods (2018).
+
         Args:
             dataset_metrics: Объект DatasetMetrics с агрегированными метриками
-            
+
         Returns:
             dict: {
-                'modality': str,           # Определённый тип
-                'confidence': float,       # Уверенность (0-1)
-                'source': str,             # Научная ссылка
-                'description': str,        # Описание типа
-                'all_scores': dict         # Оценки для всех типов
+                'modality': str,      # Определённый тип
+                'confidence': float,  # Уверенность (0-1)
+                'source': str,        # Научная ссылка
+                'description': str,   # Описание типа
+                'all_scores': dict,   # Оценки для всех типов
+                'is_color': bool,     # Цветной ли датасет
+                'color_diversity': float  # Среднее MICD
             }
         """
+        # Определяем цветной ли датасет (если атрибут доступен)
+        is_color = getattr(dataset_metrics, 'is_color_dataset', False)
+        color_diversity = getattr(dataset_metrics, 'avg_color_diversity', 0.0)
+
         scores = {}
-        
         for modality, thresholds in self.THRESHOLDS.items():
+            # Цветной датасет не может быть SAR или рентгеном —
+            # жёсткое исключение на основе физической природы модальностей.
+            # Oliver & Quegan (2004); Pham et al. (2000)
+            if is_color and modality in self._GRAYSCALE_ONLY_MODALITIES:
+                scores[modality] = 0.0
+                continue
             score = self._calculate_match_score(dataset_metrics, thresholds)
             scores[modality] = score
-        
-        # Находим лучшее совпадение
+
         best_modality = max(scores, key=scores.get)
         confidence = scores[best_modality]
-        
+
         return {
             'modality': best_modality,
             'confidence': confidence,
             'source': self.THRESHOLDS[best_modality]['source'],
             'description': self.THRESHOLDS[best_modality]['description'],
-            'all_scores': scores
+            'all_scores': scores,
+            'is_color': is_color,
+            'color_diversity': color_diversity,
         }
     
     def _calculate_match_score(
@@ -211,6 +242,14 @@ class ImageModalityClassifier:
         print(f"  Уверенность: {classification['confidence'] * 100:.1f}%")
         print(f"  Описание: {classification['description']}")
         print(f"  Источник: {classification['source']}")
+
+        is_color = classification.get('is_color', None)
+        if is_color is not None:
+            color_label = "цветной" if is_color else "grayscale"
+            micd = classification.get('color_diversity', 0.0)
+            print(f"  Цветность: {color_label} (MICD={micd:.1f})")
+            if is_color:
+                print(f"  (SAR и рентген исключены — физически grayscale-модальности)")
 
         print(f"\n  Оценки по всем типам:")
         sorted_scores = sorted(
