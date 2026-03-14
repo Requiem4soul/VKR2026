@@ -103,62 +103,62 @@ def build_candidate_pool() -> List[Dict[str, Any]]:
             'methods': ['denoise'],
             'params': {'denoise': {'method': 'gaussian', 'ksize': 5}},
         },
-        # # ── Bilateral filter ───────────────────────────────────────────────
-        # {
-        #     'id': 'bilateral_s75',
-        #     'display': 'Bilateral (d=9, s=75)',
-        #     'methods': ['denoise'],
-        #     'params': {'denoise': {'method': 'bilateral', 'd': 9,
-        #                            'sigma_color': 75, 'sigma_space': 75}},
-        # },
-        # {
-        #     'id': 'bilateral_s150',
-        #     'display': 'Bilateral (d=9, s=150)',
-        #     'methods': ['denoise'],
-        #     'params': {'denoise': {'method': 'bilateral', 'd': 9,
-        #                            'sigma_color': 150, 'sigma_space': 150}},
-        # },
-        # # ── CLAHE ──────────────────────────────────────────────────────────
-        # {
-        #     'id': 'clahe_c10',
-        #     'display': 'CLAHE (clip=1.0)',
-        #     'methods': ['contrast_enhancement'],
-        #     'params': {'contrast_enhancement': {'method': 'clahe', 'clip_limit': 1.0,
-        #                                         'tile_grid_size': (8, 8)}},
-        # },
-        # {
-        #     'id': 'clahe_c20',
-        #     'display': 'CLAHE (clip=2.0)',
-        #     'methods': ['contrast_enhancement'],
-        #     'params': {'contrast_enhancement': {'method': 'clahe', 'clip_limit': 2.0,
-        #                                         'tile_grid_size': (8, 8)}},
-        # },
-        # # ── Unsharp mask ───────────────────────────────────────────────────
-        # {
-        #     'id': 'unsharp_a05',
-        #     'display': 'Unsharp mask (amount=0.5)',
-        #     'methods': ['sharpening'],
-        #     'params': {'sharpening': {'method': 'unsharp_mask', 'alpha': 0.5}},
-        # },
-        # {
-        #     'id': 'unsharp_a10',
-        #     'display': 'Unsharp mask (amount=1.0)',
-        #     'methods': ['sharpening'],
-        #     'params': {'sharpening': {'method': 'unsharp_mask', 'alpha': 1.0}},
-        # },
-        # # ── Нормализация ───────────────────────────────────────────────────
-        # {
-        #     'id': 'norm_zscore',
-        #     'display': 'Нормализация Z-score',
-        #     'methods': ['normalize'],
-        #     'params': {'normalize': {'method': 'zscore'}},
-        # },
-        # {
-        #     'id': 'norm_minmax',
-        #     'display': 'Нормализация Min-Max',
-        #     'methods': ['normalize'],
-        #     'params': {'normalize': {'method': 'minmax'}},
-        # },
+        # ── Bilateral filter ───────────────────────────────────────────────
+        {
+            'id': 'bilateral_s75',
+            'display': 'Bilateral (d=9, s=75)',
+            'methods': ['denoise'],
+            'params': {'denoise': {'method': 'bilateral', 'd': 9,
+                                   'sigma_color': 75, 'sigma_space': 75}},
+        },
+        {
+            'id': 'bilateral_s150',
+            'display': 'Bilateral (d=9, s=150)',
+            'methods': ['denoise'],
+            'params': {'denoise': {'method': 'bilateral', 'd': 9,
+                                   'sigma_color': 150, 'sigma_space': 150}},
+        },
+        # ── CLAHE ──────────────────────────────────────────────────────────
+        {
+            'id': 'clahe_c10',
+            'display': 'CLAHE (clip=1.0)',
+            'methods': ['contrast_enhancement'],
+            'params': {'contrast_enhancement': {'method': 'clahe', 'clip_limit': 1.0,
+                                                'tile_grid_size': (8, 8)}},
+        },
+        {
+            'id': 'clahe_c20',
+            'display': 'CLAHE (clip=2.0)',
+            'methods': ['contrast_enhancement'],
+            'params': {'contrast_enhancement': {'method': 'clahe', 'clip_limit': 2.0,
+                                                'tile_grid_size': (8, 8)}},
+        },
+        # ── Unsharp mask ───────────────────────────────────────────────────
+        {
+            'id': 'unsharp_a05',
+            'display': 'Unsharp mask (amount=0.5)',
+            'methods': ['sharpening'],
+            'params': {'sharpening': {'method': 'unsharp_mask', 'alpha': 0.5}},
+        },
+        {
+            'id': 'unsharp_a10',
+            'display': 'Unsharp mask (amount=1.0)',
+            'methods': ['sharpening'],
+            'params': {'sharpening': {'method': 'unsharp_mask', 'alpha': 1.0}},
+        },
+        # ── Нормализация ───────────────────────────────────────────────────
+        {
+            'id': 'norm_zscore',
+            'display': 'Нормализация Z-score',
+            'methods': ['normalize'],
+            'params': {'normalize': {'method': 'zscore'}},
+        },
+        {
+            'id': 'norm_minmax',
+            'display': 'Нормализация Min-Max',
+            'methods': ['normalize'],
+            'params': {'normalize': {'method': 'minmax'}},
+        },
     ]
 
     return pool
