@@ -295,11 +295,11 @@ def create_preprocessed_dataset(
             with open(yaml_src, 'r', encoding='utf-8') as _f:
                 _yaml_data = _yaml.safe_load(_f)
             # train -> target/train/images
-            _yaml_data['train'] = str(target_path / 'train' / 'images')
-            # val -> target/valid/images  (папка называется valid, ключ val)
-            _yaml_data['val']   = str(target_path / 'valid' / 'images')
-            # test -> target/test/images
-            _yaml_data['test']  = str(target_path / 'test'  / 'images')
+            # Относительные пути — работают при любом перемещении датасета
+            _yaml_data.pop('path', None)
+            _yaml_data['train'] = '../train/images'
+            _yaml_data['val']   = '../valid/images'
+            _yaml_data['test']  = '../test/images' 
             with open(target_path / 'data.yaml', 'w', encoding='utf-8') as _f:
                 _yaml.dump(_yaml_data, _f, allow_unicode=True)
             # Лог для диагностики — печатаем итоговый yaml
@@ -452,11 +452,15 @@ def _run_training(
 
             yaml_path = dataset_path / 'data.yaml'
 
-            try:
-                from Train.Universal_train.universal_model_trainer import get_image_size_from_dataset
-                imgsz = get_image_size_from_dataset(dataset_path)
-            except Exception:
-                imgsz = 640
+            # imgsz: приоритет model_config, fallback на автодетект из датасета
+            if model_config.get('imgsz'):
+                imgsz = int(model_config['imgsz'])
+            else:
+                try:
+                    from Train.Universal_train.universal_model_trainer import get_image_size_from_dataset
+                    imgsz = get_image_size_from_dataset(dataset_path)
+                except Exception:
+                    imgsz = 640
 
             train_kwargs = dict(
                 data=str(yaml_path),
@@ -483,9 +487,11 @@ def _run_training(
             # Отдельная валидация на нужном сплите (valid для SHA, test для финала)
             best_pt = result_dir / 'run' / 'weights' / 'best.pt'
             eval_model = YOLO(str(best_pt) if best_pt.exists() else f'yolov8{model_size}.pt')
+            # ultralytics принимает только 'val'/'train'/'test' — нормализуем 'valid' → 'val'
+            _yolo_split = 'val' if eval_split in ('val', 'valid') else eval_split
             val_res = eval_model.val(
                 data=str(dataset_path / 'data.yaml'),
-                split=eval_split,
+                split=_yolo_split,
                 device=device,
                 verbose=False,
             )
@@ -620,11 +626,15 @@ def _run_training_final(
 
             yaml_path = dataset_path / 'data.yaml'
 
-            try:
-                from Train.Universal_train.universal_model_trainer import get_image_size_from_dataset
-                imgsz = get_image_size_from_dataset(dataset_path)
-            except Exception:
-                imgsz = 640
+            # imgsz: приоритет model_config, fallback на автодетект из датасета
+            if model_config.get('imgsz'):
+                imgsz = int(model_config['imgsz'])
+            else:
+                try:
+                    from Train.Universal_train.universal_model_trainer import get_image_size_from_dataset
+                    imgsz = get_image_size_from_dataset(dataset_path)
+                except Exception:
+                    imgsz = 640
 
             results = model.train(
                 data=str(yaml_path),
@@ -646,9 +656,10 @@ def _run_training_final(
             # Валидация на test split с лучшими весами
             best_pt = result_dir / 'run' / 'weights' / 'best.pt'
             eval_model = YOLO(str(best_pt) if best_pt.exists() else f'yolov8{model_size}.pt')
+            _yolo_split = 'val' if eval_split in ('val', 'valid') else eval_split
             val_res = eval_model.val(
                 data=str(yaml_path),
-                split=eval_split,
+                split=_yolo_split,
                 device=device,
                 verbose=False,
             )

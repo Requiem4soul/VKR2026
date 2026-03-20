@@ -57,7 +57,23 @@ def _create_dst_structure(src_path: Path, dst_path: Path,
             (dst_path / split / 'images').mkdir(parents=True, exist_ok=True)
             (dst_path / split / 'labels').mkdir(parents=True, exist_ok=True)
         if (src_path / 'data.yaml').exists():
-            shutil.copy(src_path / 'data.yaml', dst_path / 'data.yaml')
+            # Обновляем пути в data.yaml на абсолютные пути назначения.
+            # Относительные пути из оригинала не работают когда датасет
+            # скопирован в другую папку (YOLO не найдёт split='val'/'test').
+            try:
+                import yaml as _yaml
+                with open(src_path / 'data.yaml', 'r', encoding='utf-8') as _f:
+                    _yaml_data = _yaml.safe_load(_f)
+                # Относительные пути — работают при любом перемещении датасета
+                # (схема аналогична LUNA16: пути относительно data.yaml)
+                _yaml_data.pop('path', None)
+                _yaml_data['train'] = '../train/images'
+                _yaml_data['val']   = '../valid/images'
+                _yaml_data['test']  = '../test/images'
+                with open(dst_path / 'data.yaml', 'w', encoding='utf-8') as _f:
+                    _yaml.dump(_yaml_data, _f, default_flow_style=False, allow_unicode=True)
+            except Exception:
+                shutil.copy(src_path / 'data.yaml', dst_path / 'data.yaml')
     else:
         # Классификация: копируем дерево подпапок (классы)
         for split in splits:
