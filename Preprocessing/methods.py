@@ -27,23 +27,34 @@ class PreprocessingMethods:
         """
         Шумоподавление с автоматическим выбором фильтра
 
-        Научное обоснование выбора фильтров:
+        Научное обоснование выбора четырёх классических пространственных фильтров.
 
-        1. Gaussian noise → Bilateral filter
-           - Сохраняет края при удалении Gaussian шума
-           - Tomasi & Manduchi (1998) "Bilateral filtering for gray and color images"
+        Набор фильтров сформирован на основе:
+          - Gonzalez & Woods (2018) "Digital Image Processing", 4th ed., Pearson —
+            глава 5 выделяет Gaussian, Median, Wiener и Adaptive (Bilateral) как
+            основные пространственные фильтры шумоподавления.
+          - Fan et al. (2019) "Brief review of image denoising techniques",
+            Visual Computing for Industry, Biomedicine, and Art, 2(1) —
+            сравнительный обзор подтверждает тот же набор как базовый.
+          - Tomasi & Manduchi (1998) "Bilateral filtering for gray and color images",
+            ICCV — оригинальная статья по Bilateral filter.
+          - Wiener N. (1949) "Extrapolation, Interpolation and Smoothing of
+            Stationary Time Series", MIT Press — оригинальный Wiener filter.
 
-        2. Salt & Pepper → Median filter
-           - Оптимален для импульсного шума
-           - Gonzalez & Woods (2018) "Digital Image Processing"
-
-        3. Speckle (SAR) → Median filter
-           - Эффективен для мультипликативного шума
-           - Lee (1980) "Digital image enhancement and noise filtering"
+        Покрытие типов шума:
+          1. Gaussian noise → Bilateral filter (сохраняет края)
+             Tomasi & Manduchi (1998), ibid.
+          2. Salt & Pepper → Median filter (золотой стандарт для импульсного шума)
+             Gonzalez & Woods (2018), ibid.
+          3. Смешанный / неизвестный → Gaussian blur (быстрый, общего назначения)
+             Gonzalez & Woods (2018), ibid.
+          4. Адаптивный (любой тип) → Wiener filter (локально адаптируется к
+             дисперсии шума; заменяет NLM ради вычислительной эффективности)
+             Wiener (1949), ibid.; Fan et al. (2019), ibid.
 
         Args:
             image: Входное изображение
-            method: 'auto' (автовыбор), 'median', 'bilateral', 'nlm'
+            method: 'auto' (автовыбор), 'median', 'gaussian', 'bilateral', 'wiener'
             noise_type: 'gaussian', 'salt_pepper', 'speckle', 'unknown'
             noise_level: 'low', 'medium', 'high'
             **kwargs: Дополнительные параметры для фильтров
@@ -52,27 +63,25 @@ class PreprocessingMethods:
             Обработанное изображение
         """
 
-        # Автоматический выбор фильтра на основе типа шума
+        # Автоматический выбор фильтра на основе типа шума.
+        # Gonzalez & Woods (2018) гл. 5; Fan et al. (2019).
         if method == 'auto':
             if noise_type == 'gaussian':
-                # Bilateral filter идеален для Gaussian noise
+                # Bilateral filter идеален для Gaussian noise — сохраняет края
+                # Tomasi & Manduchi (1998)
                 method = 'bilateral'
 
-            elif noise_type == 'salt_pepper':
-                # Median filter - золотой стандарт для импульсного шума
-                method = 'median'
-
-            elif noise_type == 'speckle':
-                # Median также хорош для speckle (SAR)
+            elif noise_type in ('salt_pepper', 'speckle'):
+                # Median filter — золотой стандарт для импульсного шума
+                # Gonzalez & Woods (2018)
                 method = 'median'
 
             else:  # unknown
-                # Консервативный подход: median с минимальным kernel
-                # Научное обоснование: Yin et al. (1996) - median robust к разным типам шума
-                # Используем ksize=3 чтобы минимизировать риск повреждения деталей
-                method = 'median'
-                if 'ksize' not in kwargs:
-                    kwargs['ksize'] = 3  # Минимальный размер для безопасности
+                # Wiener filter — адаптируется к локальной дисперсии шума,
+                # подходит при неизвестном типе шума. Wiener (1949).
+                method = 'wiener'
+                if 'size' not in kwargs:
+                    kwargs['size'] = 5
 
         # Применяем выбранный фильтр
         if method == 'median':
@@ -103,25 +112,37 @@ class PreprocessingMethods:
 
             return cv2.bilateralFilter(image, d, sigma_color, sigma_space)
 
-        elif method == 'nlm':
-            # Non-Local Means (для очень сильного Gaussian шума)
-            if noise_level == 'high':
-                h = kwargs.get('h', 15)
-            elif noise_level == 'medium':
-                h = kwargs.get('h', 10)
+        elif method == 'gaussian':
+            # Gaussian blur — быстрый линейный фильтр общего назначения.
+            # Эффективен для равномерного фонового шума.
+            # Gonzalez & Woods (2018), гл. 3.
+            ksize = kwargs.get('ksize', 3)
+            # ksize должен быть нечётным
+            if ksize % 2 == 0:
+                ksize += 1
+            return cv2.GaussianBlur(image, (ksize, ksize), 0)
+
+        elif method == 'wiener':
+            # Wiener filter — адаптивный фильтр, минимизирующий среднеквадратичную
+            # ошибку. Локально адаптируется к дисперсии шума: в однородных областях
+            # сглаживает сильнее, вблизи краёв — слабее.
+            # Wiener (1949); реализация через scipy.signal.wiener.
+            # Заменяет NLM: сопоставимое качество при на порядок меньших вычислениях.
+            # Fan et al. (2019) "Brief review of image denoising techniques".
+            from scipy.signal import wiener as scipy_wiener
+            size = kwargs.get('size', 5)
+            # scipy.signal.wiener работает с float, возвращает float
+            img_float = image.astype(np.float64)
+            if img_float.ndim == 3:
+                # Применяем поканально для RGB
+                channels = [scipy_wiener(img_float[:, :, c], mysize=size)
+                            for c in range(img_float.shape[2])]
+                filtered = np.stack(channels, axis=2)
             else:
-                h = kwargs.get('h', 7)
+                filtered = scipy_wiener(img_float, mysize=size)
+            return np.clip(filtered, 0, 255).astype(np.uint8)
 
-            template_window_size = kwargs.get('template_window_size', 7)
-            search_window_size = kwargs.get('search_window_size', 21)
-
-            return cv2.fastNlMeansDenoising(
-                image, None, h,
-                template_window_size,
-                search_window_size
-            )
-
-        # Если метод не распознан - возвращаем оригинал
+        # Если метод не распознан — возвращаем оригинал
         return image
 
     @staticmethod
@@ -140,15 +161,27 @@ class PreprocessingMethods:
         if method == 'clahe':
             clip_limit = kwargs.get('clip_limit', 2.0)
             tile_grid_size = kwargs.get('tile_grid_size', (8, 8))
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
 
-            clahe = cv2.createCLAHE(
-                clipLimit=clip_limit,
-                tileGridSize=tile_grid_size
-            )
-            return clahe.apply(image)
+            if image.ndim == 3:
+                # RGB: применяем CLAHE только к L-каналу в LAB пространстве.
+                # Это стандартный подход для цветных изображений —
+                # улучшаем яркость не затрагивая цвет.
+                # Pisano et al. (1998); Gonzalez & Woods (2018).
+                lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+                lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+                return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            else:
+                return clahe.apply(image)
 
         elif method == 'histogram_eq':
-            return cv2.equalizeHist(image)
+            if image.ndim == 3:
+                # RGB: equalizeHist только по Y-каналу в YCrCb
+                ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+                ycrcb[:, :, 0] = cv2.equalizeHist(ycrcb[:, :, 0])
+                return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+            else:
+                return cv2.equalizeHist(image)
 
         return image
 
@@ -165,7 +198,16 @@ class PreprocessingMethods:
             target_brightness: Целевая яркость (0-1)
             **kwargs: Дополнительные параметры
         """
-        current_brightness = np.mean(image.astype(np.float32) / 255.0)
+        # Для RGB вычисляем яркость по luminance-формуле (ITU-R BT.601),
+        # а не как среднее по всем каналам — это физически корректнее.
+        # Для grayscale среднее пикселей.
+        img_f = image.astype(np.float32) / 255.0
+        if image.ndim == 3:
+            # BGR порядок в OpenCV: B=0, G=1, R=2
+            luminance = 0.114 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.299 * img_f[:, :, 2]
+            current_brightness = float(np.mean(luminance))
+        else:
+            current_brightness = float(np.mean(img_f))
 
         if current_brightness < 1e-10:
             return image
@@ -173,7 +215,7 @@ class PreprocessingMethods:
         factor = target_brightness / current_brightness
         factor = np.clip(factor, 0.5, 2.0)
 
-        corrected = (image.astype(np.float32) * factor).clip(0, 255).astype(np.uint8)
+        corrected = (img_f * factor * 255.0).clip(0, 255).astype(np.uint8)
         return corrected
 
     @staticmethod
@@ -231,23 +273,25 @@ class PreprocessingMethods:
         result = image.copy()
 
         for method in methods:
-            method_params = params.get(method, {}).copy()  # Копируем чтобы не изменять оригинал
+            method_params = params.get(method, {}).copy()
 
-            if method == 'denoise':
-                # ИСПРАВЛЕНИЕ: Извлекаем 'method' из params если есть
-                denoise_method = method_params.pop('method', 'auto')  # pop удаляет из dict
-                
-                # Теперь передаём method как keyword аргумент
+            # Поддержка ключей вида "denoise__1", "contrast_enhancement__0" и т.д.
+            # merge_methods_params добавляет суффикс __N когда один тип метода
+            # встречается несколько раз в пайплайне (например Gaussian + Wiener).
+            base_method = method.split("__")[0]
+
+            if base_method == 'denoise':
+                denoise_method = method_params.pop('method', 'auto')
                 result = PreprocessingMethods.denoise(
                     result,
-                    method=denoise_method,  # Передаём извлечённый метод
-                    **method_params  # Остальные параметры (noise_type, ksize и т.д.)
+                    method=denoise_method,
+                    **method_params
                 )
-            elif method == 'contrast_enhancement':
+            elif base_method == 'contrast_enhancement':
                 result = PreprocessingMethods.contrast_enhancement(result, **method_params)
-            elif method == 'brightness_correction':
+            elif base_method == 'brightness_correction':
                 result = PreprocessingMethods.brightness_correction(result, **method_params)
-            elif method == 'sharpening':
+            elif base_method == 'sharpening':
                 result = PreprocessingMethods.sharpening(result, **method_params)
 
         return result

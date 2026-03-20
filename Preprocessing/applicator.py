@@ -169,7 +169,10 @@ class DatasetPreprocessor:
                 _params['denoise'] = {'method': 'median'}
 
             for img_path in tqdm(image_files, desc=f"Processing {split}"):
-                image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                # Читаем в оригинальном формате: цветные датасеты остаются RGB,
+                # grayscale остаются grayscale. IMREAD_GRAYSCALE теряет
+                # цветовую информацию что критично для цветных датасетов.
+                image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
                 if image is None:
                     continue
                 processed = self.methods.apply_pipeline(image, methods, _params)
@@ -236,7 +239,10 @@ class DatasetPreprocessor:
                 img_path = image_files[idx]
                 img_metrics = image_metrics[idx]
 
-                image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                # Читаем в оригинальном формате: цветные датасеты остаются RGB,
+                # grayscale остаются grayscale. IMREAD_GRAYSCALE теряет
+                # цветовую информацию что критично для цветных датасетов.
+                image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
                 if image is None:
                     continue
 
@@ -309,10 +315,13 @@ class DatasetPreprocessor:
             combined_params['denoise']['noise_level'] = img_metrics.noise_level
 
             if 'method' not in combined_params['denoise']:
+                # Wiener заменяет NLM: сопоставимое качество при
+                # на порядок меньших вычислениях.
+                # Fan et al. (2019); Wiener (1949).
                 noise_to_method = {
                     'gaussian': 'bilateral',
                     'salt_pepper': 'median',
-                    'poisson': 'nlm',
+                    'poisson': 'wiener',
                     'speckle': 'median'
                 }
                 combined_params['denoise']['method'] = noise_to_method.get(

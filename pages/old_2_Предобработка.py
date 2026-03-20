@@ -164,12 +164,6 @@ CANDIDATE_GROUPS = {
                                        "sigma_color": 150, "sigma_space": 150}},
             },
             {
-                "id": "wiener_s3",
-                "display": "Wiener (size=3)",
-                "methods": ["denoise"],
-                "params": {"denoise": {"method": "wiener", "size": 3}},
-            },
-            {
                 "id": "wiener_s5",
                 "display": "Wiener (size=5)",
                 "methods": ["denoise"],
@@ -284,29 +278,15 @@ def sha_prune(candidates: List[Dict], eta: int = 2) -> List[Dict]:
 def merge_methods_params(candidates: List[Dict]) -> Tuple[List[str], Dict]:
     """
     Объединяет методы и параметры нескольких кандидатов в один пайплайн.
-
-    Поддерживает несколько кандидатов из одной группы (например два denoise-фильтра
-    последовательно): Gaussian k3 → Wiener s3 — легитимная комбинация для смешанного
-    шума (Gonzalez & Woods, 2018; PMC7036412).
-
-    Возвращает:
-        methods: список шагов вида "denoise__0", "denoise__1", ...
-                 (уникальные ключи для apply_pipeline)
-        params:  {"denoise__0": {...}, "denoise__1": {...}, ...}
+    Используется при комбинировании survivors из разных групп.
     """
     methods = []
     params = {}
-    # Счётчик повторений имён методов для уникальных ключей
-    method_counts: Dict[str, int] = {}
     for c in candidates:
         for m in c["methods"]:
-            idx = method_counts.get(m, 0)
-            method_counts[m] = idx + 1
-            key = f"{m}__{idx}" if idx > 0 else m
-            methods.append(key)
-            # Копируем params кандидата под новым ключом
-            cand_params = c["params"].get(m, {})
-            params[key] = cand_params
+            if m not in methods:
+                methods.append(m)
+        params.update(c["params"])
     return methods, params
 
 
@@ -647,9 +627,8 @@ def _run_search(q: queue.Queue, config: Dict):
         # ══════════════════════════════════════════════════════════════════
         log("")
         log("=" * 70)
-        log("ФАЗА 1: Групповой скрининг с фильтром по baseline")
-        log("Guyon & Elisseeff (2003) группировка; Kohavi & John (1997) фильтр по baseline")
-        log("SHA не применяется в Фазе 1 — цель формировать полный пул, не искать одного лучшего")
+        log("ФАЗА 1: Групповой SHA-скрининг")
+        log("Jamieson & Talwalkar (2016) SHA + Guyon & Elisseeff (2003) группировка")
         log("=" * 70)
 
         all_survivors: List[Dict] = []
@@ -676,45 +655,26 @@ def _run_search(q: queue.Queue, config: Dict):
                 log(f"    [ПРОПУСК] нет кандидатов в группе {group_label}")
                 continue
 
-            # Фаза 1: только фильтр по baseline, SHA не применяется.
-            #
-            # Обоснование отказа от SHA в Фазе 1:
-            # SHA разработан для поиска одного лучшего кандидата среди многих
-            # (Jamieson & Talwalkar, 2016). Цель Фазы 1 — другая: сформировать
-            # полный пул survivors для Фазы 2, где их комбинации будут проверяться.
-            # При малом числе кандидатов в группе (7–8) SHA вызывает over-pruning —
-            # отбрасывает кандидатов реально лучше baseline, обедняя пул.
-            # Li et al. (2018) "Hyperband" документируют эту проблему и решают её
-            # запуском SHA с разными бюджетами; в нашем случае проще отказаться
-            # от SHA в Фазе 1 вовсе, оставив только содержательный фильтр.
-            # SHA остаётся в Фазе 2 где комбинаций много и отсев оправдан.
-            #
-            # Если вся группа хуже baseline — деградируем к поведению без фильтра
-            # (берём всех), чтобы не потерять группу целиком.
+            # Фаза 1: сначала фильтр по baseline, затем SHA-отсев.
+            # Порядок "фильтр → SHA" обоснован Kohavi & John (1997):
+            # кандидаты хуже baseline заведомо не улучшают результат и
+            # исключаются до отсева, чтобы SHA выбирал среди полезных.
+            # Если вся группа хуже baseline — деградируем к поведению без
+            # фильтра (берём всех), чтобы не потерять группу целиком.
             above = [s for s in scored if s["score"] > baseline_score]
             if above:
                 n_filtered = len(scored) - len(above)
-                log(f"\n    Фильтр baseline: {n_filtered} отсеяно из {len(scored)} "
-                    f"(score <= {baseline_score:.4f}), "
-                    f"survivors: {len(above)}")
-                survivors = above
+                log(f"\n    Фильтр baseline: отсеяно {n_filtered} из {len(scored)} "
+                    f"(score <= {baseline_score:.4f})")
+                pool_for_sha = above
             else:
-                # Все кандидаты ниже baseline — берём одного лучшего.
-                # Обоснование: все кандидаты уже оценены при фиксированном
-                # бюджете, поэтому многораундовый SHA нецелесообразен —
-                # достаточно одношагового отбора по аналогии с финальным
-                # шагом Successive Rejects (Audibert & Bubeck, 2010).
-                # Это сокращает пул survivors и уменьшает число комбинаций
-                # в Фазе 2 на ~15-30%, не жертвуя качеством отбора:
-                # при close scores в пределах шума 30% эпох разница
-                # между кандидатами статистически незначима.
-                best_fallback = max(scored, key=lambda x: x["score"])
-                survivors = [best_fallback]
                 log(f"\n    Фильтр baseline: все кандидаты ниже baseline "
-                    f"({baseline_score:.4f}) — берём одного лучшего: "
-                    f"{best_fallback['display']} (score={best_fallback['score']:.4f})")
+                    f"({baseline_score:.4f}) — SHA по всем без фильтра")
+                pool_for_sha = scored
 
-            for s in sorted(survivors, key=lambda x: x["score"], reverse=True):
+            survivors = sha_prune(pool_for_sha, eta=eta)
+            log(f"    SHA: {len(pool_for_sha)} -> {len(survivors)} survivors")
+            for s in survivors:
                 log(f"      + {s['display']:40s}  score={s['score']:.4f}")
 
             all_survivors.extend(survivors)
