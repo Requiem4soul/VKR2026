@@ -347,7 +347,6 @@ def build_model(
     num_classes: int,
     pretrained: bool = True,
     image_size: int = 224,
-    freeze_backbone: bool = False,
 ) -> nn.Module:
     """
     Создаёт модель классификации с заменённой головой.
@@ -360,12 +359,6 @@ def build_model(
     При pretrained=True используются веса ImageNet-1k из torchvision.
     При image_size=28 модель всё равно принимает 28×28 через Resize в датасете,
     но голова перестраивается под num_classes.
-
-    freeze_backbone=True: замораживает все слои кроме головы классификатора.
-    Рекомендуется при малом датасете — предотвращает переобучение backbone.
-    Научное обоснование: Yosinski et al. (2014) "How transferable are features
-    in deep neural networks?", NeurIPS; Pan & Yang (2010) "A survey on transfer
-    learning", IEEE TKDE, 22(10), 1345–1359.
     """
     weights_map = {
         "resnet18":        models.ResNet18_Weights.DEFAULT if pretrained else None,
@@ -376,24 +369,15 @@ def build_model(
     if model_type == "resnet18":
         m = models.resnet18(weights=weights_map["resnet18"])
         m.fc = nn.Linear(m.fc.in_features, num_classes)
-        if freeze_backbone:
-            for name, param in m.named_parameters():
-                param.requires_grad = name.startswith("fc.")
 
     elif model_type == "resnet50":
         m = models.resnet50(weights=weights_map["resnet50"])
         m.fc = nn.Linear(m.fc.in_features, num_classes)
-        if freeze_backbone:
-            for name, param in m.named_parameters():
-                param.requires_grad = name.startswith("fc.")
 
     elif model_type == "efficientnet_b0":
         m = models.efficientnet_b0(weights=weights_map["efficientnet_b0"])
         in_features = m.classifier[1].in_features
         m.classifier[1] = nn.Linear(in_features, num_classes)
-        if freeze_backbone:
-            for name, param in m.named_parameters():
-                param.requires_grad = name.startswith("classifier.")
 
     else:
         raise ValueError(
@@ -473,34 +457,10 @@ def compute_classification_metrics(
     except Exception:
         auc = 0.0
 
-    # Precision, Recall, F1 — macro-average по всем классам.
-    # Macro-average считает метрику для каждого класса отдельно и усредняет,
-    # давая одинаковый вес каждому классу независимо от его размера.
-    # Это стандарт для многоклассовых задач (Sokolova & Lapalme, 2009,
-    # Information Processing & Management, 45(4), 427–437).
-    # zero_division=0: если класс не встречается в предсказаниях — ставим 0
-    # вместо предупреждения.
-    precision, recall, f1 = 0.0, 0.0, 0.0
-    try:
-        from sklearn.metrics import precision_recall_fscore_support
-        p, r, f, _ = precision_recall_fscore_support(
-            all_labels, all_preds,
-            average="macro",
-            zero_division=0,
-        )
-        precision = float(p)
-        recall    = float(r)
-        f1        = float(f)
-    except Exception:
-        pass
-
     return {
-        "val_acc":       acc,
-        "val_auc":       auc,
-        "val_loss":      avg_loss,
-        "val_precision": precision,
-        "val_recall":    recall,
-        "val_f1":        f1,
+        "val_acc": acc,
+        "val_auc": auc,
+        "val_loss": avg_loss,
     }
 
 
@@ -674,32 +634,12 @@ class ClassificationTrainer:
                 # Worker seed для воспроизводимости
                 g = torch.Generator()
                 g.manual_seed(self.seed)
-                # num_workers > 0: параллельная загрузка данных CPU-воркерами,
-                # пока GPU обрабатывает предыдущий батч — устраняет простой GPU.
-                # os.cpu_count() даёт логические ядра; делим на 2 для физических,
-                # но не меньше 2 и не больше 8 — выше обычно нет прироста.
-                # persistent_workers=True: воркеры живут между эпохами,
-                # не тратим время на их пересоздание каждый раз.
-                # На Windows PyTorch использует spawn для multiprocessing,
-                # что может конфликтовать с потоками Streamlit.
-                # Используем num_workers только если не Windows, либо явно
-                # задаём multiprocessing_context="spawn" для безопасности.
-                import platform
-                if platform.system() == "Windows":
-                    n_workers = min(4, max(2, (os.cpu_count() or 4) // 2))
-                    mp_context = "spawn"
-                else:
-                    n_workers = min(8, max(2, (os.cpu_count() or 4) // 2))
-                    mp_context = None
-                use_persistent = n_workers > 0
                 return DataLoader(
                     ds,
                     batch_size=batch_size,
                     shuffle=shuffle,
-                    num_workers=n_workers,
+                    num_workers=0,
                     pin_memory=torch.cuda.is_available(),
-                    persistent_workers=use_persistent,
-                    multiprocessing_context=mp_context,
                     generator=g if shuffle else None,
                 )
             except Exception as e:
@@ -780,16 +720,8 @@ class ClassificationTrainer:
             set_global_seed(self.seed)
 
             # Строим модель
-            freeze_backbone = model_cfg.get("freeze_backbone", False)
-            model = build_model(model_type, num_classes, pretrained, image_size,
-                                freeze_backbone=freeze_backbone)
+            model = build_model(model_type, num_classes, pretrained, image_size)
             model = model.to(self.device)
-            if freeze_backbone:
-                n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                n_total     = sum(p.numel() for p in model.parameters())
-                self.log(f"  [FREEZE] Backbone заморожен. "
-                         f"Обучаемых параметров: {n_trainable:,} / {n_total:,} "
-                         f"({100*n_trainable/n_total:.1f}%)")
 
             # Загружаем данные
             loaders = self._create_dataloaders(dataset_path, model_cfg, dataset_info)
@@ -800,13 +732,10 @@ class ClassificationTrainer:
             train_loader = loaders["train"]
             val_loader = loaders.get("val")
 
-            # Оптимизатор — SGD с параметрами из Yang et al. (2021) MedMNIST.
-            # При freeze_backbone передаём только trainable параметры —
-            # замороженные слои не получают градиентов (Yosinski et al., 2014).
+            # Оптимизатор — SGD с параметрами из Yang et al. (2021) MedMNIST
             lr = model_cfg.get("lr", 1e-3)
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.SGD(
-                trainable_params,
+                model.parameters(),
                 lr=lr,
                 momentum=0.9,
                 weight_decay=1e-4,
@@ -873,8 +802,7 @@ class ClassificationTrainer:
                         f"  Epoch {epoch}/{model_max_epochs} | "
                         f"train_loss={train_loss:.4f} | "
                         f"val_acc={val_metrics.get('val_acc', 0):.4f} | "
-                        f"val_auc={val_metrics.get('val_auc', 0):.4f} | "
-                        f"val_f1={val_metrics.get('val_f1', 0):.4f}"
+                        f"val_auc={val_metrics.get('val_auc', 0):.4f}"
                     )
 
                 # Сохраняем метрики в JSON каждый checkpoint_interval

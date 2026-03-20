@@ -327,16 +327,14 @@ def create_preprocessed_dataset(
             if progress_callback:
                 progress_callback(i, len(image_files), split)
 
-            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+            # Читаем в оригинальном формате — цветные датасеты сохраняют RGB.
+            # IMREAD_GRAYSCALE терял цветовую информацию у цветных датасетов,
+            # что приводило к некорректному сравнению с baseline.
+            img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
             if img is None:
-                img = cv2.imread(str(img_path))
-                if img is None:
-                    continue
-                img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            else:
-                img_gray = img
+                continue
 
-            processed = apply_pipeline_to_image(img_gray, pipeline)
+            processed = apply_pipeline_to_image(img, pipeline)
             out_path = target_path / split / 'images' / img_path.name
             cv2.imwrite(str(out_path), processed)
 
