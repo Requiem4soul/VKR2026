@@ -685,9 +685,16 @@ class ClassificationTrainer:
                 # Используем num_workers только если не Windows, либо явно
                 # задаём multiprocessing_context="spawn" для безопасности.
                 import platform
+                # Windows + Streamlit threading = pickle-конфликт при spawn.
+                # ClassificationDataset не сериализуется корректно в дочернем
+                # процессе когда модуль загружен из Streamlit-треда.
+                # Решение: num_workers=0 на Windows (однопоточная загрузка).
+                # На Linux/Mac spawn не используется, воркеры безопасны.
+                # Производительность: потеря ~10-15% скорости загрузки данных,
+                # GPU простаивает чуть больше — приемлемо для одиночных запусков.
                 if platform.system() == "Windows":
-                    n_workers = min(4, max(2, (os.cpu_count() or 4) // 2))
-                    mp_context = "spawn"
+                    n_workers = 0
+                    mp_context = None
                 else:
                     n_workers = min(8, max(2, (os.cpu_count() or 4) // 2))
                     mp_context = None

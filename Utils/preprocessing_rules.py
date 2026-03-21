@@ -67,13 +67,14 @@ class PreprocessingRules:
         'medical_xray': {
             'denoise': {
                 'enabled': True,
-                'method': 'nlm',  # Non-Local Means
+                'method': 'wiener',
                 'params': {
-                    'h': 10,
-                    'template_window_size': 7,
-                    'search_window_size': 21
+                    'size': 5
                 },
-                'rationale': 'NLM эффективен для Poisson шума, характерного для рентгена'
+                'rationale': 'Wiener filter адаптируется к локальной дисперсии шума — '
+                            'эффективен для Poisson шума рентгена при O(N) сложности. '
+                            'Заменяет NLM (O(N²)) ради вычислительной эффективности. '
+                            'Wiener (1949); Fan et al. (2019) Visual Computing 2(1).'
             },
             
             'brightness_correction': {
@@ -194,13 +195,14 @@ class PreprocessingRules:
         'microscopy': {
             'denoise': {
                 'enabled': True,
-                'method': 'nlm',
+                'method': 'wiener',
                 'params': {
-                    'h': 10,
-                    'template_window_size': 7,
-                    'search_window_size': 21
+                    'size': 5
                 },
-                'rationale': 'NLM хорошо работает с комбинированным Gaussian + Poisson шумом'
+                'rationale': 'Wiener filter адаптируется к смешанному Gaussian+Poisson шуму '
+                            'микроскопии при O(N) сложности. '
+                            'Заменяет NLM (O(N²)) ради вычислительной эффективности. '
+                            'Wiener (1949); Fan et al. (2019) Visual Computing 2(1).'
             },
             
             'brightness_correction': {
