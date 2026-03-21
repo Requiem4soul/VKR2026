@@ -489,7 +489,7 @@ def _run_search(q: queue.Queue, config: Dict):
         log(f"Датасет:      {dataset_name}")
         log(f"Задача:       {task}")
         log(f"Модель:       {model_type}  imgsz={imgsz}")
-        log(f"Финал: {max_epochs} эп. | Быстрый: {fast_epochs} эп. ({st.session_state.get('p2_screening_ratio', 30)}%) | ES patience: {patience}")
+        log(f"Финал: {max_epochs} эп. | Быстрый: {fast_epochs} эп. ({screening_ratio}%) | ES patience: {patience}")
         log(f"eta (SHA): {eta} | Seed: {seed}")
         log(f"Рабочая папка: {work_dir}")
         log("")
