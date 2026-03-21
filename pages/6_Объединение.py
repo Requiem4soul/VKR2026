@@ -1,7 +1,22 @@
 """
-pages/2_Предобработка.py — Двухфазный автоматический подбор пайплайна предобработки
+pages/6_Объединение.py — Объединённый подбор пайплайна предобработки
 
-Алгоритм: Group-wise SHA (Фаза 1) + SFS+SHA на survivors (Фаза 2)
+Алгоритм: Анализ модальности (опц.) + Group-wise SHA (Фаза 1) + SFS+SHA на survivors (Фаза 2)
+
+Расширение 2_Предобработка.py:
+    Перед Фазой 1 опционально запускается анализ метрик изображений
+    (UniversalImageAnalyzer + ImageModalityClassifier из 5_Метрика_предобработка.py).
+    Для модальностей medical_xray / sar / microscopy применяются правила
+    PreprocessingRules — группы методов запрещённые для данной модальности
+    исключаются из CANDIDATE_GROUPS до начала Фазы 1.
+    Для natural_photo / infrared используется чистый SHA+SFS без фильтрации.
+
+    Научное обоснование фильтрации по модальности:
+    - SAR: Oliver & Quegan (2004) — brightness/sharpening искажают физическую информацию
+    - Medical: Pisano et al. (1998), Pham et al. (2000) — консервативная обработка
+    - Microscopy: Sternberg (1983) — сохранение биmodal распределения
+    Выборка для анализа: min(N_train × 0.3, 300), минимум 30
+    (CLT: Kim, 2017, PMC5370305 — n ≥ 30 достаточно для оценки среднего)
 
 Научное обоснование:
 - SHA:  Jamieson & Talwalkar (2016) "Non-stochastic best arm identification",
@@ -57,7 +72,7 @@ from ui.state import (
 )
 
 st.set_page_config(
-    page_title="Подбор предобработки — VKR2026",
+    page_title="Объединённый подбор — VKR2026",
     page_icon=None,
     layout="wide",
 )
@@ -74,6 +89,9 @@ if not is_path_configured():
 
 _STATE_DEFAULTS = {
     "p2_stage":          "configure",   # configure | running | done
+    # Модальный анализ (6_Объединение.py)
+    "p2_use_modality":   False,
+    "p2_modality_result": None,   # результат анализа модальности
     "p2_log_lines":      [],
     "p2_output_queue":   None,
     "p2_thread_done":    False,
@@ -336,6 +354,40 @@ def score_from_metrics(metrics: Dict) -> float:
 # ЯДРО АЛГОРИТМА (запускается в фоновом потоке)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# АНАЛИЗ МОДАЛЬНОСТИ (опциональный предшественник Фазы 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Типы для которых правила содержательны и применяются
+_MODALITY_FILTER_TYPES = {"medical_xray", "sar", "microscopy"}
+
+# Типы для которых fallback на чистый SHA+SFS (правила неприменимы)
+_MODALITY_FALLBACK_TYPES = {"natural_photo", "infrared"}
+
+# Маппинг группы CANDIDATE_GROUPS → имя метода в PreprocessingRules
+_GROUP_TO_METHOD = {
+    "denoise":    "denoise",
+    "contrast":   "contrast_enhancement",
+    "brightness": "brightness_correction",
+    "sharpening": "sharpening",
+}
+
+
+def _get_active_candidate_groups(modality_result: Optional[Dict]) -> Dict:
+    """
+    Возвращает CANDIDATE_GROUPS с исключёнными группами (если модальность определена).
+    Если modality_result is None или apply_filter=False — возвращает полный пул.
+    """
+    if modality_result is None or not modality_result.get("apply_filter", False):
+        return CANDIDATE_GROUPS
+
+    excluded = set(modality_result.get("excluded_groups", []))
+    if not excluded:
+        return CANDIDATE_GROUPS
+
+    return {k: v for k, v in CANDIDATE_GROUPS.items() if k not in excluded}
+
+
 def _run_search(q: queue.Queue, config: Dict):
     """
     Полный цикл двухфазного поиска. Запускается в отдельном потоке.
@@ -415,7 +467,8 @@ def _run_search(q: queue.Queue, config: Dict):
             if det_batch > 0:
                 _model_cfg_base["batch"] = det_batch
 
-        fast_epochs   = max(1, int(max_epochs * (st.session_state.get("p2_screening_ratio", 30) / 100)))
+        screening_ratio = config.get("screening_ratio", 30)
+        fast_epochs     = max(1, int(max_epochs * (screening_ratio / 100)))
         datasets_path = Path(config["datasets_path"])
 
         # Рабочая папка запуска — хранит временные датасеты и финальные веса
@@ -629,12 +682,90 @@ def _run_search(q: queue.Queue, config: Dict):
                     pass
                 gc.collect()
 
+        # ── Анализ модальности (встроенный, если включён) ────────────────────
+        modality_result = config.get("modality_result", None)
+
+        if config.get("use_modality", False) and modality_result is None:
+            log("")
+            log("=" * 70)
+            log("АНАЛИЗ МОДАЛЬНОСТИ ДАТАСЕТА")
+            log("Gonzalez & Woods (2018); Oliver & Quegan (2004); Pham et al. (2000)")
+            log("Выборка: min(N_train×0.3, 300), мин. 30 — CLT (Kim 2017, PMC5370305)")
+            log("=" * 70)
+            try:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent.parent))
+                from Utils.image_analyzer      import UniversalImageAnalyzer
+                from Utils.modality_classifier import ImageModalityClassifier
+                from Utils.preprocessing_rules import PreprocessingRules as PR
+
+                try:
+                    _train_dir = datasets_path / dataset_name / "train"
+                    if (_train_dir / "images").exists():
+                        _n = len(list((_train_dir / "images").glob("*.*")))
+                    else:
+                        _n = sum(1 for _f in _train_dir.rglob("*")
+                                 if _f.suffix.lower() in {".jpg",".jpeg",".png",".bmp"})
+                    _sample = max(30, min(int(_n * 0.3), 300))
+                except Exception:
+                    _sample = 100
+                log(f"  Датасет: {dataset_name} | выборка: {_sample} изображений")
+
+                _analyzer      = UniversalImageAnalyzer(verbose=False)
+                _ds_metrics, _ = _analyzer.analyze_dataset(
+                    datasets_path / dataset_name, sample_size=_sample, split="train"
+                )
+                _color_str = "цветной" if _ds_metrics.is_color_dataset else "grayscale"
+                log(f"  SNR: {_ds_metrics.avg_snr:.1f} dB | "
+                    f"Контраст: {_ds_metrics.avg_contrast:.3f} | "
+                    f"Яркость: {_ds_metrics.avg_brightness:.3f} | {_color_str}")
+
+                _classifier = ImageModalityClassifier()
+                _modal_info = _classifier.classify(_ds_metrics)
+                _modality   = _modal_info["modality"]
+                _confidence = _modal_info["confidence"]
+                log(f"  Тип: {_modality.upper()} (уверенность {_confidence*100:.1f}%)")
+
+                _excluded, _allowed = [], []
+                if _modality in _MODALITY_FILTER_TYPES:
+                    log(f"  Применяем правила для '{_modality}':")
+                    for _gid, _mname in _GROUP_TO_METHOD.items():
+                        _ok = PR.is_method_allowed(_modality, _mname)
+                        if _ok:
+                            _allowed.append(_gid)
+                            log(f"    ✓ {_gid} ({_mname}) — разрешён")
+                        else:
+                            _excluded.append(_gid)
+                            _rat = PR.get_rationale(_modality, _mname)
+                            log(f"    ✗ {_gid} — запрещён: "
+                                f"{_rat[:70]}{'...' if len(_rat) > 70 else ''}")
+                else:
+                    log(f"  Тип '{_modality}' — фильтрация не применяется (fallback)")
+                    _allowed = list(_GROUP_TO_METHOD.keys())
+
+                modality_result = {
+                    "modality":        _modality,
+                    "confidence":      _confidence,
+                    "excluded_groups": _excluded,
+                    "allowed_groups":  _allowed,
+                    "is_color":        _ds_metrics.is_color_dataset,
+                    "apply_filter":    _modality in _MODALITY_FILTER_TYPES,
+                }
+                q.put(("modality_result", modality_result))
+                log("  Анализ модальности завершён.")
+
+            except Exception as _e:
+                log(f"  [ПРЕДУПРЕЖДЕНИЕ] Анализ модальности не удался: {_e}")
+                log("  Продолжаем без фильтрации.")
+                modality_result = None
+
+
         # ══════════════════════════════════════════════════════════════════
         # BASELINE: быстрое обучение оригинала
         # ══════════════════════════════════════════════════════════════════
         log("")
         log("=" * 70)
-        log("BASELINE: оригинальный датасет (30% эпох)")
+        log(f"BASELINE: оригинальный датасет ({screening_ratio}% эпох)")
         log("=" * 70)
         baseline_score = quick_train(dataset_name, "baseline")
         log(f"  Baseline score = {baseline_score:.4f}")
@@ -642,7 +773,7 @@ def _run_search(q: queue.Queue, config: Dict):
         # ══════════════════════════════════════════════════════════════════
         # ФАЗА 1: Group-wise SHA-скрининг
         # Guyon & Elisseeff (2003); Liu & Motoda (2007).
-        # Для каждой группы: обучаем всех кандидатов (30% эпох),
+        # Для каждой группы: обучаем всех кандидатов (screening_ratio% эпох),
         # SHA-отсев оставляет ceil(N_group / eta) survivors.
         # ══════════════════════════════════════════════════════════════════
         log("")
@@ -652,9 +783,22 @@ def _run_search(q: queue.Queue, config: Dict):
         log("SHA не применяется в Фазе 1 — цель формировать полный пул, не искать одного лучшего")
         log("=" * 70)
 
+        # Получаем активные группы с учётом модальности
+        active_groups = _get_active_candidate_groups(modality_result)
+
+        if modality_result and modality_result.get("apply_filter"):
+            excluded = modality_result.get("excluded_groups", [])
+            if excluded:
+                log(f"  Исключены группы по модальности '{modality_result['modality']}': "
+                    f"{', '.join(excluded)}")
+                log(f"  Источники: Oliver & Quegan (2004), Pham et al. (2000), "
+                    f"Pisano et al. (1998), Sternberg (1983)")
+            log(f"  Активных групп для Фазы 1: "
+                f"{len(active_groups)} из {len(CANDIDATE_GROUPS)}")
+
         all_survivors: List[Dict] = []
 
-        for group_id, group_info in CANDIDATE_GROUPS.items():
+        for group_id, group_info in active_groups.items():
             group_label = group_info["label"]
             candidates  = group_info["candidates"]
             log(f"\n  Группа [{group_label}] — {len(candidates)} кандидатов")
@@ -911,8 +1055,8 @@ def _run_search(q: queue.Queue, config: Dict):
         # Если победитель — одиночный метод из Фазы 1 (len==1) и его score
         # не превышает baseline, честно сообщаем пользователю, но всё равно
         # обучаем и сравниваем полным обучением.
-        log(f"  Лучший survivor: {best_survivor['display']}  score(30%)={best_survivor['score']:.4f}")
-        log(f"  Baseline score (30%): {baseline_score:.4f}")
+        log(f"  Лучший survivor: {best_survivor['display']}  score({screening_ratio}%)={best_survivor['score']:.4f}")
+        log(f"  Baseline score ({screening_ratio}%): {baseline_score:.4f}")
 
         # pipeline_cands — список одиночных survivor-dict из Фазы 1
         winner_methods, winner_params = merge_methods_params(best_pipeline_cands)
@@ -1092,10 +1236,11 @@ if st.session_state.p2_stage == "configure":
 
     vram_gb = _get_vram_gb()
 
-    st.title("Подбор пайплайна предобработки")
+    st.title("Объединённый подбор пайплайна предобработки")
     st.markdown(
-        "**Двухфазный алгоритм** автоматически подбирает оптимальную комбинацию "
-        "методов предобработки и сравнивает результат с baseline."
+        "**Двухфазный алгоритм** с опциональным анализом модальности датасета. "
+        "Перед Фазой 1 система определяет тип изображений и исключает методы "
+        "запрещённые для данной модальности."
     )
 
     with st.expander("Как работает алгоритм", expanded=False):
@@ -1131,6 +1276,67 @@ if st.session_state.p2_stage == "configure":
     if not datasets:
         st.warning("Датасеты не найдены. Проверь путь в Настройках.")
         st.stop()
+
+    # ── Анализ модальности ─────────────────────────────────────────────────
+    st.subheader("0. Анализ модальности (опционально)")
+    st.markdown(
+        "Если включено — перед Фазой 1 система анализирует метрики изображений "
+        "и определяет тип датасета (medical, SAR, microscopy и др.). "
+        "Группы методов запрещённые для данной модальности будут исключены из Фазы 1. "
+        "Для natural_photo и infrared фильтрация не применяется."
+    )
+
+    use_modality = st.checkbox(
+        "Использовать анализ модальности",
+        value=st.session_state.get("p2_use_modality", False),
+        key="p2_use_modality_cb",
+        help=(
+            "Oliver & Quegan (2004) SAR; Pham et al. (2000) медицина; "
+            "Sternberg (1983) микроскопия. "
+            "Выборка: min(N_train×0.3, 300), мин. 30 изображений "
+            "(CLT: Kim 2017, Korean J Anesthesiol, PMC5370305)."
+        ),
+    )
+    st.session_state.p2_use_modality = use_modality
+
+    # Показываем результат предыдущего анализа если есть
+    prev_modal = st.session_state.get("p2_modality_result")
+    if use_modality and prev_modal:
+        modality    = prev_modal.get("modality", "?")
+        confidence  = prev_modal.get("confidence", 0)
+        excluded    = prev_modal.get("excluded_groups", [])
+        apply_flt   = prev_modal.get("apply_filter", False)
+        color_str   = "цветной" if prev_modal.get("is_color") else "grayscale"
+
+        if apply_flt and excluded:
+            st.success(
+                f"Модальность: **{modality.upper()}** ({confidence*100:.0f}%) | "
+                f"{color_str} | "
+                f"Исключены группы: **{', '.join(excluded)}**"
+            )
+        elif apply_flt:
+            st.success(
+                f"Модальность: **{modality.upper()}** ({confidence*100:.0f}%) | "
+                f"{color_str} | Все группы разрешены"
+            )
+        else:
+            st.info(
+                f"Модальность: **{modality.upper()}** ({confidence*100:.0f}%) | "
+                f"{color_str} | Фильтрация не применяется (fallback на полный SHA+SFS)"
+            )
+
+        col_rerun, col_reset = st.columns([2, 1])
+        with col_rerun:
+            if st.button("🔄 Перезапустить анализ модальности", key="rerun_modal"):
+                st.session_state.p2_modality_result = None
+                st.rerun()
+        with col_reset:
+            if st.button("✕ Сбросить", key="reset_modal"):
+                st.session_state.p2_modality_result = None
+                st.session_state.p2_use_modality = False
+                st.rerun()
+
+    st.divider()
 
     # ── Датасет и задача ───────────────────────────────────────────────────
     col_ds, col_task = st.columns(2, gap="large")
@@ -1399,17 +1605,22 @@ if st.session_state.p2_stage == "configure":
 
     st.divider()
 
-    if st.button(
-        "Запустить подбор предобработки",
-        type="primary",
-        use_container_width=True,
-    ):
+    btn_label = (
+        "▶ Запустить подбор предобработки (с анализом модальности)"
+        if use_modality
+        else "▶ Запустить подбор предобработки"
+    )
+    if st.button(btn_label, type="primary", use_container_width=True):
         st.session_state.p2_stage = "running"
         st.session_state.p2_log_lines = []
         st.session_state.p2_thread_done = False
         st.session_state.p2_error = None
         st.session_state.p2_result = None
         st.session_state.p2_output_queue = None
+        # Сбрасываем предыдущий результат модальности чтобы анализ
+        # выполнился заново внутри потока _run_search
+        if use_modality:
+            st.session_state.p2_modality_result = None
         st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1444,6 +1655,11 @@ elif st.session_state.p2_stage == "running":
             "seed":           st.session_state.p2_seed,
             "eta":            st.session_state.p2_eta,
             "datasets_path":  str(get_datasets_path()),
+            # Параметры скрининга
+            "screening_ratio": st.session_state.get("p2_screening_ratio", 30),
+            # Анализ модальности
+            "use_modality":    st.session_state.get("p2_use_modality", False),
+            "modality_result": None,  # будет заполнен внутри _run_search если use_modality=True
         }
 
         t = threading.Thread(target=_run_search, args=(q, config), daemon=True)
@@ -1457,6 +1673,9 @@ elif st.session_state.p2_stage == "running":
                 msg_type, payload = q.get_nowait()
                 if msg_type == "log":
                     st.session_state.p2_log_lines.append(str(payload))
+                elif msg_type == "modality_result":
+                    # Сохраняем результат анализа модальности для отображения в UI
+                    st.session_state.p2_modality_result = payload
                 elif msg_type == "result":
                     st.session_state.p2_result = payload
                 elif msg_type == "error":
