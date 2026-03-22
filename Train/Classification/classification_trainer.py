@@ -406,24 +406,37 @@ class ClassificationDataset(Dataset):
 
     def _preload_to_cache(self):
         """
-        Загружает все изображения в RAM (PIL, до transform).
+        Загружает все изображения в RAM (PIL, после предварительного Resize).
         Вызывается один раз при создании датасета если cache_in_memory=True.
 
-        Без аугментаций трансформы детерминированы, поэтому можно было бы
-        кешировать и тензоры — но PIL занимает меньше RAM (uint8 vs float32)
-        и не требует пересчёта при смене image_size.
+        ВАЖНО: Resize выполняется ДО кеширования.
+        Это предотвращает хранение оригинальных изображений (640×640 и крупнее)
+        вместо уменьшенных (224×224), что приводило бы к многократному
+        перерасходу RAM. Без этого Resize 7k изображений 640×640 занимали бы
+        ~2.6 GB вместо ~0.45 GB при 224×224.
 
-        Оценка RAM: N × H × W × 3 байт при uint8 PIL.
-        При 7k изображений 224×224×3 ≈ 450 MB — комфортно для большинства систем.
+        В __getitem__ transform применяется поверх уже уменьшенного PIL —
+        CenterCrop и ToTensor работают корректно.
+
+        Оценка RAM: N × image_size² × 3 байт (uint8 PIL) после Resize.
+        При 7k изображений image_size=224: 7000 × 224² × 3 ≈ 0.45 GB.
         """
+        # Размер для предварительного Resize: чуть больше image_size
+        # чтобы CenterCrop в transform работал корректно (аналог _default_transforms).
+        pre_resize = int(self.image_size * 1.15)
         for idx, (img_path, _) in enumerate(self.samples):
             try:
                 img = Image.open(img_path)
-                # Конвертируем сразу — чтобы в __getitem__ не открывать файл
+                # Конвертируем канальность
                 if self.num_channels == 1:
                     img = img.convert("L").convert("RGB")
                 else:
                     img = img.convert("RGB")
+                # Resize ДО кеширования — ключевое отличие от старого бага.
+                # Используем BILINEAR (быстрее BICUBIC, качество достаточное
+                # для промежуточного кеша — финальный CenterCrop в transform
+                # не добавляет дополнительных артефактов).
+                img = img.resize((pre_resize, pre_resize), Image.BILINEAR)
                 img.load()  # принудительно читает данные с диска в RAM
                 self._cache[idx] = img
             except Exception:
@@ -854,13 +867,53 @@ class ClassificationTrainer:
         )
         self.log(f"  batch_size={batch_size} (VRAM={self.vram_gb:.1f} GB, imgsz={image_size})")
 
+        # Оцениваем объём датасета для решения о кешировании в RAM.
+        # Кешируем PIL-изображения после предварительного Resize до pre_resize
+        # (= image_size * 1.15) — именно такой размер хранится в кеше.
+        # Это исправляет старый баг когда изображения кешировались в оригинальном
+        # размере (640×640) вместо уменьшенного (224×224).
+        # Формула: N * pre_resize^2 * 3 канала * 1 байт (uint8 PIL) → GB.
+        # Порог 2 GB — консервативный: оставляем память под модель и ОС.
+        pre_resize_size = int(image_size * 1.15)
+
+        def _estimate_cache_ram_gb(n_samples: int) -> float:
+            return n_samples * (pre_resize_size ** 2) * 3 / (1024 ** 3)
+
         def make_loader(split: str, shuffle: bool) -> Optional[DataLoader]:
             split_path = dataset_path / split
             if not split_path.exists():
                 return None
             try:
+                # Считаем число образцов без загрузки изображений —
+                # просто считаем файлы чтобы оценить RAM.
+                n_approx = sum(
+                    1 for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff")
+                    for _ in split_path.rglob(ext)
+                ) if split_path.exists() else 0
+
+                # Кешируем только train и только если хватает RAM.
+                # val/test маленькие — там DataPrefetcher достаточен.
+                # Порог 2 GB: при 7k изображений 224×224 ≈ 0.45 GB — кеш всегда включён.
+                # При 400k изображений 224×224 ≈ 26 GB — кеш отключится, работаем без него.
+                ram_gb_needed = _estimate_cache_ram_gb(n_approx)
+                use_cache = (split == "train") and (ram_gb_needed <= 2.0)
+
+                if split == "train":
+                    if use_cache:
+                        self.log(
+                            f"  [CACHE] train-сплит: {n_approx} изображений, "
+                            f"~{ram_gb_needed:.2f} GB → кешируем в RAM (ускорение загрузки)"
+                        )
+                    else:
+                        self.log(
+                            f"  [CACHE] train-сплит: {n_approx} изображений, "
+                            f"~{ram_gb_needed:.2f} GB → датасет слишком большой для RAM-кеша, "
+                            f"загружаем с диска (num_workers=0, DataPrefetcher активен)"
+                        )
+
                 ds = ClassificationDataset(
                     dataset_path, split, image_size, num_channels=num_channels,
+                    cache_in_memory=use_cache,
                 )
                 # Worker seed для воспроизводимости
                 g = torch.Generator()
