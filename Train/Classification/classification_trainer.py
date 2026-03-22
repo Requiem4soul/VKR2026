@@ -505,6 +505,61 @@ def compute_classification_metrics(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ВЗВЕШЕННЫЙ ЛОСС (адаптивный к балансу классов)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_class_weights(
+    dataset: "ClassificationDataset",
+    num_classes: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Вычисляет веса классов для CrossEntropyLoss на основе частот в train-сплите.
+
+    Формула: weight[c] = N_total / (N_classes × N_c)
+    Это inverse-frequency weighting — стандартный подход для несбалансированных
+    датасетов (King & Zeng, 2001; Japkowicz & Stephen, 2002).
+
+    Поведение:
+    - Сбалансированный датасет (все классы равны): все веса = 1.0 → поведение
+      идентично nn.CrossEntropyLoss() без весов.
+    - Несбалансированный: минорные классы получают больший вес, что предотвращает
+      застревание модели на предсказании мажоритарного класса.
+
+    Научное обоснование:
+    King & Zeng (2001) "Logistic Regression in Rare Events Data",
+        Political Analysis, 9(2), 137–163.
+    Japkowicz & Stephen (2002) "The class imbalance problem: A systematic study",
+        Intelligent Data Analysis, 6(5), 429–449.
+
+    Args:
+        dataset: ClassificationDataset с атрибутом .samples [(path, label), ...]
+        num_classes: число классов
+        device: устройство для тензора весов
+
+    Returns:
+        Тензор весов формы [num_classes] или None при ошибке
+    """
+    try:
+        from collections import Counter
+        labels = [s[1] for s in dataset.samples]
+        counts = Counter(labels)
+        total = len(labels)
+        # Если все классы представлены одинаково — веса единичные, лосс не меняется
+        if len(set(counts.values())) == 1:
+            return None
+        weights = torch.tensor(
+            [total / (num_classes * max(counts.get(i, 1), 1))
+             for i in range(num_classes)],
+            dtype=torch.float32,
+            device=device,
+        )
+        return weights
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ОСНОВНОЙ КЛАСС ТРЕНЕРА
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -810,7 +865,14 @@ class ClassificationTrainer:
             # Оптимизатор — SGD с параметрами из Yang et al. (2021) MedMNIST.
             # При freeze_backbone передаём только trainable параметры —
             # замороженные слои не получают градиентов (Yosinski et al., 2014).
-            lr = model_cfg.get("lr", 1e-3)
+            #
+            # lr по умолчанию: 1e-3 (Yang et al., 2021) для обучения с нуля;
+            # 1e-4 для pretrained (fine-tuning) — большой lr разрушает веса
+            # предобученной модели. Howard & Ruder (2018) "Universal Language
+            # Model Fine-Tuning", ACL — discriminative fine-tuning.
+            # На сбалансированных датасетах с большим числом примеров разница
+            # несущественна; на малых датасетах 1e-3 вызывает застревание.
+            lr = model_cfg.get("lr", 1e-4 if pretrained else 1e-3)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.SGD(
                 trainable_params,
@@ -822,7 +884,9 @@ class ClassificationTrainer:
             scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=model_max_epochs
             )
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(weight=_get_class_weights(
+                loaders["train"].dataset, num_classes, self.device
+            ))
 
             # Early Stopping
             es_config = self.es_config_default
