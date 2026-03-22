@@ -90,7 +90,8 @@ if not is_path_configured():
 _STATE_DEFAULTS = {
     "p2_stage":          "configure",   # configure | running | done
     # Модальный анализ (6_Объединение.py)
-    "p2_use_modality":   False,
+    "p2_use_modality":   True,
+    "p2_use_wiener":     False,
     "p2_modality_result": None,   # результат анализа модальности
     "p2_log_lines":      [],
     "p2_output_queue":   None,
@@ -194,14 +195,20 @@ CANDIDATE_GROUPS = {
                 "params": {"denoise": {"method": "wiener", "size": 5}},
             },
         ],
-        # Пул шумоподавления покрывает четыре классических пространственных фильтра:
+        # Пул шумоподавления покрывает три классических пространственных фильтра
+        # (базовый набор, всегда активен):
         #   Median    — импульсный шум (salt & pepper). Gonzalez & Woods (2018).
-        #   Gaussian  — равномерный фоновый шум.        Gonzalez & Woods (2018).
+        #   Gaussian  — равномерный фоновый шум, speckle. Gonzalez & Woods (2018).
         #   Bilateral — Gaussian шум с сохранением краёв. Tomasi & Manduchi (1998).
-        #   Wiener    — адаптивный, любой тип шума.
+        # Wiener (опционально, включается пользователем):
+        #   Wiener    — адаптивный линейный фильтр, минимизирует MSE.
         #               Wiener (1949); Fan et al. (2019) "Brief review of image
         #               denoising techniques", Visual Computing for Industry,
         #               Biomedicine, and Art, 2(1).
+        #               Исключён по умолчанию: scipy.signal.wiener реализован на
+        #               Python без SIMD-оптимизации — ~1–1.5 сек/изображение vs
+        #               ~3–8 мс для OpenCV-фильтров. На датасетах >10k изображений
+        #               применение Wiener увеличивает время предобработки на часы.
         # NLM исключён: O(N²) сложность непрактична для SHA-скрининга.
         # Jamieson & Talwalkar (2016) — бюджет на обучение, не предобработку.
     },
@@ -238,24 +245,33 @@ CANDIDATE_GROUPS = {
         "label": "Яркость",
         "candidates": [
             {
-                "id": "bright_04",
-                "display": "Яркость → 0.4",
+                "id": "gamma_05",
+                "display": "Gamma (γ=0.5, осветление)",
                 "methods": ["brightness_correction"],
-                "params": {"brightness_correction": {"target_brightness": 0.4}},
+                "params": {"brightness_correction": {"gamma": 0.5}},
             },
             {
-                "id": "bright_05",
-                "display": "Яркость → 0.5",
+                "id": "gamma_08",
+                "display": "Gamma (γ=0.8, лёгкое осветление)",
                 "methods": ["brightness_correction"],
-                "params": {"brightness_correction": {"target_brightness": 0.5}},
+                "params": {"brightness_correction": {"gamma": 0.8}},
             },
             {
-                "id": "bright_06",
-                "display": "Яркость → 0.6",
+                "id": "gamma_12",
+                "display": "Gamma (γ=1.2, лёгкое затемнение)",
                 "methods": ["brightness_correction"],
-                "params": {"brightness_correction": {"target_brightness": 0.6}},
+                "params": {"brightness_correction": {"gamma": 1.2}},
             },
         ],
+        # Гамма-коррекция — нелинейное степенное преобразование яркости.
+        # gamma < 1 осветляет (подтягивает тёмные области),
+        # gamma > 1 затемняет (подавляет пересветы).
+        # Три значения покрывают типичные проблемы датасетов:
+        #   γ=0.5 — сильное осветление (недоэкспонированные изображения)
+        #   γ=0.8 — мягкая коррекция (слегка тёмные датасеты)
+        #   γ=1.2 — мягкое затемнение (слегка пересвеченные датасеты)
+        # Реализация через LUT — O(1) на пиксель, очень быстро.
+        # Gonzalez & Woods (2018) "Digital Image Processing", 4th ed., гл. 3.2.
     },
     "sharpening": {
         "label": "Резкость",
@@ -373,19 +389,45 @@ _GROUP_TO_METHOD = {
 }
 
 
-def _get_active_candidate_groups(modality_result: Optional[Dict]) -> Dict:
+def _get_active_candidate_groups(modality_result: Optional[Dict],
+                                  use_wiener: bool = False) -> Dict:
     """
-    Возвращает CANDIDATE_GROUPS с исключёнными группами (если модальность определена).
-    Если modality_result is None или apply_filter=False — возвращает полный пул.
+    Возвращает CANDIDATE_GROUPS с учётом двух фильтров:
+    1. Модальность — исключает группы методов запрещённые для типа датасета.
+    2. use_wiener  — если False, удаляет кандидатов wiener_s3 и wiener_s5
+                     из группы denoise.
+
+    Аргументы:
+        modality_result: результат анализа модальности или None
+        use_wiener: включить ли Wiener-фильтры в пул кандидатов.
+            По умолчанию False — Wiener реализован через scipy.signal.wiener
+            без SIMD-оптимизации (~1–1.5 сек/изображение против ~3–8 мс для
+            OpenCV-фильтров). На датасетах >10k изображений это критично.
+            Fan et al. (2019); сравнительный анализ скорости OpenCV vs scipy.
     """
+    # Шаг 1: фильтр по модальности (исключение групп целиком)
     if modality_result is None or not modality_result.get("apply_filter", False):
-        return CANDIDATE_GROUPS
+        groups = CANDIDATE_GROUPS
+    else:
+        excluded = set(modality_result.get("excluded_groups", []))
+        groups = {k: v for k, v in CANDIDATE_GROUPS.items() if k not in excluded} \
+            if excluded else CANDIDATE_GROUPS
 
-    excluded = set(modality_result.get("excluded_groups", []))
-    if not excluded:
-        return CANDIDATE_GROUPS
+    # Шаг 2: фильтр Wiener — удаляем кандидатов wiener_* из группы denoise
+    if use_wiener:
+        return groups
 
-    return {k: v for k, v in CANDIDATE_GROUPS.items() if k not in excluded}
+    # Wiener выключен — строим копию groups с отфильтрованными кандидатами
+    _WIENER_IDS = {"wiener_s3", "wiener_s5"}
+    result = {}
+    for gid, ginfo in groups.items():
+        if gid == "denoise":
+            filtered_cands = [c for c in ginfo["candidates"]
+                              if c["id"] not in _WIENER_IDS]
+            result[gid] = {**ginfo, "candidates": filtered_cands}
+        else:
+            result[gid] = ginfo
+    return result
 
 
 def _run_search(q: queue.Queue, config: Dict):
@@ -783,8 +825,11 @@ def _run_search(q: queue.Queue, config: Dict):
         log("SHA не применяется в Фазе 1 — цель формировать полный пул, не искать одного лучшего")
         log("=" * 70)
 
-        # Получаем активные группы с учётом модальности
-        active_groups = _get_active_candidate_groups(modality_result)
+        # Получаем активные группы с учётом модальности и флага Wiener
+        active_groups = _get_active_candidate_groups(
+            modality_result,
+            use_wiener=config.get("use_wiener", False),
+        )
 
         if modality_result and modality_result.get("apply_filter"):
             excluded = modality_result.get("excluded_groups", [])
@@ -795,6 +840,14 @@ def _run_search(q: queue.Queue, config: Dict):
                     f"Pisano et al. (1998), Sternberg (1983)")
             log(f"  Активных групп для Фазы 1: "
                 f"{len(active_groups)} из {len(CANDIDATE_GROUPS)}")
+
+        if config.get("use_wiener", False):
+            log("  Wiener-фильтры: ВКЛЮЧЕНЫ (wiener_s3, wiener_s5)")
+            log("  Предупреждение: ~1–1.5 сек/изображение (scipy, без SIMD).")
+            log("  Fan et al. (2019) Visual Computing 2(1); Wiener (1949).")
+        else:
+            log("  Wiener-фильтры: выключены — используются Median/Gaussian/Bilateral")
+            log("  Gonzalez & Woods (2018); Tomasi & Manduchi (1998).")
 
         all_survivors: List[Dict] = []
 
@@ -1288,7 +1341,7 @@ if st.session_state.p2_stage == "configure":
 
     use_modality = st.checkbox(
         "Использовать анализ модальности",
-        value=st.session_state.get("p2_use_modality", False),
+        value=st.session_state.get("p2_use_modality", True),
         key="p2_use_modality_cb",
         help=(
             "Oliver & Quegan (2004) SAR; Pham et al. (2000) медицина; "
@@ -1298,6 +1351,27 @@ if st.session_state.p2_stage == "configure":
         ),
     )
     st.session_state.p2_use_modality = use_modality
+
+    use_wiener = st.checkbox(
+        "Включить Wiener-фильтры в пул кандидатов",
+        value=st.session_state.get("p2_use_wiener", False),
+        key="p2_use_wiener_cb",
+        help=(
+            "Добавляет Wiener (size=3) и Wiener (size=5) в группу шумоподавления. "
+            "Wiener — адаптивный линейный фильтр, минимизирует MSE относительно "
+            "оригинала (Wiener, 1949; Fan et al., 2019). "
+            "⚠ Отключён по умолчанию: scipy.signal.wiener работает без SIMD-оптимизации "
+            "и занимает ~1–1.5 сек/изображение против ~3–8 мс для OpenCV-фильтров. "
+            "Рекомендуется включать только на датасетах до ~5k изображений."
+        ),
+    )
+    st.session_state.p2_use_wiener = use_wiener
+
+    if use_wiener:
+        st.warning(
+            "⚠ Wiener включён. На датасете >5k изображений предобработка может занять "
+            "несколько часов. Убедитесь что это оправдано размером датасета."
+        )
 
     # Показываем результат предыдущего анализа если есть
     prev_modal = st.session_state.get("p2_modality_result")
@@ -1588,9 +1662,11 @@ if st.session_state.p2_stage == "configure":
 
     # ── Оценка числа обучений ─────────────────────────────────────────────
     fast_ep = max(1, int(epochs * (screening_ratio / 100)))
-    total_candidates = sum(len(g["candidates"]) for g in CANDIDATE_GROUPS.values())
+    # Считаем активный пул с учётом флага Wiener
+    _active_groups_ui = _get_active_candidate_groups(None, use_wiener=use_wiener)
+    total_candidates = sum(len(g["candidates"]) for g in _active_groups_ui.values())
     survivors_est = sum(
-        math.ceil(len(g["candidates"]) / eta) for g in CANDIDATE_GROUPS.values()
+        math.ceil(len(g["candidates"]) / eta) for g in _active_groups_ui.values()
     )
     phase2_est = survivors_est
 
@@ -1658,8 +1734,10 @@ elif st.session_state.p2_stage == "running":
             # Параметры скрининга
             "screening_ratio": st.session_state.get("p2_screening_ratio", 30),
             # Анализ модальности
-            "use_modality":    st.session_state.get("p2_use_modality", False),
+            "use_modality":    st.session_state.get("p2_use_modality", True),
             "modality_result": None,  # будет заполнен внутри _run_search если use_modality=True
+            # Wiener-фильтры
+            "use_wiener":      st.session_state.get("p2_use_wiener", False),
         }
 
         t = threading.Thread(target=_run_search, args=(q, config), daemon=True)

@@ -175,6 +175,12 @@ class DatasetPreprocessor:
                 image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
                 if image is None:
                     continue
+                # Убираем alpha-канал если есть (BGRA → BGR).
+                # PNG с прозрачностью читаются как 4-канальные (BGRA),
+                # что приводит к ошибке в cvtColor (BGR2LAB, BGR2YCrCb и др.).
+                # Alpha-канал в датасетах для обучения нейросетей не используется.
+                if image.ndim == 3 and image.shape[2] == 4:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
                 processed = self.methods.apply_pipeline(image, methods, _params)
 
                 out_path = _dst_image_path(img_path, src_split_dir, dst_split_dir)
@@ -245,6 +251,9 @@ class DatasetPreprocessor:
                 image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
                 if image is None:
                     continue
+                # Убираем alpha-канал если есть (BGRA → BGR).
+                if image.ndim == 3 and image.shape[2] == 4:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
 
                 if cluster_methods:
                     combined_params = self._build_params_for_image(
