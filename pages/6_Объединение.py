@@ -360,10 +360,9 @@ def score_from_metrics(metrics: Dict) -> float:
         return 0.6 * metrics.get("auc", 0.0) + 0.4 * metrics.get("acc", 0.0)
     # Детекция (аналог composite_score из module3)
     return (
-        0.40 * metrics.get("mAP50-95", 0.0)
-        + 0.30 * metrics.get("mAP50", 0.0)
+        0.45 * metrics.get("mAP50-95", 0.0)
+        + 0.35 * metrics.get("mAP50", 0.0)
         + 0.20 * metrics.get("f1", 0.0)
-        + 0.10 * (1.0 / (1.0 + metrics.get("val_loss", 1.0)))
     )
 
 
@@ -822,9 +821,9 @@ def _run_search(q: queue.Queue, config: Dict):
         # ══════════════════════════════════════════════════════════════════
         log("")
         log("=" * 70)
-        log("ФАЗА 1: Групповой скрининг с фильтром по baseline")
-        log("Guyon & Elisseeff (2003) группировка; Kohavi & John (1997) фильтр по baseline")
-        log("SHA не применяется в Фазе 1 — цель формировать полный пул, не искать одного лучшего")
+        log("ФАЗА 1: Групповой скрининг (baseline-фильтр → SHA)")
+        log("Guyon & Elisseeff (2003) группировка; Kohavi & John (1997) фильтр по baseline;")
+        log("Jamieson & Talwalkar (2016) SHA среди кандидатов выше baseline")
         log("=" * 70)
 
         # Получаем активные группы с учётом модальности и флага Wiener
@@ -875,44 +874,30 @@ def _run_search(q: queue.Queue, config: Dict):
                 log(f"    [ПРОПУСК] нет кандидатов в группе {group_label}")
                 continue
 
-            # Фаза 1: только фильтр по baseline, SHA не применяется.
+            # Фаза 1: фильтр по baseline → SHA-отсев среди прошедших фильтр.
             #
-            # Обоснование отказа от SHA в Фазе 1:
-            # SHA разработан для поиска одного лучшего кандидата среди многих
-            # (Jamieson & Talwalkar, 2016). Цель Фазы 1 — другая: сформировать
-            # полный пул survivors для Фазы 2, где их комбинации будут проверяться.
-            # При малом числе кандидатов в группе (7–8) SHA вызывает over-pruning —
-            # отбрасывает кандидатов реально лучше baseline, обедняя пул.
-            # Li et al. (2018) "Hyperband" документируют эту проблему и решают её
-            # запуском SHA с разными бюджетами; в нашем случае проще отказаться
-            # от SHA в Фазе 1 вовсе, оставив только содержательный фильтр.
-            # SHA остаётся в Фазе 2 где комбинаций много и отсев оправдан.
+            # Порядок: baseline-фильтр сначала, SHA после.
+            # Kohavi & John (1997) — отсев кандидатов хуже baseline бессмысленен
+            # для пула Фазы 2. SHA (Jamieson & Talwalkar, 2016) применяется только
+            # к кандидатам выше baseline, оставляя ceil(N/eta) лучших.
             #
-            # Если вся группа хуже baseline — деградируем к поведению без фильтра
-            # (берём всех), чтобы не потерять группу целиком.
+            # Если вся группа хуже baseline — группа пропускается целиком.
+            # Обоснование: ни один метод группы не улучшает качество относительно
+            # оригинала, поэтому включать их в пул Фазы 2 нецелесообразно.
             above = [s for s in scored if s["score"] > baseline_score]
-            if above:
-                n_filtered = len(scored) - len(above)
-                log(f"\n    Фильтр baseline: {n_filtered} отсеяно из {len(scored)} "
-                    f"(score <= {baseline_score:.4f}), "
-                    f"survivors: {len(above)}")
-                survivors = above
-            else:
-                # Все кандидаты ниже baseline — берём одного лучшего.
-                # Обоснование: все кандидаты уже оценены при фиксированном
-                # бюджете, поэтому многораундовый SHA нецелесообразен —
-                # достаточно одношагового отбора по аналогии с финальным
-                # шагом Successive Rejects (Audibert & Bubeck, 2010).
-                # Это сокращает пул survivors и уменьшает число комбинаций
-                # в Фазе 2 на ~15-30%, не жертвуя качеством отбора:
-                # при close scores в пределах шума 30% эпох разница
-                # между кандидатами статистически незначима.
-                best_fallback = max(scored, key=lambda x: x["score"])
-                survivors = [best_fallback]
-                log(f"\n    Фильтр baseline: все кандидаты ниже baseline "
-                    f"({baseline_score:.4f}) — берём одного лучшего: "
-                    f"{best_fallback['display']} (score={best_fallback['score']:.4f})")
+            if not above:
+                log(f"\n    Фильтр baseline: все {len(scored)} кандидатов группы "
+                    f"ниже baseline ({baseline_score:.4f}) — группа [{group_label}] пропускается.")
+                continue
 
+            n_filtered = len(scored) - len(above)
+            if n_filtered:
+                log(f"\n    Фильтр baseline: {n_filtered} отсеяно из {len(scored)} "
+                    f"(score <= {baseline_score:.4f}), осталось: {len(above)}")
+
+            # SHA-отсев среди кандидатов выше baseline
+            survivors = sha_prune(above, eta=eta)
+            log(f"    SHA-отсев (eta={eta}): {len(above)} → {len(survivors)} survivors")
             for s in sorted(survivors, key=lambda x: x["score"], reverse=True):
                 log(f"      + {s['display']:40s}  score={s['score']:.4f}")
 
@@ -1300,11 +1285,12 @@ if st.session_state.p2_stage == "configure":
 
     with st.expander("Как работает алгоритм", expanded=False):
         st.markdown("""
-**Фаза 1 — Групповой SHA-скрининг** *(Guyon & Elisseeff, 2003; Liu & Motoda, 2007)*
+**Фаза 1 — Групповой скрининг** *(Guyon & Elisseeff, 2003; Kohavi & John, 1997; Jamieson & Talwalkar, 2016)*
 
 Методы предобработки разбиты на тематические группы (шум, контраст, яркость, резкость).
-Внутри каждой группы все кандидаты обучаются **30% эпох** без Early Stopping,
-затем SHA-отсев оставляет `ceil(N/eta)` лучших survivors.
+Внутри каждой группы все кандидаты обучаются **30% эпох** без Early Stopping.
+Затем: фильтр по baseline (отсекает кандидатов хуже оригинала) → SHA-отсев среди прошедших фильтр (`ceil(N/eta)` лучших).
+Если вся группа хуже baseline — группа пропускается целиком.
 
 **Фаза 2 — SFS+SHA на survivors** *(Kohavi & John, 1997; Jamieson & Talwalkar, 2016)*
 
@@ -1319,7 +1305,7 @@ if st.session_state.p2_stage == "configure":
 | Шаг | Что происходит | Эпох |
 |-----|----------------|------|
 | Baseline (быстрый) | Оценка оригинала | 30% |
-| Фаза 1 | SHA по каждой группе | 30% × N кандидатов |
+| Фаза 1 | Baseline-фильтр → SHA по каждой группе | 30% × N кандидатов |
 | Фаза 2 | SFS+SHA на survivors | 30% × итерации |
 | Финал победителя | Полное обучение | 100% + ES |
 | Финал baseline | Полное обучение | 100% + ES |
@@ -1991,7 +1977,7 @@ elif st.session_state.p2_stage == "done":
                 b_score = result.get("baseline_score", 0.0)
                 table2_rows = [
                     {
-                        "Метрика":    "Score  (0.4×mAP50-95 + 0.3×mAP50 + 0.2×F1 + 0.1×loss)",
+                        "Метрика":    "Score  (0.45×mAP50-95 + 0.35×mAP50 + 0.2×F1)",
                         "Baseline":   _fmt(b_score),
                         "Победитель": _fmt(w_score),
                         "Δ":          _delta_fmt(w_score, b_score),
