@@ -152,12 +152,25 @@ class PreprocessingMethods:
             **kwargs
     ) -> np.ndarray:
         """
-        Улучшение контраста
+        Улучшение контраста.
+
+        Поддерживает grayscale (2D), одноканальный 3D (H,W,1) и RGB (H,W,3).
+        Одноканальный 3D squeeze-ится до 2D перед обработкой и восстанавливается
+        в конце — это нужно для MIAS и аналогичных grayscale датасетов где
+        cv2.IMREAD_UNCHANGED может вернуть (H,W,1) вместо (H,W).
 
         Args:
             method: 'clahe', 'histogram_eq'
             **kwargs: Дополнительные параметры
         """
+        # Нормализуем одноканальный 3D → 2D.
+        # cv2.IMREAD_UNCHANGED на grayscale PNG иногда возвращает (H,W,1),
+        # что вызывает ошибку cvtColor(COLOR_BGR2LAB): scn=1 не поддерживается.
+        squeezed = False
+        if image.ndim == 3 and image.shape[2] == 1:
+            image = image[:, :, 0]
+            squeezed = True
+
         if method == 'clahe':
             clip_limit = kwargs.get('clip_limit', 2.0)
             tile_grid_size = kwargs.get('tile_grid_size', (8, 8))
@@ -170,20 +183,28 @@ class PreprocessingMethods:
                 # Pisano et al. (1998); Gonzalez & Woods (2018).
                 lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
                 lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-                return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
             else:
-                return clahe.apply(image)
+                # Grayscale (2D): применяем CLAHE напрямую.
+                # Стандарт в медицинской визуализации.
+                # Pisano et al. (1998) J. Digital Imaging, 11(4), 193-200.
+                result = clahe.apply(image)
 
         elif method == 'histogram_eq':
             if image.ndim == 3:
                 # RGB: equalizeHist только по Y-каналу в YCrCb
                 ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
                 ycrcb[:, :, 0] = cv2.equalizeHist(ycrcb[:, :, 0])
-                return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+                result = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
             else:
-                return cv2.equalizeHist(image)
+                result = cv2.equalizeHist(image)
+        else:
+            result = image
 
-        return image
+        # Восстанавливаем (H,W,1) если исходное изображение было таким
+        if squeezed:
+            result = result[:, :, np.newaxis]
+        return result
 
     @staticmethod
     def gamma_correction(

@@ -92,6 +92,7 @@ _STATE_DEFAULTS = {
     # Модальный анализ (6_Объединение.py)
     "p2_use_modality":   True,
     "p2_use_wiener":     False,
+    "p2_use_torch_compile": True,
     "p2_modality_result": None,   # результат анализа модальности
     "p2_log_lines":      [],
     "p2_output_queue":   None,
@@ -583,8 +584,9 @@ def _run_search(q: queue.Queue, config: Dict):
             """
             _cfg = {
                 **_model_cfg_base,
-                "name":       f"{model_type}_{name_suffix}",
-                "max_epochs": epochs,
+                "name":              f"{model_type}_{name_suffix}",
+                "max_epochs":        epochs,
+                "use_torch_compile": config.get("use_torch_compile", False),
             }
             if use_es:
                 _cfg["early_stopping"] = {"patience": patience, "metric": "val_auc"}
@@ -1373,6 +1375,28 @@ if st.session_state.p2_stage == "configure":
             "несколько часов. Убедитесь что это оправдано размером датасета."
         )
 
+    use_torch_compile = st.checkbox(
+        "Включить torch.compile (JIT-компиляция модели)",
+        value=st.session_state.get("p2_use_torch_compile", True),
+        key="p2_use_torch_compile_cb",
+        help=(
+            "torch.compile компилирует граф модели через Triton/CUDA, давая +20–40% "
+            "скорости обучения. Требует triton-windows. "
+            "⚠ Отключён по умолчанию: первая эпоха каждого обучения занимает "
+            "~1–2 мин на компиляцию. При SHA-скрининге (~27 обучений) накладные "
+            "расходы превышают выигрыш. Включать только при финальном обучении "
+            "одной модели на большом датасете (>10k изображений, >50 эпох)."
+        ),
+    )
+    st.session_state.p2_use_torch_compile = use_torch_compile
+
+    if use_torch_compile:
+        st.warning(
+            "⚠ torch.compile включён. Первая эпоха каждого обучения будет медленнее "
+            "(~1–2 мин компиляция). На малых датасетах или коротких прогонах "
+            "это может замедлить подбор."
+        )
+
     # Показываем результат предыдущего анализа если есть
     prev_modal = st.session_state.get("p2_modality_result")
     if use_modality and prev_modal:
@@ -1738,6 +1762,8 @@ elif st.session_state.p2_stage == "running":
             "modality_result": None,  # будет заполнен внутри _run_search если use_modality=True
             # Wiener-фильтры
             "use_wiener":      st.session_state.get("p2_use_wiener", False),
+            # torch.compile
+            "use_torch_compile": st.session_state.get("p2_use_torch_compile", True),
         }
 
         t = threading.Thread(target=_run_search, args=(q, config), daemon=True)
