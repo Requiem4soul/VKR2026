@@ -302,29 +302,29 @@ class DataPrefetcher:
 
 def _default_transforms(image_size: int, split: str) -> transforms.Compose:
     """
-    Стандартные трансформации для классификации.
-    Аугментация только на train (RandomHorizontalFlip, RandomCrop).
-    На val/test — только Resize + CenterCrop + Normalize.
+    Трансформации для классификации без аугментации.
+
+    Аугментации (RandomCrop, RandomHorizontalFlip) намеренно исключены:
+    данная работа исследует влияние предобработки на качество модели
+    на оригинальных данных. Аугментации вносят дополнительную случайность
+    и искусственно расширяют обучающую выборку, что затрудняет честное
+    сравнение пайплайнов предобработки.
+
+    Для всех сплитов применяется одинаковый детерминированный pipeline:
+    Resize → CenterCrop → ToTensor → Normalize (ImageNet stats).
+    CenterCrop вместо простого Resize сохраняет стандартную практику
+    Yang et al. (2021) MedMNIST для финального размера изображения.
     """
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     )
-    if split == "train":
-        return transforms.Compose([
-            transforms.Resize(int(image_size * 1.15)),
-            transforms.RandomCrop(image_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])
-    else:
-        return transforms.Compose([
-            transforms.Resize(int(image_size * 1.15)),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            normalize,
-        ])
+    return transforms.Compose([
+        transforms.Resize(int(image_size * 1.15)),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        normalize,
+    ])
 
 
 class ClassificationDataset(Dataset):
@@ -345,16 +345,27 @@ class ClassificationDataset(Dataset):
         image_size: int = 224,
         transform: Optional[transforms.Compose] = None,
         num_channels: int = 3,
+        cache_in_memory: bool = False,
     ):
         self.dataset_path = dataset_path
         self.split = split
         self.image_size = image_size
         self.num_channels = num_channels
         self.transform = transform or _default_transforms(image_size, split)
+        self.cache_in_memory = cache_in_memory
+
+        # Кеш: idx → PIL.Image (уже convert-нутый, до transform).
+        # Хранится как PIL а не тензор — transform включает аугментации
+        # (RandomCrop, RandomHorizontalFlip) которые должны применяться заново
+        # на каждом __getitem__, иначе аугментация теряется.
+        self._cache: Dict[int, "Image.Image"] = {}
 
         self.samples: List[Tuple[Path, int]] = []
         self.classes: List[str] = []
         self._load(dataset_path / split)
+
+        if cache_in_memory:
+            self._preload_to_cache()
 
     def _load(self, split_path: Path):
         if not split_path.exists():
@@ -393,16 +404,47 @@ class ClassificationDataset(Dataset):
             "Ожидается: подпапки по классам или images/ + labels.csv"
         )
 
+    def _preload_to_cache(self):
+        """
+        Загружает все изображения в RAM (PIL, до transform).
+        Вызывается один раз при создании датасета если cache_in_memory=True.
+
+        Без аугментаций трансформы детерминированы, поэтому можно было бы
+        кешировать и тензоры — но PIL занимает меньше RAM (uint8 vs float32)
+        и не требует пересчёта при смене image_size.
+
+        Оценка RAM: N × H × W × 3 байт при uint8 PIL.
+        При 7k изображений 224×224×3 ≈ 450 MB — комфортно для большинства систем.
+        """
+        for idx, (img_path, _) in enumerate(self.samples):
+            try:
+                img = Image.open(img_path)
+                # Конвертируем сразу — чтобы в __getitem__ не открывать файл
+                if self.num_channels == 1:
+                    img = img.convert("L").convert("RGB")
+                else:
+                    img = img.convert("RGB")
+                img.load()  # принудительно читает данные с диска в RAM
+                self._cache[idx] = img
+            except Exception:
+                # Если изображение не удалось загрузить — оставляем без кеша,
+                # __getitem__ прочитает его с диска как обычно
+                pass
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         img_path, label = self.samples[idx]
-        img = Image.open(img_path)
-        if self.num_channels == 1:
-            img = img.convert("L").convert("RGB")  # grayscale → RGB для pretrained
+        if idx in self._cache:
+            # Берём из кеша — копия чтобы PIL не мутировал в трансформах
+            img = self._cache[idx].copy()
         else:
-            img = img.convert("RGB")
+            img = Image.open(img_path)
+            if self.num_channels == 1:
+                img = img.convert("L").convert("RGB")
+            else:
+                img = img.convert("RGB")
         img = self.transform(img)
         return img, label
 
@@ -818,7 +860,7 @@ class ClassificationTrainer:
                 return None
             try:
                 ds = ClassificationDataset(
-                    dataset_path, split, image_size, num_channels=num_channels
+                    dataset_path, split, image_size, num_channels=num_channels,
                 )
                 # Worker seed для воспроизводимости
                 g = torch.Generator()

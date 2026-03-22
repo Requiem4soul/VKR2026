@@ -63,6 +63,15 @@ class PreprocessingMethods:
             Обработанное изображение
         """
 
+        # Нормализуем (H,W,1) → (H,W).
+        # cv2.bilateralFilter и ряд других OpenCV-фильтров не принимают
+        # одноканальный 3D массив (scn=1 → ошибка). После обработки
+        # shape восстанавливается.
+        squeezed = False
+        if image.ndim == 3 and image.shape[2] == 1:
+            image = image[:, :, 0]
+            squeezed = True
+
         # Автоматический выбор фильтра на основе типа шума.
         # Gonzalez & Woods (2018) гл. 5; Fan et al. (2019).
         if method == 'auto':
@@ -84,6 +93,7 @@ class PreprocessingMethods:
                     kwargs['size'] = 5
 
         # Применяем выбранный фильтр
+        result = image  # fallback если метод не распознан
         if method == 'median':
             # Adaptive kernel size based on noise level
             if noise_level == 'high':
@@ -93,7 +103,7 @@ class PreprocessingMethods:
             else:  # low
                 ksize = kwargs.get('ksize', 3)
 
-            return cv2.medianBlur(image, ksize)
+            result = cv2.medianBlur(image, ksize)
 
         elif method == 'bilateral':
             # Адаптивные параметры для bilateral filter
@@ -110,7 +120,7 @@ class PreprocessingMethods:
                 sigma_color = kwargs.get('sigma_color', 50)
                 sigma_space = kwargs.get('sigma_space', 50)
 
-            return cv2.bilateralFilter(image, d, sigma_color, sigma_space)
+            result = cv2.bilateralFilter(image, d, sigma_color, sigma_space)
 
         elif method == 'gaussian':
             # Gaussian blur — быстрый линейный фильтр общего назначения.
@@ -120,7 +130,7 @@ class PreprocessingMethods:
             # ksize должен быть нечётным
             if ksize % 2 == 0:
                 ksize += 1
-            return cv2.GaussianBlur(image, (ksize, ksize), 0)
+            result = cv2.GaussianBlur(image, (ksize, ksize), 0)
 
         elif method == 'wiener':
             # Wiener filter — адаптивный фильтр, минимизирующий среднеквадратичную
@@ -140,10 +150,12 @@ class PreprocessingMethods:
                 filtered = np.stack(channels, axis=2)
             else:
                 filtered = scipy_wiener(img_float, mysize=size)
-            return np.clip(filtered, 0, 255).astype(np.uint8)
+            result = np.clip(filtered, 0, 255).astype(np.uint8)
 
-        # Если метод не распознан — возвращаем оригинал
-        return image
+        # Восстанавливаем (H,W,1) если исходное изображение было таким
+        if squeezed:
+            result = result[:, :, np.newaxis]
+        return result
 
     @staticmethod
     def contrast_enhancement(

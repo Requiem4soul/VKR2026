@@ -49,6 +49,7 @@ class ImageModalityClassifier:
             'brightness': (0.1, 0.4),
             'snr': (20, 40),
             'dynamic_range': (0.0, 0.7),
+            'grayscale_only': True,
             'source': 'Pham et al. (2000)',
             'description': 'Медицинские рентгеновские снимки'
         },
@@ -146,6 +147,18 @@ class ImageModalityClassifier:
         """
         score = 0.0
         count = 0
+
+        # 0. Бонус за grayscale — физически сильный сигнал для медицинских модальностей.
+        # SAR и рентген физически не дают цветных изображений.
+        # Oliver & Quegan (2004); Pham et al. (2000); Gonzalez & Woods (2018).
+        # Бонус добавляется только модальностям с флагом 'grayscale_only': True.
+        # Вес 2.0 отражает что граyscale — жёсткое физическое ограничение,
+        # более надёжный сигнал чем любой числовой порог по контрасту/яркости.
+        if thresholds.get('grayscale_only', False):
+            is_color = getattr(metrics, 'is_color_dataset', True)
+            if not is_color:
+                score += 2.0
+            count += 2
         
         # 1. Контраст
         if 'contrast' in thresholds:
