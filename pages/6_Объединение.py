@@ -1865,11 +1865,17 @@ elif st.session_state.p2_stage == "done":
             wm  = result.get("winner_metrics",       {}) or {}
             bqs = result.get("baseline_quick_score", 0.0)
 
+            # Процент эпох скрининга, который пользователь выставил в UI.
+            # Берём из session_state — он точно есть, так как пользователь
+            # выставил его перед запуском. Дефолт 30 на случай старых сессий.
+            _sr = st.session_state.get("p2_screening_ratio", 30)
+            _score_col = f"Score ({_sr}% эп.)"
+
             # ─────────────────────────────────────────────────────────────
             # ТАБЛИЦА 1: финальные survivors последней итерации vs baseline
-            #            (сравнение по quick-score, 30% эпох)
+            #            (сравнение по quick-score, _sr% эпох)
             # ─────────────────────────────────────────────────────────────
-            st.subheader("Таблица 1 — Финальные survivors vs Baseline (быстрое обучение, 30% эпох)")
+            st.subheader(f"Таблица 1 — Финальные survivors vs Baseline (быстрое обучение, {_sr}% эпох)")
             st.caption(
                 "Все пайплайны, прошедшие SHA-отсев на последней итерации Фазы 2, "
                 "отсортированы по score по убыванию."
@@ -1879,17 +1885,17 @@ elif st.session_state.p2_stage == "done":
             if final_survivors_data:
                 table1_rows = [
                     {
-                        "Пайплайн":         "— Baseline (оригинал) —",
-                        "Score (30% эп.)":  f"{bqs:.4f}",
-                        "vs Baseline":      "—",
+                        "Пайплайн":   "— Baseline (оригинал) —",
+                        _score_col:   f"{bqs:.4f}",
+                        "vs Baseline": "—",
                     }
                 ]
                 for s in final_survivors_data:
                     delta = s["score"] - bqs
                     table1_rows.append({
-                        "Пайплайн":        s["display"],
-                        "Score (30% эп.)": f"{s['score']:.4f}",
-                        "vs Baseline":     f"{delta:+.4f}",
+                        "Пайплайн":   s["display"],
+                        _score_col:   f"{s['score']:.4f}",
+                        "vs Baseline": f"{delta:+.4f}",
                     })
                 st.dataframe(pd.DataFrame(table1_rows), use_container_width=True)
             else:
@@ -2018,7 +2024,7 @@ elif st.session_state.p2_stage == "done":
                         {
                             "Итерация":             h.get("iteration", "—"),
                             "Лучший пайплайн":      h.get("best_pipeline", "—"),
-                            "Score (30% эп.)":      f"{h.get('score', 0.0):.4f}",
+                            _score_col:             f"{h.get('score', 0.0):.4f}",
                             "Кандидатов (SHA вход)": h.get("n_candidates", "—"),
                             "Survivors (SHA выход)": h.get("n_survivors", "—"),
                         }
@@ -2034,8 +2040,8 @@ elif st.session_state.p2_stage == "done":
                 with st.expander("Survivors Фазы 1 (SHA-скрининг по группам)", expanded=False):
                     rows = [
                         {
-                            "Метод":               s["display"],
-                            "Score (30% эп.)":     f"{s['score']:.4f}",
+                            "Метод":   s["display"],
+                            _score_col: f"{s['score']:.4f}",
                         }
                         for s in sorted(survivors_p1, key=lambda x: x["score"], reverse=True)
                     ]
@@ -2053,13 +2059,13 @@ elif st.session_state.p2_stage == "done":
             if final_survivors_data:
                 csv_table1_rows = [
                     {"Пайплайн": "— Baseline (оригинал) —",
-                     "Score_30pct": bqs, "vs_Baseline": 0.0}
+                     f"Score_{_sr}pct": bqs, "vs_Baseline": 0.0}
                 ]
                 for s in final_survivors_data:
                     csv_table1_rows.append({
-                        "Пайплайн":    s["display"],
-                        "Score_30pct": s["score"],
-                        "vs_Baseline": round(s["score"] - bqs, 4),
+                        "Пайплайн":        s["display"],
+                        f"Score_{_sr}pct": s["score"],
+                        "vs_Baseline":     round(s["score"] - bqs, 4),
                     })
                 csv1 = pd.DataFrame(csv_table1_rows).to_csv(index=False, encoding="utf-8")
                 with dl_col1:

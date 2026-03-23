@@ -530,7 +530,7 @@ class YOLOWrapper(BaseModelWrapper):
     def extract_metrics(self) -> Dict[str, float]:
         """Извлекает метрики из результатов YOLO обучения"""
         if self.results is None:
-            return {'mAP50': 0.0, 'mAP50-95': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'train_loss': 1.0}
+            return {'mAP50': 0.0, 'mAP50-95': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'train_loss': 1.0, 'val_loss': 1.0}
         
         try:
             results_dict = self.results.results_dict
@@ -542,6 +542,7 @@ class YOLOWrapper(BaseModelWrapper):
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
             
             train_loss = float(results_dict.get('train/box_loss', results_dict.get('train/cls_loss', 1.0)))
+            val_loss = float(results_dict.get('val/box_loss', results_dict.get('val/cls_loss', 1.0)))
             
             return {
                 'mAP50': map50,
@@ -550,10 +551,11 @@ class YOLOWrapper(BaseModelWrapper):
                 'recall': recall,
                 'f1': f1,
                 'train_loss': train_loss,
+                'val_loss': val_loss
             }
         except Exception as e:
             print(f"[WARNING] Не удалось извлечь метрики YOLO: {e}")
-            return {'mAP50': 0.0, 'mAP50-95': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'train_loss': 1.0}
+            return {'mAP50': 0.0, 'mAP50-95': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'train_loss': 1.0, 'val_loss': 1.0}
     
     def save(self, path: str):
         if self.model and self.last_project_path:
@@ -1127,16 +1129,7 @@ class UniversalModelTrainer:
                 )
                 
                 all_metrics = {'train_loss': 0, 'val_loss': 0}
-                best_metrics = None  # метрики лучшей эпохи по ES
-
-                # Получаем stopper для этой модели если ES включён.
-                # ES проверяется на каждой эпохе (не на каждом чекпоинте) —
-                # это исправляет баг когда patience считался по чекпоинтам.
-                # Prechelt (1998): ES должен проверяться после каждой эпохи.
-                _stopper = None
-                if self.enable_early_stopping and self.early_stoppers:
-                    _stopper = self.early_stoppers.get(key)
-
+                
                 for epoch in range(epochs_to_train):
                     current_epoch = start_epoch + epoch + 1
                     self.log_message(f"  Эпоха {current_epoch}/{end_epoch}")
@@ -1154,42 +1147,8 @@ class UniversalModelTrainer:
                     
                     all_metrics.update(val_metrics)
                     all_metrics['train_loss'] = train_metrics['train_loss']
-
-                    # ES на каждой эпохе — модель ещё жива в self.models[key],
-                    # поэтому save_checkpoint_with_metrics работает корректно.
-                    if _stopper is not None:
-                        def _save_fn(ep, mtr, _key=key):
-                            return self.save_checkpoint_with_metrics(_key, ep, mtr)
-
-                        _epoch_metrics = {**all_metrics, 'epoch': current_epoch}
-                        should_continue, es_reason = _stopper.step(
-                            _epoch_metrics, current_epoch, _save_fn
-                        )
-                        self.log_message(f"  [ES] {es_reason}")
-
-                        if _stopper.best_score is not None:
-                            best_metrics = {**all_metrics, 'epoch': current_epoch}
-
-                        if not should_continue:
-                            self.log_message(f"  [ES] Ранняя остановка на эпохе {current_epoch}")
-                            # Обновляем end_epoch чтобы чекпоинт сохранился корректно
-                            end_epoch = current_epoch
-                            break
-
-                # Если ES сохранил лучшие веса — восстанавливаем их
-                if _stopper and _stopper.best_model_path and os.path.exists(_stopper.best_model_path):
-                    try:
-                        ckpt = torch.load(_stopper.best_model_path, map_location=device)
-                        if 'model_state_dict' in ckpt and ckpt['model_state_dict'] is not None:
-                            self.models[key].model.load_state_dict(ckpt['model_state_dict'])
-                            self.log_message(
-                                f"  [ES] Восстановлены лучшие веса (epoch={_stopper.best_epoch})"
-                            )
-                    except Exception as _e:
-                        self.log_message(f"  [ES] Не удалось восстановить веса: {_e}")
-
-                # Возвращаем метрики лучшей эпохи если ES активен, иначе последней
-                metrics = best_metrics if (best_metrics is not None) else all_metrics
+                
+                metrics = all_metrics
             
             metrics['epoch'] = end_epoch
             self.metrics_history[key].append(metrics)
@@ -1314,38 +1273,20 @@ class UniversalModelTrainer:
                     if metrics is None:
                         continue
                     
-                    # Early Stopping проверка.
-                    # Для YOLO: ES проверяется здесь по чекпоинтам —
-                    # YOLO обучается единым вызовом .train(), внутренний ES недоступен.
-                    # Для faster_rcnn / retinanet: ES уже обрабатывается внутри
-                    # train_model_segment на каждой эпохе — здесь не дублируем.
-                    model_type_for_es = model_config.get('type', '')
-                    if (self.enable_early_stopping and self.early_stoppers
-                            and model_type_for_es == 'yolo'):
+                    # Early Stopping проверка
+                    if self.enable_early_stopping and self.early_stoppers:
                         stopper = self.early_stoppers.get(key)
                         if stopper:
                             def save_fn(ep, mtr):
                                 return self.save_checkpoint_with_metrics(key, ep, mtr)
-
+                            
                             should_continue, reason = stopper.step(metrics, end_epoch, save_fn)
                             self.log_message(f"[ES] {key}: {reason}")
-
+                            
                             if not should_continue:
                                 self.training_active[key] = False
                                 self.stop_reasons[key] = reason
                                 self.log_message(f"[ES] Остановлено обучение {key}")
-
-                    # Для faster_rcnn / retinanet: ES уже мог остановить обучение
-                    # внутри train_model_segment — синхронизируем training_active.
-                    if model_type_for_es in ('faster_rcnn', 'retinanet'):
-                        if self.enable_early_stopping and self.early_stoppers:
-                            stopper = self.early_stoppers.get(key)
-                            if stopper and stopper.patience_counter >= stopper.config.patience:
-                                self.training_active[key] = False
-                                self.stop_reasons[key] = (
-                                    f"Early stopping: метрика не улучшалась "
-                                    f"{stopper.patience_counter} эпох"
-                                )
                     
                     # Ранний отбор
                     if self.enable_early_selection and self.early_selector:

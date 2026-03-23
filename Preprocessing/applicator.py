@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 from tqdm import tqdm
 import cv2
+import numpy as np
 from typing import Dict, List, Any, Optional
 
 from Preprocessing.methods import PreprocessingMethods
@@ -181,6 +182,16 @@ class DatasetPreprocessor:
                 # Alpha-канал в датасетах для обучения нейросетей не используется.
                 if image.ndim == 3 and image.shape[2] == 4:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+                # Конвертируем 16-битные изображения (CV_16U) в 8-битные (CV_8U).
+                # IMREAD_UNCHANGED читает PNG/TIFF как есть, включая 16-бит глубину.
+                # Методы CLAHE и equalizeHist требуют строго CV_8U — иначе OpenCV
+                # бросает ошибку "Unsupported depth" / "Assertion failed _src.type()".
+                # Нормализуем [0, 65535] → [0, 255] через cv2.convertScaleAbs
+                # с alpha=255/65535: сохраняет яркостные соотношения, не обрезает
+                # старший байт (что дало бы неверные результаты для тёмных снимков).
+                # Канальность и BGR/grayscale не изменяются.
+                if image.dtype == np.uint16:
+                    image = cv2.convertScaleAbs(image, alpha=255.0 / 65535.0)
                 processed = self.methods.apply_pipeline(image, methods, _params)
 
                 out_path = _dst_image_path(img_path, src_split_dir, dst_split_dir)
@@ -254,6 +265,9 @@ class DatasetPreprocessor:
                 # Убираем alpha-канал если есть (BGRA → BGR).
                 if image.ndim == 3 and image.shape[2] == 4:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+                # Конвертируем 16-битные изображения в 8-битные (см. выше).
+                if image.dtype == np.uint16:
+                    image = cv2.convertScaleAbs(image, alpha=255.0 / 65535.0)
 
                 if cluster_methods:
                     combined_params = self._build_params_for_image(

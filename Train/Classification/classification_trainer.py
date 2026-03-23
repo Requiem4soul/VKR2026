@@ -873,11 +873,25 @@ class ClassificationTrainer:
         # Это исправляет старый баг когда изображения кешировались в оригинальном
         # размере (640×640) вместо уменьшенного (224×224).
         # Формула: N * pre_resize^2 * 3 канала * 1 байт (uint8 PIL) → GB.
-        # Порог 2 GB — консервативный: оставляем память под модель и ОС.
+        # Порог: 70% от доступной RAM — стандартный safety margin.
+        # psutil.virtual_memory().available возвращает реально свободную память
+        # (не просто total - used), что точнее для оценки допустимого объёма кеша.
         pre_resize_size = int(image_size * 1.15)
 
         def _estimate_cache_ram_gb(n_samples: int) -> float:
             return n_samples * (pre_resize_size ** 2) * 3 / (1024 ** 3)
+
+        # Определяем допустимый порог RAM для кеша.
+        # Используем 70% от доступной RAM — оставляем место под модель, ОС и прочее.
+        # Минимум 1.0 GB (на случай если psutil недоступен или RAM почти занята),
+        # максимум 16 GB (защита от аномальных значений).
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024 ** 3)
+            ram_cache_limit_gb = max(1.0, min(16.0, available_gb * 0.70))
+        except ImportError:
+            # psutil не установлен — используем консервативный порог
+            ram_cache_limit_gb = 2.0
 
         def make_loader(split: str, shuffle: bool) -> Optional[DataLoader]:
             split_path = dataset_path / split
@@ -893,22 +907,21 @@ class ClassificationTrainer:
 
                 # Кешируем только train и только если хватает RAM.
                 # val/test маленькие — там DataPrefetcher достаточен.
-                # Порог 2 GB: при 7k изображений 224×224 ≈ 0.45 GB — кеш всегда включён.
-                # При 400k изображений 224×224 ≈ 26 GB — кеш отключится, работаем без него.
                 ram_gb_needed = _estimate_cache_ram_gb(n_approx)
-                use_cache = (split == "train") and (ram_gb_needed <= 2.0)
+                use_cache = (split == "train") and (ram_gb_needed <= ram_cache_limit_gb)
 
                 if split == "train":
                     if use_cache:
                         self.log(
                             f"  [CACHE] train-сплит: {n_approx} изображений, "
-                            f"~{ram_gb_needed:.2f} GB → кешируем в RAM (ускорение загрузки)"
+                            f"~{ram_gb_needed:.2f} GB → кешируем в RAM "
+                            f"(лимит={ram_cache_limit_gb:.1f} GB, ускорение загрузки)"
                         )
                     else:
                         self.log(
                             f"  [CACHE] train-сплит: {n_approx} изображений, "
-                            f"~{ram_gb_needed:.2f} GB → датасет слишком большой для RAM-кеша, "
-                            f"загружаем с диска (num_workers=0, DataPrefetcher активен)"
+                            f"~{ram_gb_needed:.2f} GB → превышает лимит RAM "
+                            f"({ram_cache_limit_gb:.1f} GB), загружаем с диска"
                         )
 
                 ds = ClassificationDataset(
