@@ -41,6 +41,7 @@ class ImageModalityClassifier:
             'brightness': (0.0, 0.2),
             'snr': (0, 15),
             'sharpness': (3000, 10000),
+            'grayscale_only': True,
             'source': 'Oliver & Quegan (2004)',
             'description': 'Радарные изображения с характерным speckle шумом'
         },
@@ -57,6 +58,7 @@ class ImageModalityClassifier:
             'contrast': (0.3, 0.7),
             'brightness': (0.3, 0.7),
             'snr': (15, 35),
+            'color_only': True,
             'source': 'Gonzalez & Woods (2018)',
             'description': 'Естественные фотографии с нормальным освещением'
         },
@@ -152,13 +154,24 @@ class ImageModalityClassifier:
         # SAR и рентген физически не дают цветных изображений.
         # Oliver & Quegan (2004); Pham et al. (2000); Gonzalez & Woods (2018).
         # Бонус добавляется только модальностям с флагом 'grayscale_only': True.
-        # Вес 2.0 отражает что граyscale — жёсткое физическое ограничение,
+        # Вес 2.0 отражает что grayscale — жёсткое физическое ограничение,
         # более надёжный сигнал чем любой числовой порог по контрасту/яркости.
         if thresholds.get('grayscale_only', False):
             is_color = getattr(metrics, 'is_color_dataset', True)
             if not is_color:
                 score += 2.0
             count += 2
+
+        # 0b. Штраф за grayscale для модальностей с флагом 'color_only': True.
+        # Современные натуральные фотографии физически цветные (RGB).
+        # Gonzalez & Woods (2018) — цветность как первичный признак natural_photo.
+        # Реализация: добавляем count+=1 без score+=1 — это пропорционально снижает
+        # итоговый score не обнуляя его полностью. Мягче жёсткого исключения:
+        # позволяет корректно обрабатывать исторические ч/б фотоархивы.
+        if thresholds.get('color_only', False):
+            is_color = getattr(metrics, 'is_color_dataset', True)
+            if not is_color:
+                count += 1  # score не увеличивается — провальный критерий
         
         # 1. Контраст
         if 'contrast' in thresholds:
