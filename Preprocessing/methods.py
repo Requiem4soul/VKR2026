@@ -51,10 +51,15 @@ class PreprocessingMethods:
           4. Адаптивный (любой тип) → Wiener filter (локально адаптируется к
              дисперсии шума; заменяет NLM ради вычислительной эффективности)
              Wiener (1949), ibid.; Fan et al. (2019), ibid.
+          5. Мультипликативный speckle (SAR) → Lee filter (разработан специально
+             для мультипликативной модели шума SAR; адаптирует сглаживание по
+             локальному коэффициенту вариации)
+             Lee (1980) IEEE Trans. PAMI-2(2):165-168;
+             Lee (1981) Comput. Graph. Image Process. 17(1):24-32.
 
         Args:
             image: Входное изображение
-            method: 'auto' (автовыбор), 'median', 'gaussian', 'bilateral', 'wiener'
+            method: 'auto' (автовыбор), 'median', 'gaussian', 'bilateral', 'wiener', 'lee'
             noise_type: 'gaussian', 'salt_pepper', 'speckle', 'unknown'
             noise_level: 'low', 'medium', 'high'
             **kwargs: Дополнительные параметры для фильтров
@@ -151,6 +156,51 @@ class PreprocessingMethods:
             else:
                 filtered = scipy_wiener(img_float, mysize=size)
             result = np.clip(filtered, 0, 255).astype(np.uint8)
+
+        elif method == 'lee':
+            # Lee filter — специализированный фильтр для мультипликативного
+            # speckle-шума в SAR изображениях. Адаптирует степень сглаживания
+            # на основе локального коэффициента вариации (CV = std/mean):
+            # в однородных областях (низкий CV) сглаживает сильнее,
+            # вблизи краёв и ярких объектов (высокий CV) сохраняет детали.
+            #
+            # Модель шума: y = x * n, где n — мультипликативный speckle.
+            # Оценка сигнала: x_hat = mean + k * (y - mean),
+            # где k = var_x / var_y, var_x = max(0, var_y - mean²/ENL).
+            # ENL (Equivalent Number of Looks) = 1 для single-look SAR.
+            #
+            # Lee J.S. (1980) "Digital image enhancement and noise filtering
+            # by use of local statistics", IEEE Trans. Pattern Anal. Mach. Intell.,
+            # PAMI-2(2):165-168.
+            # Lee J.S. (1981) "Speckle analysis and smoothing of synthetic aperture
+            # radar images", Computer Graphics and Image Processing, 17(1):24-32.
+            ksize = kwargs.get('ksize', 3)
+            enl = kwargs.get('enl', 1.0)  # Equivalent Number of Looks
+
+            def _lee_single_channel(img_ch: np.ndarray) -> np.ndarray:
+                img_f = img_ch.astype(np.float64)
+                # Локальное среднее и дисперсия через box filter
+                mean = cv2.boxFilter(img_f, ddepth=-1, ksize=(ksize, ksize))
+                mean_sq = cv2.boxFilter(img_f ** 2, ddepth=-1, ksize=(ksize, ksize))
+                var_y = mean_sq - mean ** 2
+                var_y = np.maximum(var_y, 0.0)
+                # Дисперсия сигнала (вычитаем вклад шума)
+                # Для мультипликативного шума: var_x = var_y - mean²/ENL
+                var_x = var_y - (mean ** 2) / enl
+                var_x = np.maximum(var_x, 0.0)
+                # Весовой коэффициент Lee
+                # k = 0 в однородных областях (чистое усреднение),
+                # k → 1 вблизи краёв (сохранение оригинала)
+                k = np.where(var_y > 0, var_x / var_y, 0.0)
+                filtered = mean + k * (img_f - mean)
+                return np.clip(filtered, 0, 255).astype(np.uint8)
+
+            if image.ndim == 3:
+                channels = [_lee_single_channel(image[:, :, c])
+                            for c in range(image.shape[2])]
+                result = np.stack(channels, axis=2)
+            else:
+                result = _lee_single_channel(image)
 
         # Восстанавливаем (H,W,1) если исходное изображение было таким
         if squeezed:

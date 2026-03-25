@@ -31,7 +31,7 @@ if current_path and current_path.exists():
     else:
         st.warning("Папка существует, но датасетов внутри не найдено (нет подпапок).")
 elif current_path:
-    st.error(f"❌ Сохранённый путь не существует: `{current_path}`")
+    st.error(f"Сохранённый путь не существует: `{current_path}`")
 else:
     st.info("Путь ещё не задан.")
 
@@ -65,9 +65,9 @@ if save_clicked:
     else:
         p = Path(new_path_str.strip())
         if not p.exists():
-            st.error(f"❌ Папка не существует: `{p}`\n\nПроверь правильность пути.")
+            st.error(f"Папка не существует: `{p}`\n\nПроверь правильность пути.")
         elif not p.is_dir():
-            st.error(f"❌ Это не папка: `{p}`")
+            st.error(f"Это не папка: `{p}`")
         else:
             save_path_to_env(p)
             datasets = [d.name for d in p.iterdir() if d.is_dir()]

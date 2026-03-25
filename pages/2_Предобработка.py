@@ -19,13 +19,6 @@ pages/2_Предобработка.py — Двухфазный автомати�
         Dodge & Karam (2017) "A Study and Comparison of Human and
         Deep Learning Recognition Performance Under Visual Distortions"
 
-Отличие от Модуля 3 (SFS+SHA на полном пуле):
-    Данный модуль делит пул на тематические группы (шум, контраст, яркость, резкость),
-    проводит SHA-скрининг внутри каждой группы (Фаза 1), сокращая пул до survivors,
-    и лишь затем запускает SFS+SHA только на survivors (Фаза 2).
-    Компромисс: возможна частичная потеря межгрупповых взаимодействий на Фазе 1,
-    выигрыш — значительное сокращение числа обучений относительно Модуля 3.
-
 Обязательная очистка памяти после каждого обучения:
     После каждой модели: del model, torch.cuda.empty_cache(), gc.collect()
     Аналогично classification_trainer.py (Модуль 2).
@@ -180,11 +173,11 @@ CANDIDATE_GROUPS = {
         #   Median    — импульсный шум (salt & pepper). Gonzalez & Woods (2018).
         #   Gaussian  — равномерный фоновый шум.        Gonzalez & Woods (2018).
         #   Bilateral — Gaussian шум с сохранением краёв. Tomasi & Manduchi (1998).
-        #   Wiener    — адаптивный, любой тип шума.
+        #   Wiener    — адаптивный.
         #               Wiener (1949); Fan et al. (2019) "Brief review of image
         #               denoising techniques", Visual Computing for Industry,
         #               Biomedicine, and Art, 2(1).
-        # NLM исключён: O(N²) сложность непрактична для SHA-скрининга.
+        # Методы предобработки с высокой сложностью исключены.
         # Jamieson & Talwalkar (2016) — бюджет на обучение, не предобработку.
     },
     "contrast": {
@@ -315,6 +308,9 @@ def score_from_metrics(metrics: Dict) -> float:
     Вычисляет скалярную оценку из метрик классификации или детекции.
     Для классификации: AUC (приоритет) или ACC.
     Для детекции: взвешенная сумма mAP метрик.
+    ВАЖНО! Score текущий - не совсем научная метрика, но она лучше
+    чем если брать просто auc или map50-95. Возможно понадобится
+    научно обосновывать её. Надеюсь нет
     """
     if metrics is None:
         return 0.0
@@ -333,7 +329,7 @@ def score_from_metrics(metrics: Dict) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ЯДРО АЛГОРИТМА (запускается в фоновом потоке)
+# ЯДРО АЛГОРИТМА (должно запускаться в фоновом потоке)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_search(q: queue.Queue, config: Dict):
@@ -425,14 +421,14 @@ def _run_search(q: queue.Queue, config: Dict):
 
         set_global_seed(seed)
 
-        log("=" * 70)
+        log("=" * 50)
         log("ДВУХФАЗНЫЙ ПОДБОР ПАЙПЛАЙНА ПРЕДОБРАБОТКИ")
         log("Алгоритм: Group-wise SHA (Ф.1) + SFS+SHA на survivors (Ф.2)")
         log("Источники: Guyon & Elisseeff (2003) JMLR 3:1157-1182;")
         log("           Liu & Motoda (2007) Chapman&Hall/CRC ISBN 978-1584888789;")
         log("           Jamieson & Talwalkar (2016) AISTATS 240-248;")
         log("           Kohavi & John (1997) AI 97(1-2):273-324")
-        log("=" * 70)
+        log("=" * 50)
         log(f"Датасет:      {dataset_name}")
         log(f"Задача:       {task}")
         log(f"Модель:       {model_type}  imgsz={imgsz}")
@@ -480,7 +476,7 @@ def _run_search(q: queue.Queue, config: Dict):
             Обучает ClassificationTrainer. Возвращает лучшие метрики.
             Очистка памяти гарантирована в finally ClassificationTrainer._train_one.
 
-            checkpoint_interval:
+            checkpoint_interval - по сути уже не нужен, но просто на их базе сделано всё:
             - Быстрое обучение (use_es=False, SHA-скрининг): чекпоинты не нужны,
               ставим epochs чтобы сохранить только финальный.
             - Финальное обучение (use_es=True): сохраняем лучший чекпоинт для ES,
@@ -567,6 +563,7 @@ def _run_search(q: queue.Queue, config: Dict):
             Быстрое обучение (30% эпох, ES выкл).
             Возвращает scalar score для ранжирования SHA.
             Jamieson & Talwalkar (2016) — % эпох для скрининга задаётся пользователем.
+            В процессе доказательство и нахождение достаточного % скрининга
             """
             log(f"  Обучаю [{label}] — {fast_epochs} эп. (быстрый)...")
             try:
@@ -633,9 +630,9 @@ def _run_search(q: queue.Queue, config: Dict):
         # BASELINE: быстрое обучение оригинала
         # ══════════════════════════════════════════════════════════════════
         log("")
-        log("=" * 70)
+        log("=" * 50)
         log("BASELINE: оригинальный датасет (30% эпох)")
-        log("=" * 70)
+        log("=" * 50)
         baseline_score = quick_train(dataset_name, "baseline")
         log(f"  Baseline score = {baseline_score:.4f}")
 
@@ -646,11 +643,11 @@ def _run_search(q: queue.Queue, config: Dict):
         # SHA-отсев оставляет ceil(N_group / eta) survivors.
         # ══════════════════════════════════════════════════════════════════
         log("")
-        log("=" * 70)
+        log("=" * 50)
         log("ФАЗА 1: Групповой скрининг с фильтром по baseline")
         log("Guyon & Elisseeff (2003) группировка; Kohavi & John (1997) фильтр по baseline")
         log("SHA не применяется в Фазе 1 — цель формировать полный пул, не искать одного лучшего")
-        log("=" * 70)
+        log("=" * 50)
 
         all_survivors: List[Dict] = []
 
@@ -690,7 +687,7 @@ def _run_search(q: queue.Queue, config: Dict):
             # SHA остаётся в Фазе 2 где комбинаций много и отсев оправдан.
             #
             # Если вся группа хуже baseline — деградируем к поведению без фильтра
-            # (берём всех), чтобы не потерять группу целиком.
+            # (берём всех), чтобы не потерять группу целиком и найти хоть что-то.
             above = [s for s in scored if s["score"] > baseline_score]
             if above:
                 n_filtered = len(scored) - len(above)
@@ -745,13 +742,14 @@ def _run_search(q: queue.Queue, config: Dict):
         # Kohavi & John (1997) SFS + Jamieson & Talwalkar (2016) SHA.
         # ══════════════════════════════════════════════════════════════════
         log("")
-        log("=" * 70)
+        log("=" * 50)
         log("ФАЗА 2: SFS+SHA на survivors")
         log("Kohavi & John (1997) SFS + Jamieson & Talwalkar (2016) SHA")
         log("Порядок методов учитывается: [A+B] != [B+A]")
-        log("=" * 70)
+        log("=" * 50)
 
         # Пул survivors Фазы 1 — используется для генерации расширений на каждой итерации
+        # Лёгкий способ подсчёта первой итерации Фаза 2 - n*(n-1)
         survivor_pool: List[Dict] = list(all_survivors)
         N_survivors = len(survivor_pool)
 
@@ -837,7 +835,8 @@ def _run_search(q: queue.Queue, config: Dict):
 
             # Фаза 2: тот же принцип что в Фазе 1 — сначала фильтр по baseline,
             # затем SHA. Порядок "фильтр → SHA" (Kohavi & John, 1997):
-            # пайплайны хуже baseline бессмысленно нести дальше.
+            # пайплайны хуже baseline не бессмысленно нести дальше,
+            # но по вычислениям это будет крайне затратно.
             # Если все хуже baseline — итерация останавливается, финальными
             # survivors становятся survivors предыдущей итерации.
             combined_pool = current_survivors + new_extensions
@@ -845,7 +844,8 @@ def _run_search(q: queue.Queue, config: Dict):
             # Дедупликация по pipeline_ids — убираем дубли одинаковых наборов методов.
             # Дубли возникают когда несколько survivors расширяются разными путями
             # но приходят к одинаковому набору id. score у дублей идентичен.
-            # frozenset: порядок id не важен для дедупликации наборов.
+            # Помнить что [A+B] не тоже самое что [B+A] - это по факту разные методы,
+            # которые дадут различный score. Крайне важно учитывать это
             seen_pids: set = set()
             deduped_pool: List[Dict] = []
             for c in combined_pool:
@@ -900,9 +900,9 @@ def _run_search(q: queue.Queue, config: Dict):
         # Победитель — лучший по score среди финальных survivors.
         # ══════════════════════════════════════════════════════════════════
         log("")
-        log("=" * 70)
+        log("=" * 50)
         log("ФИНАЛЬНОЕ ОБУЧЕНИЕ ПОБЕДИТЕЛЯ")
-        log("=" * 70)
+        log("=" * 50)
 
         # Выбираем лучшего среди финальных survivors
         best_survivor = max(final_survivors, key=lambda x: x["score"])
@@ -919,7 +919,8 @@ def _run_search(q: queue.Queue, config: Dict):
         winner_display = best_survivor["display"]
         log(f"  Победитель для полного обучения: {winner_display}")
 
-        # Создаём постоянный датасет-победитель (не временный)
+        # Создаём постоянный датасет-победитель, потом нужен будет
+        # для сравнения с методами подобранными в научных статьях
         winner_ds_name = f"{dataset_name}_p2_winner"
         log(f"  Создаю постоянный датасет: {winner_ds_name}")
         preprocessor.apply_global_preprocessing(
@@ -932,12 +933,12 @@ def _run_search(q: queue.Queue, config: Dict):
                                    result_subdir="final_winner")
 
         # ══════════════════════════════════════════════════════════════════
-        # ФИНАЛЬНЫЙ BASELINE (полное обучение для честного сравнения)
+        # ФИНАЛЬНЫЙ BASELINE (полное обучение)
         # ══════════════════════════════════════════════════════════════════
         log("")
-        log("=" * 70)
+        log("=" * 50)
         log("ФИНАЛЬНЫЙ BASELINE (полное обучение для сравнения)")
-        log("=" * 70)
+        log("=" * 50)
 
         baseline_final_metrics = full_train(dataset_name, "baseline",
                                             result_subdir="final_baseline")
@@ -951,9 +952,9 @@ def _run_search(q: queue.Queue, config: Dict):
         better              = improvement > 0
 
         log("")
-        log("=" * 70)
+        log("=" * 50)
         log("ИТОГ")
-        log("=" * 70)
+        log("=" * 50)
 
         if task == "classification":
             log(f"  Baseline — score={baseline_score_full:.4f}"
@@ -984,7 +985,7 @@ def _run_search(q: queue.Queue, config: Dict):
             _cleanup_ds(winner_ds_name)
             winner_ds_name = None
 
-        log("=" * 70)
+        log("=" * 50)
 
         # ── Сохраняем JSON-отчёт ──────────────────────────────────────────
         result = {
@@ -1040,6 +1041,7 @@ def _run_search(q: queue.Queue, config: Dict):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VRAM (кешируем чтобы не вызывать torch на каждый rerun)
+# Очень необходим из-за HDD  долгой загрузки датасетов
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
@@ -1054,7 +1056,12 @@ def _get_vram_gb() -> float:
 
 
 def _suggest_batch_cls(model_type: str, vram: float, imgsz: int) -> int:
-    """Подсказывает batch_size для классификации. Yang et al. (2021)."""
+    """
+    Подсказывает batch_size для классификации. Yang et al. (2021).
+    Но важно учитываять что большой batchsize не всегда лучший, к примеру
+    если в датасете всего 200 изображений batch 200 будет бессмысленен.
+    Стоит предупредить пользователя что лучше вручную проводить оценку
+    """
     if vram <= 0:
         return 16
     max_b = {"resnet18": 128, "resnet50": 64, "efficientnet_b0": 96}.get(model_type, 64)
@@ -1074,6 +1081,7 @@ def _suggest_batch_det(model_type: str, vram: float,
     if vram <= 0:
         return 1
     # Базовый batch при 8 GB VRAM и imgsz=640
+    # Не лучший метод оценки, но в целом пойдёт
     if model_type == "yolo":
         base_at_8gb = {"n": 32, "s": 16, "m": 8, "l": 4, "x": 2}.get(yolo_size, 16)
     else:
@@ -1086,6 +1094,8 @@ def _suggest_batch_det(model_type: str, vram: float,
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UI — ЭТАП 1: КОНФИГУРАЦИЯ
+# Комментарии тут не убирать, так в UI будет отображаться
+# Вообще потом стоит разнести UI в UI, а всю логику в другое место
 # ══════════════════════════════════════════════════════════════════════════════
 
 if st.session_state.p2_stage == "configure":

@@ -5,11 +5,11 @@
 основанного на физических характеристиках процесса получения изображения.
 
 Научное обоснование:
-- SAR: Frost et al. (1982), Lee (1981) - speckle шум нельзя убирать стандартной коррекцией яркости
+- SAR: Oliver & Quegan (2004), Lee (1981) - speckle шум нельзя убирать стандартной коррекцией яркости
 - Medical: Pisano et al. (1998) - CLAHE с консервативными параметрами
 - Natural: Tomasi & Manduchi (1998) - bilateral filtering
 - Infrared: Vollmer & Möllmann (2017) - агрессивное улучшение контраста
-- Microscopy: Sternberg (1983) - сохранение биmodal распределения
+- Microscopy: Kolarević et al. (2018) Journal of Microscopy 269(3):264-276 — локальные методы эффективнее глобальных
 
 Автор: Система адаптивной предобработки
 Дата: 2025
@@ -43,24 +43,41 @@ class PreprocessingRules:
             # === ЗАПРЕЩЁННЫЕ МЕТОДЫ ===
             'brightness_correction': {
                 'enabled': False,  # КРИТИЧЕСКИ ВАЖНО!
-                'rationale': 'Низкая яркость — физическое свойство радарного рассеяния от воды. '
-                            'Коррекция яркости исказит информацию о материалах поверхности. '
-                            'Источник: Frost et al. (1982)'
+                'rationale': 'В SAR яркость пикселя кодирует коэффициент обратного рассеяния '
+                            '(backscatter coefficient) — физическую характеристику поверхности. '
+                            'Глобальная коррекция яркости исказит эту информацию и сделает '
+                            'невозможным корректное сравнение объектов на снимке. '
+                            'Oliver & Quegan (2004) "Understanding Synthetic Aperture Radar '
+                            'Images", SciTech Publishing — фундаментальный источник по '
+                            'физике SAR-изображений.'
             },
-            
+
+            # === ИСКЛЮЧЕНИЕ ===
             'contrast_enhancement': {
-                'enabled': False,  # Обычно не нужно
-                'rationale': 'Высокий контраст уже присутствует из-за разницы между водой и объектами. '
-                            'Дополнительное усиление может привести к артефактам.'
+                'enabled': True,  # С оговорками
+                'method': 'clahe',
+                'params': {
+                    'clip_limit': 1.0,
+                    'tile_grid_size': (8, 8)
+                },
+                'rationale': 'Разрешено с осторожностью: после подавления speckle-шумов '
+                            'локальное контрастирование (CLAHE) с низким clip_limit может '
+                            'может улучшать визуальную информативность при минимизации искажений статистики сигнала. '
+                            'Однако методы контрастирования применяются только после шумоподавления и с консервативными параметрами. '
+                            'Remote Sens. 2019, 11(13), 1532; ISPRS J. Photogramm. Remote Sens., 2024'
             },
             
             'sharpening': {
                 'enabled': False,
-                'rationale': 'Speckle уже создаёт эффект высокой резкости. Дополнительное sharpening усилит шум.'
+                'rationale': 'Speckle-шум в SAR имеет высокочастотную природу — sharpening '
+                            'фильтры усиливают именно высокие частоты, что приведёт к '
+                            'многократному усилению speckle вместо его подавления. '
+                            'Oliver & Quegan (2004), ibid.'
             },
             
             # === ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ ===
-            'source': 'Oliver & Quegan (2004), Lee (1981), Frost et al. (1982)',
+            'source': 'Oliver & Quegan (2004) "Understanding Synthetic Aperture Radar Images", SciTech Publishing; '
+                     'Lee J.S. (1981) IEEE Trans. Pattern Anal. Mach. Intell., 2:165-168',
             'description': 'SAR изображения требуют минимальной обработки - только подавление speckle шума'
         },
         
@@ -78,29 +95,47 @@ class PreprocessingRules:
             },
             
             'brightness_correction': {
-                'enabled': False,
-                'rationale': 'Низкая яркость обусловлена поглощением рентгеновского излучения. '
-                            'Это диагностически важная информация, которую нельзя искажать.'
+                'enabled': True,
+                'rationale': 'Коррекция яркости разрешена для рентгеновских снимков. '
+                            'Pisano et al. (2000) "Image processing algorithms for digital '
+                            'mammography: a pictorial essay", RadioGraphics 20:1479-1491 — '
+                            'brightness adjustment перечислен среди применяемых методов '
+                            'постобработки маммограмм наряду с contrast enhancement и '
+                            'unsharp masking. Коррекция яркости может улучшать видимость '
+                            'структур при недо- или переэкспонированных снимках.'
             },
             
             'contrast_enhancement': {
                 'enabled': True,
                 'method': 'clahe',
                 'params': {
-                    'clip_limit': 1.0,  # Консервативный параметр!
+                    'clip_limit': 1.0,  # Консервативный параметр
                     'tile_grid_size': (8, 8)
                 },
                 'rationale': 'CLAHE с низким clip_limit улучшает видимость деталей без искажения '
-                            'диагностически важной информации. Источник: Pisano et al. (1998)'
+                            'диагностически важной информации. '
+                            'Pisano et al. (1998) J. Digital Imaging, 11(4):193-200 — '
+                            'первая работа демонстрирующая эффективность CLAHE для маммографии.'
             },
             
             'sharpening': {
-                'enabled': False,
-                'rationale': 'Может создать ложные детали, критично для медицинской диагностики'
+                'enabled': True,
+                'method': 'unsharp_mask',
+                'params': {
+                    'amount': 0.5  # Умеренный параметр для медицинских снимков
+                },
+                'rationale': 'Unsharp masking — стандартный инструмент постобработки маммограмм. '
+                            'Pisano et al. (2000) "Image processing algorithms for digital '
+                            'mammography: a pictorial essay", RadioGraphics 20:1479-1491 — '
+                            'unsharp masking прямо перечислен среди применяемых методов. '
+                            'Умеренный alpha=0.5 улучшает видимость микрокальцинатов без '
+                            'создания артефактов.'
             },
             
-            'source': 'Pham et al. (2000), Pisano et al. (1998)',
-            'description': 'Медицинские снимки требуют осторожной обработки с сохранением диагностической информации'
+            'source': 'Pisano et al. (1998) J. Digital Imaging 11(4):193-200; '
+                     'Pisano et al. (2000) RadioGraphics 20:1479-1491',
+            'description': 'Медицинские рентгеновские снимки допускают все четыре группы предобработки; '
+                          'Lee-фильтр исключён как предназначенный для мультипликативного speckle-шума SAR'
         },
         
         'natural_photo': {
@@ -206,10 +241,14 @@ class PreprocessingRules:
             },
             
             'brightness_correction': {
-                'enabled': False,  # ВАЖНО!
-                'rationale': 'Микроскопия имеет биmodal распределение (фон + объекты). '
-                            'Глобальная коррекция яркости разрушит это распределение. '
-                            'Источник: Sternberg (1983)'
+                'enabled': True,
+                'rationale': 'Коррекция яркости разрешена для гистопатологических снимков. '
+                            'Murcia-Gomez et al. (2022) Applied Sciences 12(22):11375 — '
+                            'сравнительное исследование методов предобработки на BreakHis '
+                            'показало что статистически значимой разницы между фильтрами '
+                            'нет: основную роль играет архитектура модели. '
+                            'Следовательно, запрещать brightness нет научного основания — '
+                            'система подберёт оптимальное решение эмпирически.'
             },
             
             'contrast_enhancement': {
@@ -219,16 +258,34 @@ class PreprocessingRules:
                     'clip_limit': 1.5,
                     'tile_grid_size': (8, 8)
                 },
-                'rationale': 'Умеренный CLAHE улучшает видимость объектов сохраняя биmodal структуру'
+                'rationale': 'Умеренный CLAHE улучшает локальный контраст без изменения '
+                            'глобальных яркостных соотношений. '
+                            'Kolarević et al. (2018) ibid. подтверждают эффективность '
+                            'контрастирования для гистопатологических снимков.'
             },
             
             'sharpening': {
-                'enabled': False,
-                'rationale': 'Может усилить шум, критично для анализа мелких структур'
+                'enabled': True,
+                'method': 'unsharp_mask',
+                'params': {
+                    'amount': 0.5
+                },
+                'rationale': 'Sharpening разрешён для гистопатологических снимков. '
+                            'Dziadosz et al. (2025) Scientific Reports — применение '
+                            'sharpening для усиления краёв клеточных структур и повышения '
+                            'контраста между светлыми и тёмными областями на BreakHis '
+                            'дало точность классификации 99.60%. '
+                            'Murcia-Gomez et al. (2022) Applied Sciences 12(22):11375 — '
+                            'статистически значимой разницы между методами предобработки '
+                            'нет, поэтому система определяет оптимальный метод эмпирически. '
+                            'Умеренный alpha=0.5 снижает риск усиления артефактов.'
             },
             
-            'source': 'Sternberg (1983), Vincent & Soille (1991)',
-            'description': 'Микроскопия требует сохранения биmodal распределения (фон/объекты)'
+            'source': 'Kolarević et al. (2018) Journal of Microscopy, 269(3):264-276; '
+                     'Murcia-Gomez et al. (2022) Applied Sciences 12(22):11375; '
+                     'Dziadosz et al. (2025) Scientific Reports',
+            'description': 'Гистопатологические снимки допускают все четыре группы предобработки; '
+                          'Lee-фильтр и Gaussian blur исключены как неподходящие для клеточных структур'
         }
     }
     
