@@ -13,8 +13,8 @@ pages/6_Объединение.py — Объединённый подбор па
 
     Научное обоснование фильтрации по модальности:
     - SAR: Oliver & Quegan (2004) — brightness/sharpening искажают физическую информацию
-    - Medical: Pisano et al. (1998), Pham et al. (2000) — консервативная обработка
-    - Microscopy: Sternberg (1983) — сохранение биmodal распределения
+    - Medical: Pisano et al. (1998) J.Digital Imaging 11(4):193-200; Pisano et al. (2000) RadioGraphics 20:1479-1491
+    - Microscopy: Kolarević et al. (2018) Journal of Microscopy 269(3):264-276; Sternberg (1983) Computer 16(1):22-34
     Выборка для анализа: min(N_train × 0.3, 300), минимум 30
     (CLT: Kim, 2017, PMC5370305 — n ≥ 30 достаточно для оценки среднего)
 
@@ -91,7 +91,9 @@ _STATE_DEFAULTS = {
     "p2_stage":          "configure",   # configure | running | done
     # Модальный анализ (6_Объединение.py)
     "p2_use_modality":   True,
+    "p2_manual_modality": "auto",   # "auto" или одна из модальностей
     "p2_use_wiener":     False,
+    "p2_sha_fallback":   False,   # SHA без baseline-фильтра если Фаза 1 пуста
     "p2_use_torch_compile": True,
     "p2_modality_result": None,   # результат анализа модальности
     "p2_log_lines":      [],
@@ -195,6 +197,18 @@ CANDIDATE_GROUPS = {
                 "methods": ["denoise"],
                 "params": {"denoise": {"method": "wiener", "size": 5}},
             },
+            {
+                "id": "lee_k3",
+                "display": "Lee (ksize=3)",
+                "methods": ["denoise"],
+                "params": {"denoise": {"method": "lee", "ksize": 3}},
+            },
+            {
+                "id": "lee_k5",
+                "display": "Lee (ksize=5)",
+                "methods": ["denoise"],
+                "params": {"denoise": {"method": "lee", "ksize": 5}},
+            },
         ],
         # Пул шумоподавления покрывает три классических пространственных фильтра
         # (базовый набор, всегда активен):
@@ -210,6 +224,10 @@ CANDIDATE_GROUPS = {
         #               Python без SIMD-оптимизации — ~1–1.5 сек/изображение vs
         #               ~3–8 мс для OpenCV-фильтров. На датасетах >10k изображений
         #               применение Wiener увеличивает время предобработки на часы.
+        # Lee — специализированный фильтр для мультипликативного speckle-шума SAR.
+        #   Lee (1980) IEEE Trans. PAMI-2(2):165-168;
+        #   Lee (1981) Comput. Graph. Image Process. 17(1):24-32.
+        #   Включён в базовый пул: реализован через numpy/cv2, быстрый (~5-10 мс).
         # NLM исключён: O(N²) сложность непрактична для SHA-скрининга.
         # Jamieson & Talwalkar (2016) — бюджет на обучение, не предобработку.
     },
@@ -388,13 +406,34 @@ _GROUP_TO_METHOD = {
     "sharpening": "sharpening",
 }
 
+# Кандидаты группы denoise запрещённые для конкретных модальностей.
+# Основание:
+#   SAR    — Gaussian/Bilateral не учитывают мультипликативную природу speckle;
+#            Lee фильтр разработан именно для мультипликативного шума SAR.
+#            Lee J.S. (1980) IEEE Trans. PAMI-2(2):165-168;
+#            Lee J.S. (1981) Comput. Graph. Image Process. 17(1):24-32.
+#            Lee фильтр не применяется к non-SAR модальностям т.к. там шум
+#            аддитивный (Gaussian/Poisson) — мультипликативная модель некорректна.
+#   microscopy — Gaussian blur размывает мелкие клеточные структуры (ядра,
+#            митозы) критичные для гистопатологической классификации.
+#            Kolarević et al. (2018) Journal of Microscopy 269(3):264-276.
+_MODALITY_DENIED_CANDIDATES: Dict[str, set] = {
+    "sar":        {"gaussian_k3", "gaussian_k5", "bilateral_s75", "bilateral_s150"},
+    "microscopy": {"gaussian_k3", "gaussian_k5", "lee_k3", "lee_k5"},
+    "medical_xray": {"lee_k3", "lee_k5"},
+    "natural_photo": {"lee_k3", "lee_k5"},
+    "infrared":   {"lee_k3", "lee_k5"},
+}
+
 
 def _get_active_candidate_groups(modality_result: Optional[Dict],
                                   use_wiener: bool = False) -> Dict:
     """
-    Возвращает CANDIDATE_GROUPS с учётом двух фильтров:
+    Возвращает CANDIDATE_GROUPS с учётом трёх фильтров:
     1. Модальность — исключает группы методов запрещённые для типа датасета.
-    2. use_wiener  — если False, удаляет кандидатов wiener_s3 и wiener_s5
+    2. Модальность — исключает конкретных кандидатов внутри группы denoise
+                     (например Gaussian для SAR, Lee для non-SAR модальностей).
+    3. use_wiener  — если False, удаляет кандидатов wiener_s3 и wiener_s5
                      из группы denoise.
 
     Аргументы:
@@ -413,17 +452,25 @@ def _get_active_candidate_groups(modality_result: Optional[Dict],
         groups = {k: v for k, v in CANDIDATE_GROUPS.items() if k not in excluded} \
             if excluded else CANDIDATE_GROUPS
 
-    # Шаг 2: фильтр Wiener — удаляем кандидатов wiener_* из группы denoise
-    if use_wiener:
+    # Шаг 2: фильтр кандидатов внутри denoise по модальности
+    modality = (modality_result or {}).get("modality", "")
+    denied_ids = _MODALITY_DENIED_CANDIDATES.get(modality, set())
+
+    # Шаг 3: фильтр Wiener
+    wiener_ids = set() if use_wiener else {"wiener_s3", "wiener_s5"}
+
+    # Объединяем все исключения для denoise
+    all_denied = denied_ids | wiener_ids
+
+    if not all_denied:
         return groups
 
-    # Wiener выключен — строим копию groups с отфильтрованными кандидатами
-    _WIENER_IDS = {"wiener_s3", "wiener_s5"}
+    # Строим копию groups с отфильтрованными кандидатами в denoise
     result = {}
     for gid, ginfo in groups.items():
-        if gid == "denoise":
+        if gid == "denoise" and all_denied:
             filtered_cands = [c for c in ginfo["candidates"]
-                              if c["id"] not in _WIENER_IDS]
+                              if c["id"] not in all_denied]
             result[gid] = {**ginfo, "candidates": filtered_cands}
         else:
             result[gid] = ginfo
@@ -727,12 +774,60 @@ def _run_search(q: queue.Queue, config: Dict):
 
         # ── Анализ модальности (встроенный, если включён) ────────────────────
         modality_result = config.get("modality_result", None)
+        manual_modality = config.get("manual_modality", "auto")
+
+        # Если модальность задана вручную — строим modality_result без анализа.
+        # Применяем те же правила фильтрации групп что и при автоопределении.
+        if (config.get("use_modality", False)
+                and manual_modality != "auto"
+                and modality_result is None):
+            log("")
+            log("=" * 70)
+            log(f"МОДАЛЬНОСТЬ ЗАДАНА ВРУЧНУЮ: {manual_modality.upper()}")
+            log("Автоматический анализ изображений пропущен.")
+            log("=" * 70)
+            try:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent.parent))
+                from Utils.preprocessing_rules import PreprocessingRules as PR
+
+                _excluded, _allowed = [], []
+                if manual_modality in _MODALITY_FILTER_TYPES:
+                    log(f"  Применяем правила для '{manual_modality}':")
+                    for _gid, _mname in _GROUP_TO_METHOD.items():
+                        _ok = PR.is_method_allowed(manual_modality, _mname)
+                        if _ok:
+                            _allowed.append(_gid)
+                            log(f"    ✓ {_gid} ({_mname}) — разрешён")
+                        else:
+                            _excluded.append(_gid)
+                            _rat = PR.get_rationale(manual_modality, _mname)
+                            log(f"    ✗ {_gid} — запрещён: "
+                                f"{_rat[:70]}{'...' if len(_rat) > 70 else ''}")
+                else:
+                    log(f"  Тип '{manual_modality}' — фильтрация не применяется (fallback)")
+                    _allowed = list(_GROUP_TO_METHOD.keys())
+
+                modality_result = {
+                    "modality":        manual_modality,
+                    "confidence":      1.0,  # задано вручную — уверенность 100%
+                    "excluded_groups": _excluded,
+                    "allowed_groups":  _allowed,
+                    "is_color":        manual_modality not in {"sar", "medical_xray"},
+                    "apply_filter":    manual_modality in _MODALITY_FILTER_TYPES,
+                }
+                q.put(("modality_result", modality_result))
+                log("  Модальность применена.")
+            except Exception as _e:
+                log(f"  [ПРЕДУПРЕЖДЕНИЕ] Не удалось применить правила модальности: {_e}")
+                log("  Продолжаем без фильтрации.")
+                modality_result = None
 
         if config.get("use_modality", False) and modality_result is None:
             log("")
             log("=" * 70)
             log("АНАЛИЗ МОДАЛЬНОСТИ ДАТАСЕТА")
-            log("Gonzalez & Woods (2018); Oliver & Quegan (2004); Pham et al. (2000)")
+            log("Gonzalez & Woods (2018); Oliver & Quegan (2004); Pisano et al. (1998); Kolarević et al. (2018)")
             log("Выборка: min(N_train×0.3, 300), мин. 30 — CLT (Kim 2017, PMC5370305)")
             log("=" * 70)
             try:
@@ -837,10 +932,23 @@ def _run_search(q: queue.Queue, config: Dict):
             if excluded:
                 log(f"  Исключены группы по модальности '{modality_result['modality']}': "
                     f"{', '.join(excluded)}")
-                log(f"  Источники: Oliver & Quegan (2004), Pham et al. (2000), "
-                    f"Pisano et al. (1998), Sternberg (1983)")
+                log(f"  Источники: Oliver & Quegan (2004) SAR; "
+                    f"Pisano et al. (1998, 2000) рентген; "
+                    f"Kolarević et al. (2018) микроскопия")
             log(f"  Активных групп для Фазы 1: "
                 f"{len(active_groups)} из {len(CANDIDATE_GROUPS)}")
+
+        # Лог исключённых кандидатов внутри группы denoise по модальности
+        modality_str = (modality_result or {}).get("modality", "")
+        denied_ids = _MODALITY_DENIED_CANDIDATES.get(modality_str, set())
+        if denied_ids and "denoise" in active_groups:
+            denied_displays = [
+                c["display"] for c in CANDIDATE_GROUPS["denoise"]["candidates"]
+                if c["id"] in denied_ids
+            ]
+            if denied_displays:
+                log(f"  Исключены кандидаты denoise для '{modality_str}': "
+                    f"{', '.join(denied_displays)}")
 
         if config.get("use_wiener", False):
             log("  Wiener-фильтры: ВКЛЮЧЕНЫ (wiener_s3, wiener_s5)")
@@ -851,6 +959,9 @@ def _run_search(q: queue.Queue, config: Dict):
             log("  Gonzalez & Woods (2018); Tomasi & Manduchi (1998).")
 
         all_survivors: List[Dict] = []
+        # Сохраняем scored по каждой группе для SHA-fallback
+        # (используется если все группы оказались ниже baseline)
+        _scored_per_group: Dict[str, List[Dict]] = {}
 
         for group_id, group_info in active_groups.items():
             group_label = group_info["label"]
@@ -873,6 +984,9 @@ def _run_search(q: queue.Queue, config: Dict):
             if not scored:
                 log(f"    [ПРОПУСК] нет кандидатов в группе {group_label}")
                 continue
+
+            # Сохраняем для возможного SHA-fallback
+            _scored_per_group[group_id] = scored
 
             # Фаза 1: фильтр по baseline → SHA-отсев среди прошедших фильтр.
             #
@@ -904,9 +1018,98 @@ def _run_search(q: queue.Queue, config: Dict):
             all_survivors.extend(survivors)
 
         if not all_survivors:
-            raise RuntimeError(
-                "Фаза 1 не дала survivors — проверьте датасет и модель."
-            )
+            sha_fallback = config.get("sha_fallback", False)
+            if sha_fallback:
+                # SHA-fallback: все группы оказались хуже baseline.
+                # Применяем SHA без baseline-фильтра — берём ceil(N/eta) лучших
+                # из каждой группы отдельно.
+                # Используется только когда НИ ОДНА группа не дала survivors выше
+                # baseline — если хотя бы одна группа прошла, мы уже не попадём сюда.
+                # Jamieson & Talwalkar (2016) — SHA ранжирует кандидатов независимо
+                # от абсолютного порога.
+                log("")
+                log("=" * 70)
+                log("SHA-FALLBACK: все группы Фазы 1 ниже baseline")
+                log("Применяем SHA без baseline-фильтра (ceil(N/eta) лучших из каждой группы)")
+                log("Jamieson & Talwalkar (2016) AISTATS 240-248")
+                log("=" * 70)
+
+                # Повторно собираем scored по группам из уже обученных результатов.
+                # Поскольку scored не сохранялся между группами — нужно пройти заново
+                # по active_groups и взять все кандидаты которые уже обучались.
+                # Но scored уже потерян после цикла. Поэтому используем другой подход:
+                # запускаем SHA напрямую на всех scored из каждой группы заново,
+                # но scored уже не доступен. Нужно сохранить scored_per_group.
+                # Исправление: сохраним scored_per_group в первом цикле.
+                log("  [INFO] Повторный проход по группам для SHA-fallback...")
+                for group_id, group_info in active_groups.items():
+                    group_label = group_info["label"]
+                    fallback_scored = _scored_per_group.get(group_id, [])
+                    if not fallback_scored:
+                        continue
+                    fallback_survivors = sha_prune(fallback_scored, eta=eta)
+                    log(f"  Группа [{group_label}]: SHA без baseline "
+                        f"({len(fallback_scored)} → {len(fallback_survivors)} survivors)")
+                    for s in sorted(fallback_survivors, key=lambda x: x["score"], reverse=True):
+                        log(f"    + {s['display']:40s}  score={s['score']:.4f}")
+                    all_survivors.extend(fallback_survivors)
+
+                if not all_survivors:
+                    log("")
+                    log("Baseline лучше всех методов предобработки. "
+                        "Рекомендуется использовать оригинальный датасет.")
+                    _put_result({
+                        "dataset_name":         dataset_name,
+                        "task":                 task,
+                        "winner_pipeline":      "baseline",
+                        "winner_methods":       [],
+                        "winner_params":        {},
+                        "winner_ds_name":       None,
+                        "better_than_baseline": False,
+                        "improvement":          0.0,
+                        "baseline_metrics":     {},
+                        "winner_metrics":       {},
+                        "baseline_score":       baseline_score,
+                        "winner_score":         baseline_score,
+                        "history":              [],
+                        "phase1_survivors":     [],
+                        "final_survivors":      [],
+                        "baseline_quick_score": baseline_score,
+                        "screening_ratio":      screening_ratio,
+                    })
+                    q.put(("done", "Поиск завершён: baseline лучше всех методов."))
+                    return
+            else:
+                # SHA-fallback выключен — сообщаем пользователю и завершаем корректно
+                log("")
+                log("=" * 70)
+                log("ИТОГ: Baseline лучше всех методов предобработки")
+                log("=" * 70)
+                log("  Ни один метод предобработки не улучшил качество модели.")
+                log("  Рекомендуется использовать оригинальный датасет без предобработки.")
+                log("  Совет: попробуйте включить SHA-fallback чтобы всё же получить")
+                log("  кандидатов для Фазы 2 без отсечки по baseline.")
+                _put_result({
+                    "dataset_name":         dataset_name,
+                    "task":                 task,
+                    "winner_pipeline":      "baseline",
+                    "winner_methods":       [],
+                    "winner_params":        {},
+                    "winner_ds_name":       None,
+                    "better_than_baseline": False,
+                    "improvement":          0.0,
+                    "baseline_metrics":     {},
+                    "winner_metrics":       {},
+                    "baseline_score":       baseline_score,
+                    "winner_score":         baseline_score,
+                    "history":              [],
+                    "phase1_survivors":     [],
+                    "final_survivors":      [],
+                    "baseline_quick_score": baseline_score,
+                    "screening_ratio":      screening_ratio,
+                })
+                q.put(("done", "Поиск завершён: baseline лучше всех методов."))
+                return
 
         log(f"\n  Итого survivors после Фазы 1: {len(all_survivors)}")
         for s in sorted(all_survivors, key=lambda x: x["score"], reverse=True):
@@ -1026,14 +1229,17 @@ def _run_search(q: queue.Queue, config: Dict):
             # survivors становятся survivors предыдущей итерации.
             combined_pool = current_survivors + new_extensions
 
-            # Дедупликация по pipeline_ids — убираем дубли одинаковых наборов методов.
-            # Дубли возникают когда несколько survivors расширяются разными путями
-            # но приходят к одинаковому набору id. score у дублей идентичен.
-            # frozenset: порядок id не важен для дедупликации наборов.
+            # Дедупликация по pipeline_ids — убираем только точные дубли:
+            # одинаковые пайплайны с одинаковым порядком методов И одинаковыми id.
+            # ВАЖНО: используем tuple а не frozenset — порядок методов важен,
+            # [A+B] и [B+A] это разные пайплайны (применяются последовательно,
+            # результат зависит от порядка). frozenset их уравнивал — это было баг.
+            # Дубли возникают только когда несколько survivors расширяются
+            # абсолютно одинаково (совпадают и методы и порядок).
             seen_pids: set = set()
             deduped_pool: List[Dict] = []
             for c in combined_pool:
-                key = frozenset(c["pipeline_ids"])
+                key = tuple(c["pipeline_ids"])  # tuple сохраняет порядок
                 if key not in seen_pids:
                     seen_pids.add(key)
                     deduped_pool.append(c)
@@ -1332,13 +1538,47 @@ if st.session_state.p2_stage == "configure":
         value=st.session_state.get("p2_use_modality", True),
         key="p2_use_modality_cb",
         help=(
-            "Oliver & Quegan (2004) SAR; Pham et al. (2000) медицина; "
-            "Sternberg (1983) микроскопия. "
+            "Oliver & Quegan (2004) SAR; Pisano et al. (1998, 2000) рентген; "
+            "Kolarević et al. (2018) микроскопия. "
             "Выборка: min(N_train×0.3, 300), мин. 30 изображений "
             "(CLT: Kim 2017, Korean J Anesthesiol, PMC5370305)."
         ),
     )
     st.session_state.p2_use_modality = use_modality
+
+    if use_modality:
+        manual_modality = st.selectbox(
+            "Модальность датасета",
+            options=["auto", "medical_xray", "microscopy", "sar", "natural_photo", "infrared"],
+            index=["auto", "medical_xray", "microscopy", "sar", "natural_photo", "infrared"].index(
+                st.session_state.get("p2_manual_modality", "auto")
+            ),
+            format_func=lambda x: {
+                "auto":          "Авто (определить автоматически)",
+                "medical_xray":  "Medical X-ray (рентген, маммография)",
+                "microscopy":    "Microscopy (микроскопия, гистопатология)",
+                "sar":           "SAR (радарные снимки)",
+                "natural_photo": "Natural Photo (натуральные фото)",
+                "infrared":      "Infrared (тепловизор, ИК-снимки)",
+            }[x],
+            key="p2_manual_modality_select",
+            help=(
+                "Авто — автоматическое определение по метрикам изображений. "
+                "Если автоопределение ошибается (например микроскопия определяется "
+                "как натуральное фото) — укажите модальность вручную. "
+                "Это применит соответствующие правила фильтрации групп методов."
+            ),
+        )
+        st.session_state.p2_manual_modality = manual_modality
+
+        if manual_modality != "auto":
+            st.info(
+                f"Модальность задана вручную: **{manual_modality.upper()}**. "
+                "Автоматический анализ изображений будет пропущен."
+            )
+    else:
+        manual_modality = "auto"
+        st.session_state.p2_manual_modality = "auto"
 
     use_wiener = st.checkbox(
         "Включить Wiener-фильтры в пул кандидатов",
@@ -1360,6 +1600,21 @@ if st.session_state.p2_stage == "configure":
             "⚠ Wiener включён. На датасете >5k изображений предобработка может занять "
             "несколько часов. Убедитесь что это оправдано размером датасета."
         )
+
+    use_sha_fallback = st.checkbox(
+        "SHA-fallback: если Фаза 1 пуста — отобрать лучших без baseline-фильтра",
+        value=st.session_state.get("p2_sha_fallback", False),
+        key="p2_sha_fallback_cb",
+        help=(
+            "Применяется только если ВСЕ группы Фазы 1 оказались хуже baseline. "
+            "Если хотя бы одна группа дала survivors — этот режим не используется. "
+            "При включении: SHA-отсев (ceil(N/eta) лучших) применяется к каждой группе "
+            "без отсечки по baseline, давая Фазе 2 хоть каких-то кандидатов. "
+            "При выключении: алгоритм завершается с сообщением что baseline лучше всех методов. "
+            "Jamieson & Talwalkar (2016) — SHA ранжирует кандидатов без порогового отсева."
+        ),
+    )
+    st.session_state.p2_sha_fallback = use_sha_fallback
 
     use_torch_compile = st.checkbox(
         "Включить torch.compile (JIT-компиляция модели)",
@@ -1745,9 +2000,12 @@ elif st.session_state.p2_stage == "running":
             "screening_ratio": st.session_state.get("p2_screening_ratio", 30),
             # Анализ модальности
             "use_modality":    st.session_state.get("p2_use_modality", True),
+            "manual_modality": st.session_state.get("p2_manual_modality", "auto"),
             "modality_result": None,  # будет заполнен внутри _run_search если use_modality=True
             # Wiener-фильтры
             "use_wiener":      st.session_state.get("p2_use_wiener", False),
+            # SHA-fallback при пустой Фазе 1
+            "sha_fallback":    st.session_state.get("p2_sha_fallback", False),
             # torch.compile
             "use_torch_compile": st.session_state.get("p2_use_torch_compile", True),
         }
