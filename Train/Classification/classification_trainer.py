@@ -798,6 +798,8 @@ class ClassificationTrainer:
         }
         self.early_stoppers: Dict[str, EarlyStopping] = {}
         self.stop_reasons: Dict[str, str] = {}
+        # Пути к последним сохранённым чекпоинтам — для warm-start автоподбора
+        self.last_checkpoint_paths: Dict[str, str] = {}
 
         if clean_old_results:
             self._clean_old_result_folders()
@@ -994,20 +996,21 @@ class ClassificationTrainer:
         metrics: Dict[str, float],
         key: str,
         is_best: bool = False,
+        scheduler=None,
     ) -> str:
         """Сохраняет чекпоинт и возвращает путь."""
         fname = f"ckpt_{key}_ep{epoch:04d}{'_BEST' if is_best else ''}.pt"
         path = os.path.join(self.checkpoint_dir, fname)
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "metrics": metrics,
-                "seed": self.seed,
-            },
-            path,
-        )
+        payload = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "metrics": metrics,
+            "seed": self.seed,
+        }
+        if scheduler is not None:
+            payload["scheduler_state_dict"] = scheduler.state_dict()
+        torch.save(payload, path)
         return path
 
     # ── Обучение одной модели на одном датасете ────────────────────────────
@@ -1017,11 +1020,20 @@ class ClassificationTrainer:
         model_cfg: Dict[str, Any],
         dataset_name: str,
         key: str,
+        resume_from_path: Optional[str] = None,
     ) -> Optional[Dict[str, float]]:
         """
         Обучает одну модель на одном датасете.
         Возвращает финальные метрики или None при ошибке.
         Очищает GPU-память в блоке finally (как в universal_model_trainer).
+
+        resume_from_path: путь к чекпоинту (.pt) для warm-start.
+            Загружает model_state_dict и optimizer_state_dict.
+            Используется автоподбором процента скрининга: вместо обучения
+            с нуля на x+10% эпох — дообучаем с сохранённых x% весов.
+            Примечание: состояние dataloader shuffle не восстанавливается,
+            поэтому результат незначительно отличается от непрерывного
+            обучения — для цели ранжирования Спирмена это приемлемо.
         """
         model_type = model_cfg["type"]
         model_max_epochs = model_cfg.get("max_epochs", self.max_epochs)
@@ -1108,6 +1120,26 @@ class ClassificationTrainer:
                 loaders["train"].dataset, num_classes, self.device
             ))
 
+            # Warm-start: загружаем веса и optimizer state из чекпоинта.
+            # Используется автоподбором процента скрининга для дообучения
+            # с x% до x+10% вместо обучения с нуля.
+            resume_start_epoch = 0
+            if resume_from_path and os.path.exists(resume_from_path):
+                try:
+                    ckpt = torch.load(resume_from_path, map_location=self.device)
+                    base_model.load_state_dict(ckpt["model_state_dict"])
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                    if "scheduler_state_dict" in ckpt:
+                        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                    resume_start_epoch = ckpt.get("epoch", 0)
+                    self.log(f"  [RESUME] Загружен чекпоинт: {os.path.basename(resume_from_path)}"
+                             f" (эпоха {resume_start_epoch})")
+                except Exception as _re:
+                    self.log(f"  [RESUME] Не удалось загрузить чекпоинт: {_re} — обучаем с нуля")
+                    resume_start_epoch = 0
+            elif resume_from_path:
+                self.log(f"  [RESUME] Чекпоинт не найден: {resume_from_path} — обучаем с нуля")
+
             # AMP (Automatic Mixed Precision): ускорение за счёт fp16 на GPU.
             # GradScaler предотвращает underflow градиентов при fp16.
             # Enabled только при наличии GPU — на CPU AMP не даёт прироста.
@@ -1138,7 +1170,7 @@ class ClassificationTrainer:
             # (использует threading, не multiprocessing).
             prefetcher = DataPrefetcher(train_loader, self.device)
 
-            for epoch in range(1, model_max_epochs + 1):
+            for epoch in range(resume_start_epoch + 1, model_max_epochs + 1):
                 model.train()
                 total_loss = 0.0
                 n_batches = 0
@@ -1192,7 +1224,8 @@ class ClassificationTrainer:
                     def _save_best(ep, mtr):
                         # Сохраняем веса base_model (до компиляции) —
                         # скомпилированная модель может иметь другой формат state_dict
-                        return self._save_checkpoint(base_model, optimizer, ep, mtr, key, is_best=True)
+                        return self._save_checkpoint(base_model, optimizer, ep, mtr, key,
+                                                     is_best=True, scheduler=scheduler)
 
                     continue_training, es_msg = stopper.step(val_metrics, epoch, _save_best)
                     if not continue_training:
@@ -1202,7 +1235,8 @@ class ClassificationTrainer:
                 else:
                     # Чекпоинт каждые N эпох
                     if epoch % self.checkpoint_interval == 0 or epoch == model_max_epochs:
-                        ckpt = self._save_checkpoint(base_model, optimizer, epoch, val_metrics, key)
+                        ckpt = self._save_checkpoint(base_model, optimizer, epoch,
+                                                     val_metrics, key, scheduler=scheduler)
                         self.log(f"  [CKPT] Сохранён: {ckpt}")
 
             # Восстанавливаем лучшие веса если ES включён.
@@ -1226,7 +1260,12 @@ class ClassificationTrainer:
                 last_metrics = {**last_metrics, **{f"test_{k}": v for k, v in test_metrics.items()}}
 
             # Сохраняем финальный чекпоинт
-            self._save_checkpoint(base_model, optimizer, last_metrics.get("epoch", 0), last_metrics, key)
+            _final_ckpt = self._save_checkpoint(
+                base_model, optimizer, last_metrics.get("epoch", 0), last_metrics, key,
+                scheduler=scheduler,
+            )
+            # Запоминаем путь для возможного warm-start следующего прогона
+            self.last_checkpoint_paths[key] = _final_ckpt
 
             return last_metrics
 
@@ -1287,15 +1326,21 @@ class ClassificationTrainer:
 
     # ── Главный цикл ───────────────────────────────────────────────────────
 
-    def run_training(self):
+    def run_training(self, resume_paths: Optional[Dict[str, str]] = None):
         """
         Запускает обучение всех комбинаций модель × датасет.
         Структура: внешний цикл по чекпоинтам, внутренний — по комбинациям.
         После каждой комбинации — очистка памяти.
+
+        resume_paths: словарь {key: path_to_checkpoint} для warm-start.
+            key = f"{model_name}_{dataset_name}".
+            Используется автоподбором процента скрининга.
         """
         self.log("\n" + "=" * 80)
         self.log("НАЧАЛО ОБУЧЕНИЯ КЛАССИФИКАТОРОВ")
         self.log("=" * 80)
+
+        _resume_paths = resume_paths or {}
 
         # Определяем порог эпох для раннего отбора
         max_epochs_global = max(
@@ -1311,7 +1356,10 @@ class ClassificationTrainer:
                     self.log(f"\n[SKIP] {key} — отсеяна ранним отбором")
                     continue
 
-                metrics = self._train_one(model_cfg, dataset_name, key)
+                metrics = self._train_one(
+                    model_cfg, dataset_name, key,
+                    resume_from_path=_resume_paths.get(key),
+                )
                 if metrics:
                     self.metrics_history[key].append({**metrics, "epoch": metrics.get("epoch", 0)})
 
