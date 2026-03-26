@@ -432,10 +432,17 @@ def _run_training(
     use_early_stopping: bool = False,
     early_stopping_patience: int = 10,
     eval_split: str = 'val',
+    resume_from: str = '',
 ) -> Dict[str, float]:
     """
     Запускает обучение через wrapper'ы из Модуля 2.
     Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1', 'val_loss'}.
+
+    resume_from: путь к last.pt для warm-start (YOLO).
+        Если указан и файл существует — загружает веса вместо предобученных.
+        Используется автоподбором процента скрининга.
+        Примечание: optimizer state не восстанавливается (Ultralytics API),
+        для цели ранжирования Спирмена это приемлемо.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -446,7 +453,13 @@ def _run_training(
         if model_type == 'yolo':
             from ultralytics import YOLO
             model_size = model_config.get('size', 'n')
-            model = YOLO(f'yolov8{model_size}.pt')
+
+            # Warm-start: загружаем last.pt если передан и существует
+            if resume_from and os.path.exists(resume_from):
+                model = YOLO(resume_from)
+                log_fn(f"  [RESUME] YOLO загружен с весов: {os.path.basename(resume_from)}")
+            else:
+                model = YOLO(f'yolov8{model_size}.pt')
 
             yaml_path = dataset_path / 'data.yaml'
 
@@ -514,6 +527,7 @@ def _run_training(
                 'precision': _pre,
                 'recall':    _rec,
                 'val_loss':  val_loss,
+                '_ckpt_path': str(result_dir / 'run' / 'weights' / 'last.pt'),
             }
 
             del model, results, eval_model, val_res

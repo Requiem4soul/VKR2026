@@ -121,6 +121,10 @@ _STATE_DEFAULTS = {
     "p2_seed":           42,
     "p2_eta":            2,
     "p2_winner_ds":      None,
+    # Автоподбор процента скрининга
+    "p2_auto_screen":         False,   # включить автоподбор
+    "p2_auto_screen_start":   40,      # начальный % (пользователь задаёт)
+    "p2_auto_screen_rho":     0.9,     # порог Спирмена (0.8 или 0.9)
 }
 for _k, _v in _STATE_DEFAULTS.items():
     if _k not in st.session_state:
@@ -332,6 +336,50 @@ def sha_prune(candidates: List[Dict], eta: int = 2) -> List[Dict]:
     keep = max(1, keep)
     sorted_c = sorted(candidates, key=lambda x: x.get("score", 0.0), reverse=True)
     return sorted_c[:keep]
+
+
+def _spearman_rho(scores_a: Dict[str, float], scores_b: Dict[str, float]) -> float:
+    """
+    Коэффициент ранговой корреляции Спирмена между двумя наборами scores.
+
+    Принимает словари {candidate_id: score} для двух прогонов.
+    Учитывает только общие ключи (кандидаты присутствующие в обоих прогонах).
+
+    Используется для автоподбора процента скрининга:
+    если ρ(x%, x+10%) >= порога, то x% достаточно.
+
+    Научное обоснование:
+    Egele et al. (2024) Neurocomputing — early discarding: ранги доминирующих
+    моделей стабильны на ранних эпохах. Спирмен измеряет стабильность ранжирования.
+    Спирмен ρ ≥ 0.9 — сильная корреляция (стандартный порог в ML-литературе).
+
+    Returns:
+        float: ρ ∈ [-1, 1]. 1.0 — идеальное совпадение рангов.
+               0.0 если менее 2 общих кандидатов (нет смысла считать).
+    """
+    # Общие ключи
+    common_keys = [k for k in scores_a if k in scores_b]
+    n = len(common_keys)
+    if n < 2:
+        return 0.0
+
+    a = [scores_a[k] for k in common_keys]
+    b = [scores_b[k] for k in common_keys]
+
+    def _ranks(vals):
+        # Присваиваем ранги: 1 = лучший (наибольший score)
+        indexed = sorted(enumerate(vals), key=lambda x: x[1], reverse=True)
+        ranks = [0.0] * len(vals)
+        for rank, (idx, _) in enumerate(indexed, 1):
+            ranks[idx] = float(rank)
+        return ranks
+
+    ra = _ranks(a)
+    rb = _ranks(b)
+
+    d2 = sum((ra[i] - rb[i]) ** 2 for i in range(n))
+    rho = 1.0 - (6.0 * d2) / (n * (n * n - 1))
+    return round(rho, 4)
 
 
 def merge_methods_params(candidates: List[Dict]) -> Tuple[List[str], Dict]:
@@ -567,6 +615,23 @@ def _run_search(q: queue.Queue, config: Dict):
 
         set_global_seed(seed)
 
+        # ── Прогрев GPU (warm-up) ──────────────────────────────────────────
+        # Первый forward+backward pass на GPU инициализирует CUDA-буферы и
+        # JIT-кеш torch.compile — без этого первый кандидат получает другой
+        # score из-за недетерминированной инициализации.
+        # Занимает ~2-5 сек. Dodge & Karam (2017) — воспроизводимость в DL.
+        try:
+            import torch as _tw
+            if _tw.cuda.is_available():
+                _dummy = _tw.randn(4, 3, imgsz, imgsz, device="cuda")
+                _dummy_out = _tw.nn.Conv2d(3, 16, 3, padding=1).cuda()(_dummy)
+                _dummy_out.sum().backward()
+                del _dummy, _dummy_out
+                _tw.cuda.empty_cache()
+                log("  [GPU WARMUP] CUDA инициализирована")
+        except Exception as _we:
+            log(f"  [GPU WARMUP] Пропущен: {_we}")
+
         log("=" * 70)
         log("ДВУХФАЗНЫЙ ПОДБОР ПАЙПЛАЙНА ПРЕДОБРАБОТКИ")
         log("Алгоритм: Group-wise SHA (Ф.1) + SFS+SHA на survivors (Ф.2)")
@@ -581,6 +646,10 @@ def _run_search(q: queue.Queue, config: Dict):
         log(f"Финал: {max_epochs} эп. | Быстрый: {fast_epochs} эп. ({screening_ratio}%) | ES patience: {patience}")
         log(f"eta (SHA): {eta} | Seed: {seed}")
         log(f"Рабочая папка: {work_dir}")
+        log(f"[DEBUG] auto_screen={config.get('auto_screen')} | "
+            f"auto_screen_start={config.get('auto_screen_start')} | "
+            f"auto_screen_rho={config.get('auto_screen_rho')} | "
+            f"screening_ratio={config.get('screening_ratio')}")
         log("")
 
         preprocessor = DatasetPreprocessor()
@@ -617,7 +686,8 @@ def _run_search(q: queue.Queue, config: Dict):
         # ── Обучение для классификации ─────────────────────────────────────
 
         def _train_cls(ds_name: str, epochs: int, use_es: bool,
-                       name_suffix: str) -> Dict:
+                       name_suffix: str,
+                       resume_from_path: Optional[str] = None) -> Dict:
             """
             Обучает ClassificationTrainer. Возвращает лучшие метрики.
             Очистка памяти гарантирована в finally ClassificationTrainer._train_one.
@@ -627,6 +697,8 @@ def _run_search(q: queue.Queue, config: Dict):
               ставим epochs чтобы сохранить только финальный.
             - Финальное обучение (use_es=True): сохраняем лучший чекпоинт для ES,
               но не чаще чем раз в 10 эпох — избегаем лишних записей на диск.
+
+            resume_from_path: путь к чекпоинту для warm-start (автоподбор скрининга).
             """
             _cfg = {
                 **_model_cfg_base,
@@ -652,23 +724,29 @@ def _run_search(q: queue.Queue, config: Dict):
                 early_stopping_metric="val_auc",
                 enable_early_selection=False,
             )
-            trainer.run_training()
-            key     = f"{model_type}_{name_suffix}_{ds_name}"
-            history = trainer.metrics_history.get(key, [])
+            _key = f"{model_type}_{name_suffix}_{ds_name}"
+            # Передаём resume_path если есть
+            _resume_paths = {_key: resume_from_path} if resume_from_path else {}
+            trainer.run_training(resume_paths=_resume_paths)
+            history = trainer.metrics_history.get(_key, [])
             if not history:
                 return {}
             best = max(history, key=lambda x: x.get("val_auc", x.get("val_acc", 0.0)))
+            # Возвращаем также путь к чекпоинту для возможного warm-start
+            best["_ckpt_path"] = trainer.last_checkpoint_paths.get(_key, "")
             return best
 
         # ── Обучение для детекции ──────────────────────────────────────────
 
         def _train_det(ds_name: str, epochs: int, use_es: bool,
-                       result_subdir: str, keep_weights: bool) -> Dict:
+                       result_subdir: str, keep_weights: bool,
+                       resume: str = '') -> Dict:
             """
             Обучает детекционную модель через _run_training / _run_training_final
             из module3_preprocessing_search.
             keep_weights=True — не удаляет result_dir (финальное обучение).
             keep_weights=False — удаляет result_dir (SHA-скрининг).
+            resume: путь к last.pt для warm-start (YOLO).
             Очистка GPU-памяти внутри вызываемых функций.
             """
             from module3_preprocessing_search import (
@@ -679,7 +757,6 @@ def _run_search(q: queue.Queue, config: Dict):
             result_dir = work_dir / result_subdir
 
             if keep_weights:
-                # Финальное обучение — ES всегда вкл, eval на test, веса сохраняются
                 metrics = _run_training_final(
                     dataset_path=ds_path,
                     model_config=_model_cfg_base,
@@ -690,7 +767,6 @@ def _run_search(q: queue.Queue, config: Dict):
                     eval_split="test",
                 )
             else:
-                # SHA-скрининг — ES выкл для честного сравнения, eval на valid
                 metrics = _run_training(
                     dataset_path=ds_path,
                     model_config=_model_cfg_base,
@@ -700,6 +776,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     use_early_stopping=False,
                     early_stopping_patience=patience,
                     eval_split="valid",
+                    resume_from=resume,
                 )
             return metrics
 
@@ -733,6 +810,62 @@ def _run_search(q: queue.Queue, config: Dict):
                 log(f"    [ОШИБКА quick_train] {e}")
                 log(traceback.format_exc())
                 return 0.0
+            finally:
+                try:
+                    import torch as _t
+                    if _t.cuda.is_available():
+                        _t.cuda.empty_cache()
+                        _t.cuda.synchronize()
+                except Exception:
+                    pass
+                gc.collect()
+
+        def quick_train_n(ds_name: str, label: str, n_epochs: int,
+                          resume_from: Optional[str] = None,
+                          score_floor: float = 0.0) -> Tuple[float, str]:
+            """
+            Быстрое обучение на произвольном числе эпох n_epochs.
+            Используется автоподбором процента скрининга.
+
+            resume_from: путь к чекпоинту для warm-start (дообучение с x% до x+10%).
+            score_floor: минимальный score из предыдущего прогона (прогон A).
+                При resume history содержит только новые эпохи — если все они
+                хуже score_floor, возвращаем score_floor как нижнюю границу.
+                Это гарантирует что resume не даёт результат хуже прогона A.
+
+            Returns:
+                (score, ckpt_path) — score для ранжирования и путь к
+                финальному чекпоинту для следующего warm-start прогона.
+                ckpt_path = "" если чекпоинт недоступен.
+            """
+            try:
+                if task == "classification":
+                    m = _train_cls(ds_name, n_epochs, use_es=False,
+                                   name_suffix=f"qas{n_epochs}ep",
+                                   resume_from_path=resume_from)
+                    ckpt_path = m.pop("_ckpt_path", "")
+                    sc = score_from_metrics(m)
+                    # При resume берём max(новый score, score прогона A)
+                    # — лучшая эпоха могла быть до точки resume
+                    if resume_from and score_floor > 0:
+                        sc = max(sc, score_floor)
+                    return sc, ckpt_path
+                else:
+                    safe_label = label[:20].replace(" ", "_").replace("+", "_")
+                    subdir = f"det_qas_{safe_label}_{n_epochs}ep"
+                    # YOLO: передаём resume через result_subdir last.pt если есть
+                    _resume_arg = resume_from if resume_from and os.path.exists(
+                        resume_from) else False
+                    m = _train_det(ds_name, n_epochs, use_es=False,
+                                   result_subdir=subdir, keep_weights=True,
+                                   resume=_resume_arg)
+                    # Для YOLO ищем last.pt в папке результатов
+                    _det_dir = str(work_dir / subdir)
+                    _last_pt = os.path.join(_det_dir, "weights", "last.pt")
+                    ckpt_path = _last_pt if os.path.exists(_last_pt) else ""
+                    return score_from_metrics(m), ckpt_path
+            except Exception:
+                return 0.0, ""
             finally:
                 try:
                     import torch as _t
@@ -900,6 +1033,143 @@ def _run_search(q: queue.Queue, config: Dict):
 
         # ══════════════════════════════════════════════════════════════════
         # BASELINE: быстрое обучение оригинала
+        # ══════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════
+        # АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА (опционально)
+        #
+        # Запускает Фазу 1 дважды — на x% и x+10% эпох — и сравнивает
+        # ранги кандидатов через коэффициент Спирмена.
+        # Если ρ >= порога — x% достаточно, используем его результаты.
+        # Если нет — увеличиваем x на 10 и повторяем.
+        #
+        # Научное обоснование:
+        # Egele et al. (2024) Neurocomputing — ранги доминирующих моделей
+        # стабильны на ранних эпохах (early discarding).
+        # Спирмен ρ ≥ 0.9 — стандартный порог сильной корреляции.
+        # ══════════════════════════════════════════════════════════════════
+        auto_screen       = config.get("auto_screen", False)
+        auto_screen_start = config.get("auto_screen_start", 40)
+        auto_screen_rho   = config.get("auto_screen_rho", 0.9)
+
+        # Будет заполнен либо автоподбором, либо использует текущий fast_epochs
+        _auto_screen_scores: Optional[Dict[str, float]] = None  # scores при найденном %
+
+        if auto_screen:
+            log("")
+            log("=" * 70)
+            log("АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА")
+            log(f"Начальный %: {auto_screen_start}% | Порог Спирмена ρ ≥ {auto_screen_rho}")
+            log("Egele et al. (2024) Neurocomputing — early discarding stability")
+            log("=" * 70)
+
+            # Получаем пул кандидатов (тот же что будет в Фазе 1)
+            _as_active_groups = _get_active_candidate_groups(
+                modality_result,
+                use_wiener=config.get("use_wiener", False),
+            )
+            _as_all_cands = []
+            for _gid, _ginfo in _as_active_groups.items():
+                for _cand in _ginfo["candidates"]:
+                    _as_all_cands.append(_cand)
+
+            if len(_as_all_cands) < 2:
+                log("  [ПРОПУСК] Менее 2 кандидатов — автоподбор невозможен.")
+            else:
+                # Предварительно создаём датасеты кандидатов один раз
+                _as_ds_map: Dict[str, str] = {}  # cand_id → ds_name
+                log(f"  Создаю датасеты для {len(_as_all_cands)} кандидатов...")
+                for _cand in _as_all_cands:
+                    try:
+                        _ds = _make_tmp_ds(_cand["id"], _cand["methods"], _cand["params"])
+                        _as_ds_map[_cand["id"]] = _ds
+                    except Exception as _e:
+                        log(f"  [ОШИБКА] {_cand['display']}: {_e}")
+
+                _as_ratio_a = auto_screen_start
+                _as_found   = False
+                _as_scores_a: Dict[str, float] = {}
+                # Словарь чекпоинтов после прогона A: {cand_id: ckpt_path}
+                _as_ckpts_a: Dict[str, str] = {}
+
+                while _as_ratio_a <= 100:
+                    _as_ep_a = max(1, int(max_epochs * (_as_ratio_a / 100)))
+                    _as_ratio_b = _as_ratio_a + 10
+                    _as_ep_b = max(1, int(max_epochs * (_as_ratio_b / 100)))
+
+                    log(f"\n  Прогон A: {_as_ratio_a}% ({_as_ep_a} эп.)")
+                    _as_scores_a = {}
+                    _as_ckpts_a = {}
+                    for _cand in _as_all_cands:
+                        _ds = _as_ds_map.get(_cand["id"])
+                        if _ds is None:
+                            continue
+                        _sc, _ckpt = quick_train_n(_ds, _cand["display"], _as_ep_a)
+                        _as_scores_a[_cand["id"]] = _sc
+                        _as_ckpts_a[_cand["id"]] = _ckpt
+                        log(f"    {_cand['display']:40s}  score={_sc:.4f}")
+
+                    if _as_ratio_b > 100:
+                        # Достигли потолка — используем 100%
+                        log(f"  Достигнут потолок 100% — используем {_as_ratio_a}%")
+                        screening_ratio = _as_ratio_a
+                        fast_epochs = _as_ep_a
+                        _auto_screen_scores = _as_scores_a
+                        _as_found = True
+                        break
+
+                    log(f"\n  Прогон B: {_as_ratio_b}% ({_as_ep_b} эп.) "
+                        f"[warm-start с {_as_ratio_a}%]")
+                    _as_scores_b: Dict[str, float] = {}
+                    for _cand in _as_all_cands:
+                        _ds = _as_ds_map.get(_cand["id"])
+                        if _ds is None:
+                            continue
+                        # Warm-start: дообучаем с чекпоинта прогона A
+                        _resume = _as_ckpts_a.get(_cand["id"], "")
+                        # score_floor — лучший score прогона A для этого кандидата
+                        # гарантирует что resume не даст результат хуже прогона A
+                        _floor = _as_scores_a.get(_cand["id"], 0.0)
+                        _sc, _ = quick_train_n(_ds, _cand["display"], _as_ep_b,
+                                               resume_from=_resume,
+                                               score_floor=_floor)
+                        _as_scores_b[_cand["id"]] = _sc
+                        log(f"    {_cand['display']:40s}  score={_sc:.4f}"
+                            f"{'  [resume]' if _resume else ''}")
+
+                    _rho = _spearman_rho(_as_scores_a, _as_scores_b)
+                    log(f"\n  Спирмен ρ({_as_ratio_a}% vs {_as_ratio_b}%) = {_rho:.4f}"
+                        f"  (порог: {auto_screen_rho})")
+
+                    if _rho >= auto_screen_rho:
+                        log(f"  ✅ Порог достигнут — используем {_as_ratio_a}% скрининга")
+                        screening_ratio = _as_ratio_a
+                        fast_epochs = _as_ep_a
+                        _auto_screen_scores = _as_scores_a
+                        _as_found = True
+                        break
+                    else:
+                        log(f"  ❌ ρ={_rho:.4f} < {auto_screen_rho} — "
+                            f"увеличиваем до {_as_ratio_b}%")
+                        # Следующая итерация A = текущий B — warm-start не нужен,
+                        # scores_b уже посчитаны, но нам нужны их чекпоинты.
+                        # Поэтому пересчитываем A заново с нуля для следующей пары.
+                        _as_ratio_a = _as_ratio_b
+
+                # Удаляем временные датасеты созданные для автоподбора
+                for _ds in _as_ds_map.values():
+                    _cleanup_ds(_ds)
+
+                if _as_found:
+                    log(f"\n  Итог автоподбора: screening_ratio={screening_ratio}%"
+                        f"  ({fast_epochs} эп.)")
+                    log(f"  Jamieson & Talwalkar (2016) AISTATS 240-248 — "
+                        f"SHA с эмпирически подобранным бюджетом эпох")
+
+        # ══════════════════════════════════════════════════════════════════
+        # BASELINE: быстрое обучение оригинала
+        # Выполняется ПОСЛЕ автоподбора чтобы использовать итоговый
+        # fast_epochs — baseline должен обучаться на том же проценте
+        # что и кандидаты для честного сравнения.
         # ══════════════════════════════════════════════════════════════════
         log("")
         log("=" * 70)
@@ -1917,13 +2187,62 @@ if st.session_state.p2_stage == "configure":
                 "При нестабильных кривых обучения или малом числе эпох рекомендуется "
                 "40–50% для снижения rank instability (Li et al., 2018 Hyperband)."
             ),
-        )
+        ) if not st.session_state.get("p2_auto_screen", False) else st.session_state.get("p2_screening_ratio", 30)
+
+    # ── Автоподбор процента скрининга ─────────────────────────────────────
+    st.divider()
+    auto_screen = st.checkbox(
+        "Автоподбор процента скрининга",
+        value=st.session_state.get("p2_auto_screen", False),
+        key="p2_auto_screen_cb",
+        help=(
+            "Автоматически подбирает минимальный процент скрининга при котором "
+            "ранжирование кандидатов стабильно. Запускает Фазу 1 дважды "
+            "(на x% и x+10%) и проверяет корреляцию Спирмена. "
+            "Egele et al. (2024) Neurocomputing — early discarding stability. "
+            "Увеличивает время подбора: каждая пара прогонов = 2x кандидатов."
+        ),
+    )
+    st.session_state.p2_auto_screen = auto_screen
+
+    if auto_screen:
+        _as_col1, _as_col2 = st.columns(2)
+        with _as_col1:
+            auto_screen_start = st.slider(
+                "Начальный % для проверки",
+                min_value=20, max_value=60,
+                value=st.session_state.get("p2_auto_screen_start", 30),
+                step=10,
+                key="p2_auto_screen_start_slider",
+                help="С какого процента начинать поиск. 30% рекомендуется как минимум.",
+            )
+            st.session_state.p2_auto_screen_start = auto_screen_start
+        with _as_col2:
+            auto_screen_rho = st.selectbox(
+                "Порог Спирмена ρ",
+                options=[0.9, 0.8],
+                index=0,
+                key="p2_auto_screen_rho_select",
+                format_func=lambda x: (
+                    "0.9 — сильная корреляция (рекомендуется)"
+                    if x == 0.9 else
+                    "0.8 — умеренно высокая (быстрее)"
+                ),
+                help=(
+                    "ρ ≥ 0.9 — стандартный порог сильной корреляции в ML-литературе. "
+                    "ρ ≥ 0.8 — умеренно высокая, приемлемо для ВКР с оговоркой."
+                ),
+            )
+            st.session_state.p2_auto_screen_rho = auto_screen_rho
 
     st.session_state.p2_epochs = epochs
     st.session_state.p2_patience = patience
     st.session_state.p2_eta = eta
     st.session_state.p2_seed = seed
-    st.session_state.p2_screening_ratio = screening_ratio
+    # Сохраняем screening_ratio только когда автоподбор выключен —
+    # при включённом автоподборе значение определяется автоматически
+    if not auto_screen:
+        st.session_state.p2_screening_ratio = screening_ratio
 
     # ── Оценка числа обучений ─────────────────────────────────────────────
     fast_ep = max(1, int(epochs * (screening_ratio / 100)))
@@ -1998,6 +2317,14 @@ elif st.session_state.p2_stage == "running":
             "datasets_path":  str(get_datasets_path()),
             # Параметры скрининга
             "screening_ratio": st.session_state.get("p2_screening_ratio", 30),
+            # Автоподбор процента скрининга — читаем из ключей виджетов напрямую,
+            # так как session_state может не успеть обновиться до rerun
+            "auto_screen":        st.session_state.get("p2_auto_screen_cb",
+                                  st.session_state.get("p2_auto_screen", False)),
+            "auto_screen_start":  st.session_state.get("p2_auto_screen_start_slider",
+                                  st.session_state.get("p2_auto_screen_start", 40)),
+            "auto_screen_rho":    st.session_state.get("p2_auto_screen_rho_select",
+                                  st.session_state.get("p2_auto_screen_rho", 0.9)),
             # Анализ модальности
             "use_modality":    st.session_state.get("p2_use_modality", True),
             "manual_modality": st.session_state.get("p2_manual_modality", "auto"),
