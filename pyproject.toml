@@ -27,7 +27,7 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
-[[tool.uv.sources]]
+[tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
