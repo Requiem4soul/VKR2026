@@ -1188,8 +1188,23 @@ class UniversalModelTrainer:
                         try:
                             _meta = torch.load(_ckpt_path, map_location='cpu',
                                                weights_only=False)
-                            # Ultralytics: 'epoch' — последняя завершённая эпоха (0-based)
-                            yolo_trained_epochs = int(_meta.get('epoch', 0)) + 1
+                            # Ultralytics сохраняет epoch=-1 в финальных весах
+                            # (last.pt / best.pt) — это намеренное поведение
+                            # библиотеки для уменьшения размера файла инференса.
+                            # Читаем число обученных эпох из train_results['epoch']
+                            # (1-based список), либо из train_args['epochs'].
+                            _tr = _meta.get('train_results', {})
+                            _ep_list = _tr.get('epoch', [])
+                            if hasattr(_ep_list, 'tolist'):
+                                _ep_list = _ep_list.tolist()
+                            else:
+                                _ep_list = list(_ep_list)
+
+                            if _ep_list:
+                                yolo_trained_epochs = int(_ep_list[-1])
+                            else:
+                                _ta = _meta.get('train_args', {})
+                                yolo_trained_epochs = int(_ta.get('epochs', start_epoch))
                         except Exception:
                             yolo_trained_epochs = start_epoch
 

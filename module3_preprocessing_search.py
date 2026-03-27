@@ -499,13 +499,34 @@ def _run_training(
                     _meta = torch.load(
                         resume_from, map_location='cpu', weights_only=False
                     )
-                    # 'epoch' — последняя завершённая эпоха (0-based);
-                    # прибавляем 1 чтобы получить число обученных эпох.
-                    resume_start_epoch = int(_meta.get('epoch', 0)) + 1
+                    # Ultralytics сохраняет epoch=-1 в финальных весах
+                    # (last.pt / best.pt) и обнуляет optimizer для уменьшения
+                    # размера файла — это намеренное поведение библиотеки.
+                    # Поэтому ckpt['epoch'] всегда -1 и не подходит для
+                    # определения числа обученных эпох.
+                    #
+                    # Правильный способ: читать из train_results['epoch'] —
+                    # список номеров эпох (1-based). Последний элемент даёт
+                    # число обученных эпох. Если train_results недоступен —
+                    # fallback на train_args['epochs'].
+                    _train_results = _meta.get('train_results', {})
+                    _epoch_list = _train_results.get('epoch', [])
+                    if hasattr(_epoch_list, 'tolist'):
+                        _epoch_list = _epoch_list.tolist()
+                    else:
+                        _epoch_list = list(_epoch_list)
+
+                    if _epoch_list:
+                        # train_results['epoch'] — 1-based список (1, 2, ..., N)
+                        resume_start_epoch = int(_epoch_list[-1])
+                    else:
+                        # Fallback: train_args['epochs'] = total epochs запуска
+                        _train_args = _meta.get('train_args', {})
+                        resume_start_epoch = int(_train_args.get('epochs', 0))
+
                 except Exception:
-                    # Если метаданные недоступны — консервативно считаем 0;
-                    # в худшем случае обучим ep_b эпох вместо дельты.
                     resume_start_epoch = 0
+
                 model = YOLO(resume_from)
                 log_fn(
                     f"  [RESUME] YOLO загружен с весов: {os.path.basename(resume_from)}"
