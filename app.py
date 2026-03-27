@@ -17,7 +17,7 @@ st.set_page_config(
 init_session_state()
 render_sidebar()
 
-st.title("Система анализа и обучения моделей детекции")
+st.title("Подбор методов предобработки для повышения точности нейронных моделкй")
 st.markdown("**Дипломная работа (ВКР) 2026**")
 st.divider()
 

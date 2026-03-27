@@ -564,12 +564,56 @@ class YOLOWrapper(BaseModelWrapper):
             return {'mAP50': 0.0, 'mAP50-95': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'train_loss': 1.0}
     
     def save(self, path: str):
+        """
+        Сохраняет best.pt — лучшие веса по mAP за весь прогон.
+        Используется для финального сохранения результатов обучения
+        (3_Обучение.py).
+        """
         if self.model and self.last_project_path:
             best_weights = Path(self.last_project_path) / 'weights' / 'best.pt'
             if best_weights.exists():
                 import shutil
                 shutil.copy(best_weights, path)
-    
+
+    def save_for_warmstart(self, path: str) -> bool:
+        """
+        Сохраняет last.pt — чекпоинт последней эпохи для warm-start.
+
+        Используется при сегментном обучении (train_model_segment) когда
+        нужно продолжить обучение со следующего сегмента.
+
+        Отличие от save():
+        - save()               → best.pt  (лучшие веса по mAP, для финала)
+        - save_for_warmstart() → last.pt  (последняя эпоха + epoch counter,
+                                           для дообучения)
+
+        Почему last.pt а не best.pt для warm-start:
+        last.pt содержит корректный epoch counter — сколько эпох уже обучено.
+        best.pt может указывать на более раннюю эпоху (лучшую по mAP),
+        что при следующем warm-start даст неверный epochs_delta и
+        эффективно обучит больше эпох чем запланировано.
+
+        Li et al. (2018) "Hyperband", JMLR 18(185): warm-start successive
+        halving использует веса последней эпохи бюджета, а не лучшей.
+
+        Returns:
+            True если last.pt успешно скопирован, False иначе.
+        """
+        if self.model and self.last_project_path:
+            import shutil
+            last_weights = Path(self.last_project_path) / 'weights' / 'last.pt'
+            if last_weights.exists():
+                shutil.copy(last_weights, path)
+                return True
+            # Fallback: если last.pt нет (редкий случай при очень коротком
+            # обучении когда Ultralytics не успевает его записать) — берём best.pt
+            best_weights = Path(self.last_project_path) / 'weights' / 'best.pt'
+            if best_weights.exists():
+                shutil.copy(best_weights, path)
+                print(f"[WARN] last.pt не найден, для warm-start скопирован best.pt: {path}")
+                return True
+        return False
+
     def load(self, path: str):
         if os.path.exists(path):
             self.model = YOLO(path)
@@ -1305,8 +1349,22 @@ class UniversalModelTrainer:
                     self.checkpoint_dir,
                     f"{key}_epoch_{end_epoch}.pt"
                 )
-                self.models[key].save(checkpoint_path)
-                self.log_message(f"Сохранен чекпоинт: {checkpoint_path}")
+                # Для YOLO используем save_for_warmstart() — сохраняет last.pt
+                # с корректным epoch counter для следующего сегмента.
+                # Для Faster R-CNN / RetinaNet используем save() как раньше.
+                # Li et al. (2018) JMLR 18(185): warm-start использует
+                # веса последней эпохи бюджета, а не лучшей.
+                if model_type == 'yolo' and hasattr(self.models[key], 'save_for_warmstart'):
+                    saved = self.models[key].save_for_warmstart(checkpoint_path)
+                    if saved:
+                        self.log_message(f"Сохранён чекпоинт (last.pt) для warm-start: {checkpoint_path}")
+                    else:
+                        # Fallback если save_for_warmstart не смог сохранить
+                        self.models[key].save(checkpoint_path)
+                        self.log_message(f"Сохранён чекпоинт (best.pt, fallback): {checkpoint_path}")
+                else:
+                    self.models[key].save(checkpoint_path)
+                    self.log_message(f"Сохранен чекпоинт: {checkpoint_path}")
 
                 # Для PyTorch-моделей (Faster R-CNN, RetinaNet) сохраняем
                 # отдельный файл с optimizer_state_dict.

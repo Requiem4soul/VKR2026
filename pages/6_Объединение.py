@@ -740,14 +740,31 @@ def _run_search(q: queue.Queue, config: Dict):
 
         def _train_det(ds_name: str, epochs: int, use_es: bool,
                        result_subdir: str, keep_weights: bool,
-                       resume: str = '') -> Dict:
+                       resume: str = '',
+                       final: bool = False) -> Dict:
             """
-            Обучает детекционную модель через _run_training / _run_training_final
-            из module3_preprocessing_search.
-            keep_weights=True — не удаляет result_dir (финальное обучение).
-            keep_weights=False — удаляет result_dir (SHA-скрининг).
-            resume: путь к last.pt для warm-start (YOLO).
-            Очистка GPU-памяти внутри вызываемых функций.
+            Обучает детекционную модель через _run_training / _run_training_final.
+
+            Параметр final=True: финальное обучение победителя.
+                Вызывает _run_training_final (ES включён, eval на test,
+                result_dir не удаляется — веса сохраняются).
+                Используется из full_train.
+
+            Параметр final=False (по умолчанию): скрининговое обучение.
+                Вызывает _run_training с keep_weights и resume.
+                keep_weights=True  → result_dir НЕ удаляется (last.pt нужен
+                                     для следующего warm-start прогона).
+                keep_weights=False → result_dir удаляется (экономия места).
+                Используется из quick_train (без warm-start) и
+                quick_train_n (с warm-start, keep_weights=True).
+
+            Исправление бага: исходный код при keep_weights=True всегда
+            вызывал _run_training_final, которая игнорирует resume и
+            обучает с нуля. Прогон B автоподбора скрининга попадал туда
+            и получал обучение с 0% вместо дообучения с N%.
+            Теперь final=False → всегда _run_training с корректным resume.
+            Jamieson & Talwalkar (2016) AISTATS 240-248: warm-start SHA
+            требует сохранения и загрузки весов предыдущего прогона.
             """
             from module3_preprocessing_search import (
                 _run_training,
@@ -756,7 +773,10 @@ def _run_search(q: queue.Queue, config: Dict):
             ds_path    = get_dataset_path(ds_name)
             result_dir = work_dir / result_subdir
 
-            if keep_weights:
+            if final:
+                # Финальное обучение победителя: ES включён, eval на test.
+                # resume здесь не нужен — победитель обучается с нуля на
+                # полном числе эпох с early stopping.
                 metrics = _run_training_final(
                     dataset_path=ds_path,
                     model_config=_model_cfg_base,
@@ -767,6 +787,11 @@ def _run_search(q: queue.Queue, config: Dict):
                     eval_split="test",
                 )
             else:
+                # Скрининговое обучение (SHA или warm-start автоподбора).
+                # resume_from передаётся только для warm-start (прогон B).
+                # keep_weights=True → result_dir не удаляется, last.pt
+                # остаётся для следующего warm-start.
+                # keep_weights=False → result_dir удаляется после обучения.
                 metrics = _run_training(
                     dataset_path=ds_path,
                     model_config=_model_cfg_base,
@@ -777,10 +802,6 @@ def _run_search(q: queue.Queue, config: Dict):
                     early_stopping_patience=patience,
                     eval_split="valid",
                     resume_from=resume,
-                    # keep_weights=True: не удалять result_dir в finally,
-                    # чтобы last.pt был доступен для следующего warm-start прогона.
-                    # При keep_weights=False result_dir удалялся сразу, и
-                    # ckpt_path в quick_train_n указывал на несуществующий файл.
                     keep_weights=keep_weights,
                 )
             return metrics
@@ -861,9 +882,15 @@ def _run_search(q: queue.Queue, config: Dict):
                     # YOLO: передаём resume через result_subdir last.pt если есть
                     _resume_arg = resume_from if resume_from and os.path.exists(
                         resume_from) else False
+                    # final=False: скрининговый прогон, не финальное обучение.
+                    # keep_weights=True: result_dir НЕ удаляется — last.pt
+                    # нужен для следующего warm-start прогона.
+                    # Это исправляет баг где keep_weights=True направлял в
+                    # _run_training_final, которая игнорирует resume и
+                    # обучала с нуля вместо дообучения с N%.
                     m = _train_det(ds_name, n_epochs, use_es=False,
                                    result_subdir=subdir, keep_weights=True,
-                                   resume=_resume_arg)
+                                   resume=_resume_arg, final=False)
                     # Для YOLO ищем last.pt в папке результатов.
                     # _run_training сохраняет в result_dir/'run'/'weights'/last.pt,
                     # где result_dir = work_dir / subdir.
@@ -898,8 +925,11 @@ def _run_search(q: queue.Queue, config: Dict):
                     m = _train_cls(ds_name, max_epochs, use_es=True,
                                    name_suffix="final")
                 else:
+                    # final=True: финальное обучение победителя.
+                    # Вызывает _run_training_final (ES, eval на test).
                     m = _train_det(ds_name, max_epochs, use_es=True,
-                                   result_subdir=result_subdir, keep_weights=True)
+                                   result_subdir=result_subdir, keep_weights=True,
+                                   final=True)
                 return m
             except Exception as e:
                 log(f"    [ОШИБКА full_train] {e}")

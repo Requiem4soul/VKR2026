@@ -1243,7 +1243,36 @@ class ClassificationTrainer:
             stopper = EarlyStopping(es_config, key) if self.enable_early_stopping else None
 
             last_metrics: Dict[str, float] = {}
-            best_ckpt_path: Optional[str] = None
+
+            # При warm-start добавляем в metrics_history запись с метриками
+            # чекпоинта прогона A. Это нужно чтобы max(history) корректно
+            # учитывал пик качества который мог быть достигнут до точки resume.
+            #
+            # Без этого history содержит только эпохи ep_a+1..ep_b, и если
+            # лучшая эпоха была в диапазоне 1..ep_a — она теряется при выборе
+            # best = max(history, key=...) в вызывающем коде (_train_cls).
+            #
+            # Jamieson & Talwalkar (2016) AISTATS 240-248: ранжирование SHA
+            # должно отражать лучший достигнутый результат кандидата, а не
+            # только результат последнего прогона.
+            if resume_start_epoch > 0 and resume_from_path and os.path.exists(resume_from_path):
+                try:
+                    _ckpt_for_history = torch.load(
+                        resume_from_path, map_location=self.device, weights_only=False
+                    )
+                    _ckpt_metrics = _ckpt_for_history.get('metrics', {})
+                    # Добавляем только если метрики есть — иначе не засоряем историю
+                    if _ckpt_metrics and _ckpt_metrics.get('val_auc', _ckpt_metrics.get('val_acc')):
+                        _history_entry = {**_ckpt_metrics, 'epoch': resume_start_epoch,
+                                          '_from_checkpoint': True}
+                        self.metrics_history[key].append(_history_entry)
+                        self.log(
+                            f"  [RESUME] Добавлена запись прогона A в историю: "
+                            f"epoch={resume_start_epoch}, "
+                            f"val_auc={_ckpt_metrics.get('val_auc', 0):.4f}"
+                        )
+                except Exception:
+                    pass  # Если метрики из чекпоинта недоступны — пропускаем
 
             # ── Основной цикл по эпохам ────────────────────────────────────
             # DataPrefetcher: загружает следующий батч в фоновом потоке
@@ -1340,7 +1369,10 @@ class ClassificationTrainer:
                 )
                 last_metrics = {**last_metrics, **{f"test_{k}": v for k, v in test_metrics.items()}}
 
-            # Сохраняем финальный чекпоинт
+            # Сохраняем финальный чекпоинт.
+            # Сохраняем last_metrics (не best) — финальный чекпоинт содержит
+            # веса последней эпохи, которые нужны для следующего warm-start.
+            # Best-веса при ES уже восстановлены выше через stopper.best_model_path.
             _final_ckpt = self._save_checkpoint(
                 base_model, optimizer, last_metrics.get("epoch", 0), last_metrics, key,
                 scheduler=scheduler,
@@ -1348,7 +1380,27 @@ class ClassificationTrainer:
             # Запоминаем путь для возможного warm-start следующего прогона
             self.last_checkpoint_paths[key] = _final_ckpt
 
-            return last_metrics
+            # Возвращаем лучшие метрики по всей истории (включая прогон A).
+            # Это гарантирует что score для ранжирования SHA отражает лучший
+            # достигнутый результат кандидата, а не только результат последней
+            # эпохи или последнего прогона.
+            #
+            # Jamieson & Talwalkar (2016) AISTATS 240-248: SHA ранжирует
+            # кандидатов по лучшему результату за отведённый бюджет эпох.
+            # Если пик качества был в эпохах 1..ep_a (до warm-start),
+            # он должен участвовать в ранжировании прогона B.
+            _history_for_best = self.metrics_history.get(key, [])
+            if _history_for_best:
+                best_metrics = max(
+                    _history_for_best,
+                    key=lambda x: x.get("val_auc", x.get("val_acc", 0.0)),
+                )
+                # Добавляем _ckpt_path из финального чекпоинта, а не из best —
+                # именно финальный чекпоинт нужен для следующего warm-start прогона.
+                best_metrics = {**best_metrics, "_ckpt_path": _final_ckpt}
+                return best_metrics
+
+            return {**last_metrics, "_ckpt_path": _final_ckpt}
 
         except Exception as e:
             import traceback
