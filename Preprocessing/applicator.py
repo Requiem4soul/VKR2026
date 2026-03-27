@@ -151,6 +151,48 @@ class DatasetPreprocessor:
 
         _create_dst_structure(src_path, dst_path, splits, dataset_type)
 
+        # ── RAM-кеш оригинальных изображений ──────────────────────────────
+        # На HDD чтение тысяч мелких файлов — основное узкое место.
+        # Читаем все изображения один раз в RAM, повторные вызовы берут из кеша.
+        # Лимит: 70% от реально доступной памяти (psutil.virtual_memory().available).
+        # available уже учитывает кеш ОС который может быть освобождён при нужде.
+        _img_cache: Dict[str, np.ndarray] = {}
+        try:
+            import psutil
+            _avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+            _ram_limit_gb = max(1.0, _avail_gb * 0.70)
+        except Exception:
+            _ram_limit_gb = 2.0
+
+        # Собираем все файлы по всем сплитам и оцениваем размер
+        _all_files: List[Path] = []
+        for _split in splits:
+            _sd = src_path / _split
+            if _sd.exists():
+                _all_files.extend(_collect_image_files(_sd))
+
+        if _all_files:
+            # Оцениваем по первому изображению
+            _sample = cv2.imread(str(_all_files[0]), cv2.IMREAD_UNCHANGED)
+            if _sample is not None:
+                _bytes_per_img = _sample.nbytes
+                _total_gb = (_bytes_per_img * len(_all_files)) / (1024 ** 3)
+                if _total_gb <= _ram_limit_gb:
+                    print(f"  [RAM-кеш] Загружаем {len(_all_files)} изображений"
+                          f" (~{_total_gb:.2f} GB, лимит {_ram_limit_gb:.1f} GB)...")
+                    for _fp in tqdm(_all_files, desc="Кеширование в RAM"):
+                        _img = cv2.imread(str(_fp), cv2.IMREAD_UNCHANGED)
+                        if _img is not None:
+                            if _img.ndim == 3 and _img.shape[2] == 4:
+                                _img = cv2.cvtColor(_img, cv2.COLOR_BGRA2BGR)
+                            if _img.dtype == np.uint16:
+                                _img = cv2.convertScaleAbs(_img, alpha=255.0 / 65535.0)
+                            _img_cache[str(_fp)] = _img
+                    print(f"  [RAM-кеш] Закешировано {len(_img_cache)} изображений")
+                else:
+                    print(f"  [RAM-кеш] Пропуск — датасет {_total_gb:.2f} GB"
+                          f" > лимит {_ram_limit_gb:.1f} GB, читаем с диска")
+
         for split in splits:
             src_split_dir = src_path / split
             dst_split_dir = dst_path / split
@@ -170,28 +212,23 @@ class DatasetPreprocessor:
                 _params['denoise'] = {'method': 'median'}
 
             for img_path in tqdm(image_files, desc=f"Processing {split}"):
-                # Читаем в оригинальном формате: цветные датасеты остаются RGB,
-                # grayscale остаются grayscale. IMREAD_GRAYSCALE теряет
-                # цветовую информацию что критично для цветных датасетов.
-                image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
-                if image is None:
-                    continue
-                # Убираем alpha-канал если есть (BGRA → BGR).
-                # PNG с прозрачностью читаются как 4-канальные (BGRA),
-                # что приводит к ошибке в cvtColor (BGR2LAB, BGR2YCrCb и др.).
-                # Alpha-канал в датасетах для обучения нейросетей не используется.
-                if image.ndim == 3 and image.shape[2] == 4:
-                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-                # Конвертируем 16-битные изображения (CV_16U) в 8-битные (CV_8U).
-                # IMREAD_UNCHANGED читает PNG/TIFF как есть, включая 16-бит глубину.
-                # Методы CLAHE и equalizeHist требуют строго CV_8U — иначе OpenCV
-                # бросает ошибку "Unsupported depth" / "Assertion failed _src.type()".
-                # Нормализуем [0, 65535] → [0, 255] через cv2.convertScaleAbs
-                # с alpha=255/65535: сохраняет яркостные соотношения, не обрезает
-                # старший байт (что дало бы неверные результаты для тёмных снимков).
-                # Канальность и BGR/grayscale не изменяются.
-                if image.dtype == np.uint16:
-                    image = cv2.convertScaleAbs(image, alpha=255.0 / 65535.0)
+                # Берём из RAM-кеша если доступен, иначе читаем с диска
+                _cached = _img_cache.get(str(img_path))
+                if _cached is not None:
+                    image = _cached.copy()  # copy чтобы не мутировать кеш
+                else:
+                    # Читаем в оригинальном формате: цветные датасеты остаются RGB,
+                    # grayscale остаются grayscale. IMREAD_GRAYSCALE теряет
+                    # цветовую информацию что критично для цветных датасетов.
+                    image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+                    if image is None:
+                        continue
+                    # Убираем alpha-канал если есть (BGRA → BGR).
+                    if image.ndim == 3 and image.shape[2] == 4:
+                        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+                    # Конвертируем 16-битные изображения в 8-битные.
+                    if image.dtype == np.uint16:
+                        image = cv2.convertScaleAbs(image, alpha=255.0 / 65535.0)
                 processed = self.methods.apply_pipeline(image, methods, _params)
 
                 out_path = _dst_image_path(img_path, src_split_dir, dst_split_dir)
@@ -206,6 +243,10 @@ class DatasetPreprocessor:
                         shutil.copy(label_src, label_dst)
 
         print(f"\nГотово! Датасет сохранён в {dst_path}")
+
+        # Освобождаем RAM-кеш
+        if _img_cache:
+            _img_cache.clear()
 
     def apply_adaptive_preprocessing(
             self,
