@@ -1094,16 +1094,16 @@ class ClassificationTrainer:
             train_loader = loaders["train"]
             val_loader = loaders.get("val")
 
-            # Оптимизатор — SGD с параметрами из Yang et al. (2021) MedMNIST.
+            # Оптимизатор — SGD с параметрами из Yang et al. (2021) MedMNIST
+            # (Yang et al., 2021, NeurIPS Datasets and Benchmarks Track).
             # При freeze_backbone передаём только trainable параметры —
-            # замороженные слои не получают градиентов (Yosinski et al., 2014).
+            # замороженные слои не получают градиентов (Yosinski et al., 2014,
+            # NeurIPS 2014, "How transferable are features in deep neural networks?").
             #
-            # lr по умолчанию: 1e-3 (Yang et al., 2021) для обучения с нуля;
-            # 1e-4 для pretrained (fine-tuning) — большой lr разрушает веса
-            # предобученной модели. Howard & Ruder (2018) "Universal Language
-            # Model Fine-Tuning", ACL — discriminative fine-tuning.
-            # На сбалансированных датасетах с большим числом примеров разница
-            # несущественна; на малых датасетах 1e-3 вызывает застревание.
+            # lr по умолчанию: 1e-3 для обучения с нуля; 1e-4 для pretrained.
+            # Howard & Ruder (2018) "Universal Language Model Fine-Tuning for Text
+            # Classification", ACL 2018, pp. 328-339: при fine-tuning сниженный lr
+            # предотвращает разрушение предобученных признаков.
             lr = model_cfg.get("lr", 1e-4 if pretrained else 1e-3)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.SGD(
@@ -1112,33 +1112,114 @@ class ClassificationTrainer:
                 momentum=0.9,
                 weight_decay=1e-4,
             )
-            # LR scheduler: косинусный отжиг — хорошо работает на длинных прогонах
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=model_max_epochs
-            )
+
             criterion = nn.CrossEntropyLoss(weight=_get_class_weights(
                 loaders["train"].dataset, num_classes, self.device
             ))
 
-            # Warm-start: загружаем веса и optimizer state из чекпоинта.
-            # Используется автоподбором процента скрининга для дообучения
-            # с x% до x+10% вместо обучения с нуля.
+            # ── Warm-start: загрузка чекпоинта ────────────────────────────
+            #
+            # Используется автоподбором процента скрининга: вместо обучения
+            # с нуля на ep_b% эпох дообучаем с весов прогона A (ep_a%).
+            #
+            # Стратегия восстановления состояния (три отдельных решения):
+            #
+            # (a) Веса модели — загружаем полностью. Основная цель warm-start.
+            #
+            # (b) Optimizer state_dict (momentum buffers) — загружаем.
+            #     SGD с momentum накапливает буферы v_t = beta*v_{t-1} + grad_t.
+            #     Эти буферы кодируют направление оптимизации; их сброс вызывает
+            #     нестабильность в первых эпохах после перезапуска.
+            #     Sutskever et al. (2013) "On the importance of initialization
+            #     and momentum in deep learning", ICML 2013, pp. 1139-1147:
+            #     momentum существенно ускоряет сходимость именно за счёт
+            #     накопленной истории градиентов.
+            #
+            # (c) Learning rate — сбрасываем в исходное значение lr из конфига.
+            #     optimizer_state_dict хранит lr последней эпохи прогона A.
+            #     CosineAnnealingLR к концу прогона A приближает lr к eta_min
+            #     (по умолчанию 0). Если не перезаписать lr, обучение в первых
+            #     эпохах warm-start фактически замирает из-за нулевого шага.
+            #     Howard & Ruder (2018) ACL 2018, pp. 328-339: при каждом новом
+            #     этапе fine-tuning lr возвращается к начальному значению —
+            #     только так оптимизатор проходит полный цикл на новом этапе.
+            #     Перезапись выполняется ПОСЛЕ load_state_dict, иначе
+            #     load_state_dict перекроет наше значение.
+            #
+            # (d) Scheduler — пересоздаём, state_dict НЕ загружаем.
+            #     Подробнее: см. блок создания scheduler ниже.
             resume_start_epoch = 0
+
             if resume_from_path and os.path.exists(resume_from_path):
                 try:
                     ckpt = torch.load(resume_from_path, map_location=self.device)
+
+                    # (a) Веса модели
                     base_model.load_state_dict(ckpt["model_state_dict"])
+
+                    # (b) Optimizer state (momentum buffers)
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                    if "scheduler_state_dict" in ckpt:
-                        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+                    # (c) Сброс lr в исходное значение.
+                    # Выполняется ПОСЛЕ load_state_dict — иначе load_state_dict
+                    # перекрывает наш lr. Перебираем все param_groups явно,
+                    # потому что freeze_backbone может создавать несколько групп.
+                    # Howard & Ruder (2018): lr = начальный для каждого нового этапа.
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = lr
+
                     resume_start_epoch = ckpt.get("epoch", 0)
-                    self.log(f"  [RESUME] Загружен чекпоинт: {os.path.basename(resume_from_path)}"
-                             f" (эпоха {resume_start_epoch})")
+                    self.log(
+                        f"  [RESUME] Загружен: {os.path.basename(resume_from_path)} "
+                        f"(эпоха {resume_start_epoch}, lr сброшен в {lr:.2e})"
+                    )
                 except Exception as _re:
-                    self.log(f"  [RESUME] Не удалось загрузить чекпоинт: {_re} — обучаем с нуля")
+                    self.log(
+                        f"  [RESUME] Не удалось загрузить чекпоинт: {_re} "
+                        f"— обучаем с нуля"
+                    )
                     resume_start_epoch = 0
             elif resume_from_path:
-                self.log(f"  [RESUME] Чекпоинт не найден: {resume_from_path} — обучаем с нуля")
+                self.log(
+                    f"  [RESUME] Чекпоинт не найден: {resume_from_path} "
+                    f"— обучаем с нуля"
+                )
+
+            # ── LR Scheduler ──────────────────────────────────────────────
+            #
+            # Создаётся ПОСЛЕ блока warm-start, чтобы T_max учитывал
+            # итоговый resume_start_epoch.
+            #
+            # Проблема исходного кода:
+            #   scheduler = CosineAnnealingLR(T_max=model_max_epochs)
+            #   затем scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            #   где ckpt сохранён с T_max=ep_a (другое значение).
+            #   CosineAnnealingLR вычисляет lr(t) = eta_min + 0.5*(lr_max-eta_min)
+            #   * (1 + cos(pi * t / T_max)), где t берётся из state_dict прогона A,
+            #   а T_max — из нового планировщика. При T_max_A != T_max_B lr "прыгает"
+            #   в непредсказуемое значение уже на первом шаге — именно это вызывало
+            #   наблюдавшиеся "искажения" в метриках.
+            #
+            # Решение (Loshchilov & Hutter, 2017, "SGDR: Stochastic Gradient
+            # Descent with Warm Restarts", ICLR 2017):
+            #   При warm restart планировщик инициализируется заново с
+            #   T_max = remaining_epochs (оставшееся число эпох).
+            #   Cosine-кривая проходит полный цикл от lr (eta_max) до eta_min
+            #   именно за те эпохи, которые реально будут выполнены.
+            #   scheduler_state_dict намеренно не загружается:
+            #   планировщик всегда стартует из шага 0 своего нового цикла.
+            #
+            # remaining_epochs:
+            #   обучение с нуля: remaining == model_max_epochs
+            #   warm-start:      remaining == model_max_epochs - ep_a
+            #   минимум 1 — защита от деления на ноль при граничных случаях.
+            remaining_epochs = max(1, model_max_epochs - resume_start_epoch)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=remaining_epochs,
+                # eta_min=0 по умолчанию — стандартное значение из
+                # Loshchilov & Hutter (2017).
+            )
 
             # AMP (Automatic Mixed Precision): ускорение за счёт fp16 на GPU.
             # GradScaler предотвращает underflow градиентов при fp16.

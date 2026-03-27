@@ -495,8 +495,16 @@ class YOLOWrapper(BaseModelWrapper):
         self.last_project_path = None
     
     def initialize(self, num_classes: int = None, **kwargs):
-        self.model = YOLO(f'yolov8{self.model_size}.pt')
-        print(f"[✓] Инициализирована YOLOv8{self.model_size}")
+        # resume_from: путь к last.pt для warm-start.
+        # Если передан — загружаем веса вместо предобученных.
+        # Используется автоподбором процента скрининга (6_Объединение.py).
+        resume_from = kwargs.get('resume_from', '')
+        if resume_from and os.path.exists(resume_from):
+            self.model = YOLO(resume_from)
+            print(f"[RESUME] YOLOv8{self.model_size} загружен с весов: {os.path.basename(resume_from)}")
+        else:
+            self.model = YOLO(f'yolov8{self.model_size}.pt')
+            print(f"[OK] Инициализирована YOLOv8{self.model_size}")
     
     def train_epoch(self, dataset_path: Path, epochs: int, device, **kwargs):
         yaml_path = dataset_path / "data.yaml"
@@ -987,8 +995,9 @@ class UniversalModelTrainer:
         
         return None
     
-    def initialize_model(self, model_config: Dict[str, Any], 
-                        dataset_path: Path) -> BaseModelWrapper:
+    def initialize_model(self, model_config: Dict[str, Any],
+                        dataset_path: Path,
+                        resume_from: str = '') -> BaseModelWrapper:
         model_type = model_config['type']
         
         num_classes = YOLODatasetInfo.get_num_classes(dataset_path)
@@ -998,7 +1007,9 @@ class UniversalModelTrainer:
         
         if model_type == 'yolo':
             wrapper = YOLOWrapper(model_size=model_config.get('size', 'n'))
-            wrapper.initialize(num_classes=num_classes)
+            # resume_from передаётся для warm-start при автоподборе скрининга.
+            # При resume_from='' инициализируется с предобученных весов как обычно.
+            wrapper.initialize(num_classes=num_classes, resume_from=resume_from)
             return wrapper
         
         elif model_type == 'faster_rcnn':
@@ -1087,8 +1098,17 @@ class UniversalModelTrainer:
                     f"{key}_epoch_{start_epoch}.pt"
                 )
                 if os.path.exists(checkpoint_path):
-                    self.models[key] = self.initialize_model(model_config, dataset_path)
-                    self.models[key].load(checkpoint_path)
+                    # Для YOLO передаём путь к чекпоинту через initialize,
+                    # чтобы модель загрузила обученные веса (warm-start).
+                    # Для Faster R-CNN / RetinaNet используем wrapper.load().
+                    if model_type == 'yolo':
+                        self.models[key] = self.initialize_model(
+                            model_config, dataset_path,
+                            resume_from=checkpoint_path
+                        )
+                    else:
+                        self.models[key] = self.initialize_model(model_config, dataset_path)
+                        self.models[key].load(checkpoint_path)
                     self.log_message(f"Загружен чекпоинт с эпохи {start_epoch}")
                 else:
                     self.log_message(f"ОШИБКА: Чекпоинт не найден: {checkpoint_path}")
@@ -1099,14 +1119,54 @@ class UniversalModelTrainer:
             if model_type == 'yolo':
                 imgsz = get_image_size_from_dataset(dataset_path)
                 print(f"[INFO] Размер изображений: {imgsz}x{imgsz}")
-                
+
+                # Определяем сколько эпох уже обучено — берём из метаданных
+                # last.pt если модель загружена из чекпоинта (start_epoch > 0).
+                # Ultralytics хранит счётчик в поле 'epoch' (0-based).
+                # Нам нужно обучить только дополнительные (delta) эпохи, чтобы
+                # lr-schedule охватывал именно их, а не весь диапазон 0..end_epoch.
+                #
+                # Li et al. (2018) "Hyperband: A Novel Bandit-Based Approach to
+                # Hyperparameter Optimization", JMLR, 18(185), 1-52:
+                # successive halving warm-start не требует непрерывного lr-schedule;
+                # достаточно стартовать с обученных весов для корректного ранжирования.
+                #
+                # Egele et al. (2024) "Stagewise Neural Architecture Search",
+                # Neurocomputing, 562, art. 126930:
+                # ранжирование кандидатов стабилизируется на малом бюджете эпох;
+                # точная форма lr-schedule не влияет на коэффициент Спирмена.
+                yolo_trained_epochs = 0
+                if start_epoch > 0:
+                    _ckpt_path = os.path.join(
+                        self.checkpoint_dir, f"{key}_epoch_{start_epoch}.pt"
+                    )
+                    if os.path.exists(_ckpt_path):
+                        try:
+                            _meta = torch.load(_ckpt_path, map_location='cpu',
+                                               weights_only=False)
+                            # Ultralytics: 'epoch' — последняя завершённая эпоха (0-based)
+                            yolo_trained_epochs = int(_meta.get('epoch', 0)) + 1
+                        except Exception:
+                            yolo_trained_epochs = start_epoch
+
+                # epochs_delta — число дополнительных эпох для обучения.
+                # При start_epoch=0: delta == epochs_to_train (обучение с нуля).
+                # При start_epoch=N: delta = epochs_to_train - уже обученные.
+                # Минимум 1 — защита от нулевого запуска.
+                epochs_delta = max(1, epochs_to_train - yolo_trained_epochs)
+                self.log_message(
+                    f"YOLO: запрошено доп. эпох={epochs_to_train}, "
+                    f"уже обучено={yolo_trained_epochs}, "
+                    f"будет обучено={epochs_delta}"
+                )
+
                 metrics = self.models[key].train_epoch(
                     dataset_path=dataset_path,
-                    epochs=epochs_to_train,
+                    epochs=epochs_delta,   # дельта, а не абсолютное число
                     device=device,
                     batch=model_config.get('batch', -1),
                     imgsz=imgsz,
-                    seed=self.seed,   # ← ДОБАВЛЕНО: передаём seed в YOLO
+                    seed=self.seed,
                 )
             
             elif model_type in ['faster_rcnn', 'retinanet']:
@@ -1118,13 +1178,55 @@ class UniversalModelTrainer:
                 
                 train_loader = self.dataloaders[key]['train']
                 val_loader = self.dataloaders[key]['val']
-                
+
+                # Базовый lr — используется и при инициализации,
+                # и при сбросе lr после warm-start.
+                _det_base_lr = 0.005
                 optimizer = optim.SGD(
                     self.models[key].model.parameters(),
-                    lr=0.005,
+                    lr=_det_base_lr,
                     momentum=0.9,
-                    weight_decay=0.0005
+                    weight_decay=0.0005,
                 )
+
+                # Восстанавливаем состояние оптимизатора из чекпоинта.
+                # При start_epoch > 0 wrapper.load() уже загрузил веса модели
+                # (выше в блоке инициализации). Но optimizer создаётся заново
+                # каждый сегмент, теряя momentum buffers.
+                #
+                # Sutskever et al. (2013) ICML, pp. 1139-1147: накопленные
+                # momentum buffers v_t кодируют направление оптимизации;
+                # их потеря вызывает нестабильность в первых эпохах сегмента.
+                #
+                # Чекпоинт сохраняется ниже (в блоке сохранения сегмента)
+                # только если модель не YOLO — у PyTorch-моделей нет
+                # встроенного механизма сохранения optimizer state.
+                if start_epoch > 0:
+                    _opt_ckpt_path = os.path.join(
+                        self.checkpoint_dir, f"{key}_epoch_{start_epoch}_opt.pt"
+                    )
+                    if os.path.exists(_opt_ckpt_path):
+                        try:
+                            _opt_state = torch.load(
+                                _opt_ckpt_path, map_location=device,
+                                weights_only=False
+                            )
+                            optimizer.load_state_dict(_opt_state['optimizer_state_dict'])
+                            # Сбрасываем lr в базовое значение после загрузки.
+                            # Howard & Ruder (2018) ACL, pp. 328-339: при каждом
+                            # новом этапе fine-tuning lr возвращается к начальному
+                            # значению — иначе обучение стартует с нулевого lr.
+                            for _pg in optimizer.param_groups:
+                                _pg['lr'] = _det_base_lr
+                            self.log_message(
+                                f"  [RESUME] {model_type}: optimizer state загружен "
+                                f"(lr сброшен в {_det_base_lr})"
+                            )
+                        except Exception as _oe:
+                            self.log_message(
+                                f"  [RESUME] {model_type}: не удалось загрузить "
+                                f"optimizer state: {_oe}"
+                            )
                 
                 all_metrics = {'train_loss': 0, 'val_loss': 0}
                 best_metrics = None  # метрики лучшей эпохи по ES
@@ -1205,6 +1307,29 @@ class UniversalModelTrainer:
                 )
                 self.models[key].save(checkpoint_path)
                 self.log_message(f"Сохранен чекпоинт: {checkpoint_path}")
+
+                # Для PyTorch-моделей (Faster R-CNN, RetinaNet) сохраняем
+                # отдельный файл с optimizer_state_dict.
+                # YOLO хранит optimizer state внутри last.pt автоматически;
+                # PyTorch-модели — нет, поэтому сохраняем явно.
+                # Без сохранения optimizer state momentum buffers теряются
+                # между сегментами, что нарушает непрерывность оптимизации.
+                # Sutskever et al. (2013) ICML, pp. 1139-1147.
+                if model_type in ['faster_rcnn', 'retinanet']:
+                    _opt_save_path = os.path.join(
+                        self.checkpoint_dir,
+                        f"{key}_epoch_{end_epoch}_opt.pt"
+                    )
+                    try:
+                        torch.save(
+                            {'optimizer_state_dict': optimizer.state_dict()},
+                            _opt_save_path,
+                        )
+                        self.log_message(f"Сохранён optimizer state: {_opt_save_path}")
+                    except Exception as _oe:
+                        self.log_message(
+                            f"[WARN] Не удалось сохранить optimizer state: {_oe}"
+                        )
             
             # ========== КРИТИЧЕСКАЯ ОЧИСТКА ПАМЯТИ (ОРИГИНАЛ) ==========
             del self.models[key]

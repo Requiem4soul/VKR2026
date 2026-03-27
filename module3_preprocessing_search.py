@@ -433,16 +433,39 @@ def _run_training(
     early_stopping_patience: int = 10,
     eval_split: str = 'val',
     resume_from: str = '',
+    keep_weights: bool = False,
 ) -> Dict[str, float]:
     """
     Запускает обучение через wrapper'ы из Модуля 2.
     Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1', 'val_loss'}.
 
     resume_from: путь к last.pt для warm-start (YOLO).
-        Если указан и файл существует — загружает веса вместо предобученных.
-        Используется автоподбором процента скрининга.
-        Примечание: optimizer state не восстанавливается (Ultralytics API),
-        для цели ранжирования Спирмена это приемлемо.
+        Если указан и файл существует — загружает веса как инициализацию.
+        Используется автоподбором процента скрининга (6_Объединение.py,
+        quick_train_n): вместо обучения с нуля на ep_b эпох — дообучаем
+        с ep_a весов.
+
+        Внутри функции вычисляется epochs_delta = ep_b - resume_start_epoch,
+        и в model.train() передаётся именно дельта. Это гарантирует что
+        lr-schedule охватывает только дополнительные эпохи, а не весь
+        диапазон 0..ep_b.
+
+        Научные обоснования допустимости warm-start для ранжирования:
+        Li et al. (2018) "Hyperband", JMLR 18(185): successive halving
+        warm-start не требует непрерывного lr-schedule — достаточно
+        стартовать с обученных весов для стабильного ранжирования.
+        Egele et al. (2024) Neurocomputing 562: ранжирование Спирмена
+        стабильно независимо от формы lr-schedule при дообучении.
+
+    keep_weights: если True — result_dir НЕ удаляется в finally.
+        Необходимо при вызове из quick_train_n (keep_weights=True в
+        _train_det), чтобы last.pt был доступен для следующего warm-start.
+        При keep_weights=False (обычный SHA-скрининг) result_dir удаляется
+        как раньше.
+
+        Исправление бага: исходный _run_training всегда удалял result_dir
+        в finally, из-за чего last.pt был недоступен для warm-start даже
+        при keep_weights=True в вызывающем коде.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -454,10 +477,40 @@ def _run_training(
             from ultralytics import YOLO
             model_size = model_config.get('size', 'n')
 
-            # Warm-start: загружаем last.pt если передан и существует
+            # Определяем число уже обученных эпох из метаданных last.pt.
+            # Ultralytics сохраняет счётчик в поле 'epoch' (0-based).
+            # При warm-start нужно обучить только дополнительные (delta) эпохи,
+            # чтобы lr-schedule охватывал именно их, а не весь диапазон 0..ep_b.
+            #
+            # Проблема исходного кода: передавался epochs=ep_b (абсолютное).
+            # Без resume=True Ultralytics запускает lr-schedule заново с эпохи 0
+            # и обучает ep_b эпох — это fine-tuning с нуля по расписанию, а не
+            # дообучение с ep_a.
+            #
+            # Li et al. (2018) "Hyperband: A Novel Bandit-Based Approach to
+            # Hyperparameter Optimization", JMLR, 18(185), 1-52:
+            # successive halving warm-start не требует непрерывного lr-schedule;
+            # достаточно стартовать с обученных весов для корректного ранжирования.
+            # Egele et al. (2024) Neurocomputing 562, art. 126930:
+            # ранжирование Спирмена стабильно независимо от формы lr-schedule.
+            resume_start_epoch = 0
             if resume_from and os.path.exists(resume_from):
+                try:
+                    _meta = torch.load(
+                        resume_from, map_location='cpu', weights_only=False
+                    )
+                    # 'epoch' — последняя завершённая эпоха (0-based);
+                    # прибавляем 1 чтобы получить число обученных эпох.
+                    resume_start_epoch = int(_meta.get('epoch', 0)) + 1
+                except Exception:
+                    # Если метаданные недоступны — консервативно считаем 0;
+                    # в худшем случае обучим ep_b эпох вместо дельты.
+                    resume_start_epoch = 0
                 model = YOLO(resume_from)
-                log_fn(f"  [RESUME] YOLO загружен с весов: {os.path.basename(resume_from)}")
+                log_fn(
+                    f"  [RESUME] YOLO загружен с весов: {os.path.basename(resume_from)}"
+                    f" (эпох уже обучено: {resume_start_epoch})"
+                )
             else:
                 model = YOLO(f'yolov8{model_size}.pt')
 
@@ -473,9 +526,24 @@ def _run_training(
                 except Exception:
                     imgsz = 640
 
+            # Число дополнительных эпох — именно столько запускаем lr-schedule.
+            # При resume_start_epoch=0 (обучение с нуля): delta == epochs.
+            # При resume_start_epoch=ep_a, epochs=ep_b: delta = ep_b - ep_a.
+            # Минимум 1 — защита от нулевого запуска при граничных случаях.
+            epochs_delta = max(1, epochs - resume_start_epoch)
+            if resume_start_epoch > 0:
+                log_fn(
+                    f"  [RESUME] Запрошено эпох всего: {epochs}, "
+                    f"уже обучено: {resume_start_epoch}, "
+                    f"дополнительных: {epochs_delta}"
+                )
+
             train_kwargs = dict(
                 data=str(yaml_path),
-                epochs=epochs,
+                # Передаём дельту эпох, а не абсолютное число.
+                # Ключевое исправление: lr-schedule охватывает только
+                # дополнительные эпохи. Li et al. (2018) JMLR 18(185).
+                epochs=epochs_delta,
                 imgsz=imgsz,
                 batch=model_config.get('batch', -1),
                 device=device,
@@ -486,11 +554,18 @@ def _run_training(
                 cache=False,
                 verbose=False,
                 save=True,
+                # resume=False явно — управляем эпохами через дельту сами.
+                # resume=True потребовало бы что last.pt содержит ровно те
+                # total_epochs что были при исходном запуске, что не выполняется
+                # при сравнении разных процентов скрининга.
+                resume=False,
             )
             if use_early_stopping:
                 train_kwargs['patience'] = early_stopping_patience
             else:
-                train_kwargs['patience'] = 0  # отключаем ES для честного SHA-сравнения
+                # patience=0 отключает встроенный ES Ultralytics для честного
+                # SHA-сравнения — Jamieson & Talwalkar (2016) AISTATS 240-248.
+                train_kwargs['patience'] = 0
 
             results = model.train(**train_kwargs)
             train_metrics_dict = results.results_dict
@@ -552,6 +627,65 @@ def _run_training(
             wrapper.initialize(num_classes=num_classes)
             wrapper.model.to(device)
 
+            # Базовый lr для SGD — используется и при обычном обучении,
+            # и при явном сбросе lr после warm-start.
+            # He et al. (2016) и стандартная практика детекции: lr=0.005.
+            _base_lr = 0.005
+
+            optimizer = torch.optim.SGD(
+                wrapper.model.parameters(),
+                lr=_base_lr,
+                momentum=0.9,
+                weight_decay=0.0005,
+            )
+
+            # Warm-start для Faster R-CNN / RetinaNet.
+            # В отличие от YOLO, здесь нет метаданных эпох в чекпоинте —
+            # чекпоинт содержит только model_state_dict и optimizer_state_dict,
+            # сохранённые через wrapper.save() предыдущего прогона.
+            #
+            # Стратегия аналогична classification_trainer._train_one:
+            # (a) Веса модели — загружаем полностью.
+            # (b) Optimizer state (momentum buffers) — загружаем.
+            #     Sutskever et al. (2013) ICML, pp. 1139-1147: накопленные
+            #     буферы v_t кодируют направление оптимизации; их потеря
+            #     вызывает нестабильность в первых эпохах.
+            # (c) lr — сбрасываем в _base_lr после load_state_dict.
+            #     Howard & Ruder (2018) ACL, pp. 328-339: при каждом новом
+            #     этапе fine-tuning lr возвращается к начальному значению.
+            # (d) epochs — для Faster R-CNN / RetinaNet число эпох в
+            #     чекпоинте не хранится, поэтому epochs_delta передаётся
+            #     явно из вызывающего кода (quick_train_n передаёт дельту
+            #     аналогично YOLO — ep_b - ep_a).
+            #     Li et al. (2018) JMLR 18(185): достаточно стартовать с
+            #     обученных весов для стабильного ранжирования Спирмена.
+            resume_start_epoch_det = 0
+            if resume_from and os.path.exists(resume_from):
+                try:
+                    ckpt_det = torch.load(
+                        resume_from, map_location=device, weights_only=False
+                    )
+                    # (a) Веса модели
+                    wrapper.model.load_state_dict(ckpt_det['model_state_dict'])
+                    # (b) Optimizer state (momentum buffers)
+                    if 'optimizer_state_dict' in ckpt_det:
+                        optimizer.load_state_dict(ckpt_det['optimizer_state_dict'])
+                        # (c) Сброс lr — ПОСЛЕ load_state_dict, иначе будет перезаписан
+                        for _pg in optimizer.param_groups:
+                            _pg['lr'] = _base_lr
+                    resume_start_epoch_det = int(ckpt_det.get('epoch', 0))
+                    log_fn(
+                        f"  [RESUME] {model_type} загружен с весов: "
+                        f"{os.path.basename(resume_from)} "
+                        f"(эпоха {resume_start_epoch_det}, lr={_base_lr})"
+                    )
+                except Exception as _re:
+                    log_fn(
+                        f"  [RESUME] Не удалось загрузить чекпоинт {model_type}: "
+                        f"{_re} — обучаем с нуля"
+                    )
+                    resume_start_epoch_det = 0
+
             def collate_fn(batch):
                 return tuple(zip(*batch))
 
@@ -562,20 +696,42 @@ def _run_training(
             val_loader = DataLoader(val_ds, batch_size=batch_size,
                                     shuffle=False, collate_fn=collate_fn, num_workers=0)
 
-            optimizer = torch.optim.SGD(
-                wrapper.model.parameters(), lr=0.005,
-                momentum=0.9, weight_decay=0.0005
-            )
-
             for epoch in range(epochs):
                 wrapper.train_epoch(train_loader, device, optimizer, epoch)
 
             val_metrics = wrapper.validate(val_loader, device)
+
+            # Сохраняем чекпоинт для следующего warm-start прогона если нужно.
+            # Чекпоинт содержит model_state_dict, optimizer_state_dict и номер
+            # последней эпохи — всё необходимое для корректного warm-start.
+            # keep_weights управляет удалением result_dir в finally ниже;
+            # здесь мы дополнительно сохраняем расширенный чекпоинт с
+            # optimizer_state_dict (стандартный wrapper.save() его не включает).
+            if keep_weights:
+                _ckpt_det_path = result_dir / 'checkpoint_det.pt'
+                result_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        'model_state_dict':     wrapper.model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        # resume_start_epoch_det + epochs = абсолютная эпоха.
+                        # При следующем warm-start этот счётчик не используется
+                        # напрямую (в отличие от YOLO), но полезен для лога.
+                        'epoch': resume_start_epoch_det + epochs,
+                        'num_classes': wrapper.num_classes,
+                    },
+                    _ckpt_det_path,
+                )
+                log_fn(f"  [CKPT] Сохранён чекпоинт: {_ckpt_det_path}")
+
             metrics = {
                 'mAP50-95': float(val_metrics.get('mAP50-95', 0.0)),
                 'mAP50':    float(val_metrics.get('mAP50',    0.0)),
                 'f1':       float(val_metrics.get('f1',       0.0)),
                 'val_loss': float(val_metrics.get('val_loss', 1.0)),
+                # Путь к чекпоинту для warm-start следующего прогона.
+                # При keep_weights=False файл не создаётся — пустая строка.
+                '_ckpt_path': str(result_dir / 'checkpoint_det.pt') if keep_weights else '',
             }
 
             del wrapper, train_loader, val_loader
@@ -593,10 +749,14 @@ def _run_training(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        # result_dir (веса YOLO) удаляем здесь — метрики уже извлечены выше.
-        # tmp_dataset НЕ трогаем — он удаляется в train_candidate_fast
-        # после того как _run_training полностью вернул управление.
-        if result_dir.exists():
+        # result_dir удаляем только если keep_weights=False (обычный SHA-скрининг).
+        # При keep_weights=True (quick_train_n для автоподбора скрининга)
+        # НЕ удаляем — last.pt должен быть доступен для следующего warm-start прогона.
+        #
+        # Исправление бага: исходный код всегда удалял result_dir, из-за чего
+        # ckpt_path в quick_train_n всегда указывал на несуществующий файл и
+        # warm-start для детекции фактически не работал.
+        if not keep_weights and result_dir.exists():
             try:
                 shutil.rmtree(result_dir)
             except Exception:

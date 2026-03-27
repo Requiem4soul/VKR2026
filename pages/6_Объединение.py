@@ -777,6 +777,11 @@ def _run_search(q: queue.Queue, config: Dict):
                     early_stopping_patience=patience,
                     eval_split="valid",
                     resume_from=resume,
+                    # keep_weights=True: не удалять result_dir в finally,
+                    # чтобы last.pt был доступен для следующего warm-start прогона.
+                    # При keep_weights=False result_dir удалялся сразу, и
+                    # ckpt_path в quick_train_n указывал на несуществующий файл.
+                    keep_weights=keep_weights,
                 )
             return metrics
 
@@ -859,9 +864,14 @@ def _run_search(q: queue.Queue, config: Dict):
                     m = _train_det(ds_name, n_epochs, use_es=False,
                                    result_subdir=subdir, keep_weights=True,
                                    resume=_resume_arg)
-                    # Для YOLO ищем last.pt в папке результатов
+                    # Для YOLO ищем last.pt в папке результатов.
+                    # _run_training сохраняет в result_dir/'run'/'weights'/last.pt,
+                    # где result_dir = work_dir / subdir.
+                    # Исправление бага: исходный код не включал подпапку 'run',
+                    # из-за чего last.pt никогда не находился и warm-start
+                    # для детекции фактически не работал.
                     _det_dir = str(work_dir / subdir)
-                    _last_pt = os.path.join(_det_dir, "weights", "last.pt")
+                    _last_pt = os.path.join(_det_dir, "run", "weights", "last.pt")
                     ckpt_path = _last_pt if os.path.exists(_last_pt) else ""
                     return score_from_metrics(m), ckpt_path
             except Exception:
