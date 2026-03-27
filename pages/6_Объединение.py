@@ -1137,16 +1137,26 @@ def _run_search(q: queue.Queue, config: Dict):
                     _as_ep_b = max(1, int(max_epochs * (_as_ratio_b / 100)))
 
                     log(f"\n  Прогон A: {_as_ratio_a}% ({_as_ep_a} эп.)")
-                    _as_scores_a = {}
-                    _as_ckpts_a = {}
-                    for _cand in _as_all_cands:
-                        _ds = _as_ds_map.get(_cand["id"])
-                        if _ds is None:
-                            continue
-                        _sc, _ckpt = quick_train_n(_ds, _cand["display"], _as_ep_a)
-                        _as_scores_a[_cand["id"]] = _sc
-                        _as_ckpts_a[_cand["id"]] = _ckpt
-                        log(f"    {_cand['display']:40s}  score={_sc:.4f}")
+                    # Обучаем прогон A только если scores ещё не вычислены.
+                    # При цепочечном переходе (ρ < порога на предыдущей итерации)
+                    # _as_scores_a и _as_ckpts_a уже заполнены из прогона B —
+                    # в этом случае пропускаем обучение и идём сразу к прогону B.
+                    # Li et al. (2018) JMLR 18(185): экономия N_cands обучений
+                    # на каждой итерации кроме первой.
+                    if not _as_scores_a:
+                        for _cand in _as_all_cands:
+                            _ds = _as_ds_map.get(_cand["id"])
+                            if _ds is None:
+                                continue
+                            _sc, _ckpt = quick_train_n(_ds, _cand["display"], _as_ep_a)
+                            _as_scores_a[_cand["id"]] = _sc
+                            _as_ckpts_a[_cand["id"]] = _ckpt
+                            log(f"    {_cand['display']:40s}  score={_sc:.4f}")
+                    else:
+                        # Scores уже есть из предыдущего прогона B — выводим их
+                        for _cand in _as_all_cands:
+                            _sc = _as_scores_a.get(_cand["id"], 0.0)
+                            log(f"    {_cand['display']:40s}  score={_sc:.4f}  [перенесено из пред. прогона B]")
 
                     if _as_ratio_b > 100:
                         # Достигли потолка — используем 100%
@@ -1160,6 +1170,11 @@ def _run_search(q: queue.Queue, config: Dict):
                     log(f"\n  Прогон B: {_as_ratio_b}% ({_as_ep_b} эп.) "
                         f"[warm-start с {_as_ratio_a}%]")
                     _as_scores_b: Dict[str, float] = {}
+                    # Чекпоинты прогона B — нужны если ρ < порога,
+                    # чтобы следующая итерация могла дообучать с них.
+                    # Li et al. (2018) JMLR 18(185): цепочечное дообучение
+                    # корректно для successive halving — ранжирование сохраняется.
+                    _as_ckpts_b: Dict[str, str] = {}
                     for _cand in _as_all_cands:
                         _ds = _as_ds_map.get(_cand["id"])
                         if _ds is None:
@@ -1169,10 +1184,11 @@ def _run_search(q: queue.Queue, config: Dict):
                         # score_floor — лучший score прогона A для этого кандидата
                         # гарантирует что resume не даст результат хуже прогона A
                         _floor = _as_scores_a.get(_cand["id"], 0.0)
-                        _sc, _ = quick_train_n(_ds, _cand["display"], _as_ep_b,
-                                               resume_from=_resume,
-                                               score_floor=_floor)
+                        _sc, _ckpt_b = quick_train_n(_ds, _cand["display"], _as_ep_b,
+                                                     resume_from=_resume,
+                                                     score_floor=_floor)
                         _as_scores_b[_cand["id"]] = _sc
+                        _as_ckpts_b[_cand["id"]] = _ckpt_b
                         log(f"    {_cand['display']:40s}  score={_sc:.4f}"
                             f"{'  [resume]' if _resume else ''}")
 
@@ -1190,10 +1206,24 @@ def _run_search(q: queue.Queue, config: Dict):
                     else:
                         log(f"  ❌ ρ={_rho:.4f} < {auto_screen_rho} — "
                             f"увеличиваем до {_as_ratio_b}%")
-                        # Следующая итерация A = текущий B — warm-start не нужен,
-                        # scores_b уже посчитаны, но нам нужны их чекпоинты.
-                        # Поэтому пересчитываем A заново с нуля для следующей пары.
-                        _as_ratio_a = _as_ratio_b
+                        # Следующая итерация: прогон B становится новым прогоном A.
+                        # Scores и чекпоинты прогона B переносятся напрямую —
+                        # нет необходимости обучать A заново с нуля.
+                        #
+                        # Научное обоснование цепочечного дообучения:
+                        # Li et al. (2018) "Hyperband", JMLR 18(185), 1-52:
+                        # каждый следующий бюджет строится поверх предыдущего;
+                        # все кандидаты проходят одинаковую траекторию обучения,
+                        # поэтому ранжирование остаётся корректным.
+                        # Egele et al. (2024) Neurocomputing 562: стабильность
+                        # ранжирования Спирмена сохраняется при последовательном
+                        # дообучении, если warm-start реализован без искажений.
+                        #
+                        # Цепочка: 30%→40%→50%→... вместо повторного обучения с нуля
+                        # на каждом новом A экономит (N_iter - 1) × N_cands прогонов.
+                        _as_scores_a = _as_scores_b          # scores прогона B → новый A
+                        _as_ckpts_a  = _as_ckpts_b            # ckpts прогона B → новый A
+                        _as_ratio_a  = _as_ratio_b            # сдвигаем %
 
                 # Удаляем временные датасеты созданные для автоподбора
                 for _ds in _as_ds_map.values():
