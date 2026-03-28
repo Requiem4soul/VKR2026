@@ -514,6 +514,13 @@ class YOLOWrapper(BaseModelWrapper):
         
         self.last_project_path = Path(project) / name
         
+        # lr параметры: если переданы из вызывающего кода (warm-start),
+        # используем их; иначе дефолтные значения Ultralytics.
+        # Howard & Ruder (2018) ACL: при fine-tuning lr = 1/10 базового.
+        _lr0 = kwargs.get('lr0', 0.01)
+        _lrf = kwargs.get('lrf', 0.01)
+        _warmup_ep = kwargs.get('warmup_epochs', 3.0)
+
         self.results = self.model.train(
             data=str(yaml_path),
             epochs=epochs,
@@ -527,7 +534,10 @@ class YOLOWrapper(BaseModelWrapper):
             workers=1,
             cache=False,
             verbose=False,
-            seed=kwargs.get('seed', 0),   # ← ДОБАВЛЕНО: seed для воспроизводимости YOLO
+            seed=kwargs.get('seed', 0),
+            lr0=_lr0,
+            lrf=_lrf,
+            warmup_epochs=_warmup_ep,
         )
         
         return self.extract_metrics()
@@ -1226,6 +1236,14 @@ class UniversalModelTrainer:
                     batch=model_config.get('batch', -1),
                     imgsz=imgsz,
                     seed=self.seed,
+                    # При warm-start (start_epoch > 0) снижаем lr чтобы не
+                    # разрушить загруженные веса. Дефолтный lr0=0.01 слишком
+                    # агрессивен для дообучения на малом числе эпох.
+                    # Howard & Ruder (2018) ACL: lr = 1/10 базового при fine-tuning.
+                    # Smith (2018) arXiv:1803.09820: lr для transfer learning = lr0/10.
+                    lr0=0.001 if start_epoch > 0 else 0.01,
+                    lrf=0.5 if start_epoch > 0 else 0.01,
+                    warmup_epochs=1.0 if start_epoch > 0 else 3.0,
                 )
             
             elif model_type in ['faster_rcnn', 'retinanet']:

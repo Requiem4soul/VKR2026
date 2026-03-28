@@ -507,7 +507,7 @@ def _run_training(
                 model = YOLO(resume_from)
                 log_fn(
                     f"  [RESUME] YOLO загружен с весов: {os.path.basename(resume_from)}"
-                    f", будет обучено: {epochs} эп."
+                    f", будет обучено: {epochs} эп., lr0=0.001 (fine-tune)"
                 )
             else:
                 model = YOLO(f'yolov8{model_size}.pt')
@@ -527,6 +527,32 @@ def _run_training(
             # epochs — это уже дельта (при warm-start) или полное число (с нуля).
             # Минимум 1 — защита от нулевого запуска.
             epochs_delta = max(1, epochs)
+
+            # ── Определяем lr0 для warm-start ────────────────────────────
+            # При resume=False Ultralytics создаёт оптимизатор заново.
+            # По умолчанию lr0=0.01 — это слишком агрессивно для дообучения:
+            # высокий lr разрушает тонкую настройку загруженных весов,
+            # вызывая хаотичный разброс метрик (наблюдавшийся ρ≈0.2).
+            #
+            # Howard & Ruder (2018) ACL, pp. 328-339: при fine-tuning lr
+            # должен быть значительно ниже начального (1/10 — 1/3).
+            # Smith (2018) "A disciplined approach to neural network
+            # hyper-parameters", arXiv:1803.09820: lr для transfer learning
+            # рекомендуется 1/10 от базового lr0.
+            #
+            # Решение: при warm-start используем lr0=0.001 (1/10 дефолтного
+            # 0.01), lrf=0.5 (lr в конце = lr0*lrf = 0.0005, не падает
+            # до нуля за короткий цикл), warmup_epochs=1.0 (плавный старт).
+            # При обучении с нуля — дефолтные значения Ultralytics.
+            _is_warmstart = bool(resume_from and os.path.exists(resume_from))
+            if _is_warmstart:
+                _lr0 = 0.001       # 1/10 дефолтного 0.01
+                _lrf = 0.5         # final lr = lr0 * lrf = 0.0005
+                _warmup_ep = 1.0   # 1 эпоха warmup для плавного старта
+            else:
+                _lr0 = 0.01        # дефолт Ultralytics
+                _lrf = 0.01        # дефолт Ultralytics
+                _warmup_ep = 3.0   # дефолт Ultralytics
 
             train_kwargs = dict(
                 data=str(yaml_path),
@@ -549,6 +575,10 @@ def _run_training(
                 # total_epochs что были при исходном запуске, что не выполняется
                 # при сравнении разных процентов скрининга.
                 resume=False,
+                # LR параметры: сниженные при warm-start, дефолтные при обучении с нуля.
+                lr0=_lr0,
+                lrf=_lrf,
+                warmup_epochs=_warmup_ep,
             )
             if use_early_stopping:
                 train_kwargs['patience'] = early_stopping_patience
