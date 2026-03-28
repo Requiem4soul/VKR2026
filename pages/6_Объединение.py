@@ -871,10 +871,13 @@ def _run_search(q: queue.Queue, config: Dict):
                                    resume_from_path=resume_from)
                     ckpt_path = m.pop("_ckpt_path", "")
                     sc = score_from_metrics(m)
-                    # При resume берём max(новый score, score прогона A)
-                    # — лучшая эпоха могла быть до точки resume
-                    if resume_from and score_floor > 0:
-                        sc = max(sc, score_floor)
+                    # score_floor здесь не применяется: _train_one уже возвращает
+                    # best по всей истории включая запись прогона A (добавляется
+                    # в metrics_history из чекпоинта перед циклом обучения).
+                    # Применение score_floor поверх этого давало эффект что все
+                    # кандидаты прогона B получали ровно те же scores что прогон A
+                    # (если прогон B не улучшил результат), что приводило к ρ=1.0
+                    # и ложному выводу о достаточности % скрининга.
                     return sc, ckpt_path
                 else:
                     safe_label = label[:20].replace(" ", "_").replace("+", "_")
@@ -1184,7 +1187,16 @@ def _run_search(q: queue.Queue, config: Dict):
                         # score_floor — лучший score прогона A для этого кандидата
                         # гарантирует что resume не даст результат хуже прогона A
                         _floor = _as_scores_a.get(_cand["id"], 0.0)
-                        _sc, _ckpt_b = quick_train_n(_ds, _cand["display"], _as_ep_b,
+                        # Передаём дельту эпох (ep_b - ep_a), а не абсолютное
+                        # число. Ultralytics при warm-start сбрасывает счётчик
+                        # эпох с нуля — train_results[-1] после прогона B
+                        # хранит число эпох текущего запуска, а не суммарное.
+                        # Передавая дельту явно, мы обходим эту проблему:
+                        # функция обучает ровно _as_ep_b - _as_ep_a эпох.
+                        # Li et al. (2018) JMLR 18(185): warm-start SHA
+                        # использует бюджет дополнительных эпох.
+                        _as_ep_delta = _as_ep_b - _as_ep_a
+                        _sc, _ckpt_b = quick_train_n(_ds, _cand["display"], _as_ep_delta,
                                                      resume_from=_resume,
                                                      score_floor=_floor)
                         _as_scores_b[_cand["id"]] = _sc

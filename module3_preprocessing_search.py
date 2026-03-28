@@ -493,44 +493,21 @@ def _run_training(
             # достаточно стартовать с обученных весов для корректного ранжирования.
             # Egele et al. (2024) Neurocomputing 562, art. 126930:
             # ранжирование Спирмена стабильно независимо от формы lr-schedule.
-            resume_start_epoch = 0
+            # При warm-start вызывающий код (quick_train_n) передаёт уже
+            # готовую дельту эпох (ep_b - ep_a), а не абсолютное число.
+            # Это обходит проблему с Ultralytics: при warm-start счётчик
+            # train_results['epoch'] сбрасывается с нуля в каждом запуске,
+            # поэтому читать суммарное число эпох из last.pt ненадёжно.
+            # Решение: передавать дельту явно — тогда epochs_delta = epochs.
+            # При обычном обучении с нуля (resume_from пустой) epochs тоже
+            # является правильным числом эпох.
+            # Li et al. (2018) JMLR 18(185): warm-start SHA использует
+            # бюджет дополнительных эпох, а не абсолютный.
             if resume_from and os.path.exists(resume_from):
-                try:
-                    _meta = torch.load(
-                        resume_from, map_location='cpu', weights_only=False
-                    )
-                    # Ultralytics сохраняет epoch=-1 в финальных весах
-                    # (last.pt / best.pt) и обнуляет optimizer для уменьшения
-                    # размера файла — это намеренное поведение библиотеки.
-                    # Поэтому ckpt['epoch'] всегда -1 и не подходит для
-                    # определения числа обученных эпох.
-                    #
-                    # Правильный способ: читать из train_results['epoch'] —
-                    # список номеров эпох (1-based). Последний элемент даёт
-                    # число обученных эпох. Если train_results недоступен —
-                    # fallback на train_args['epochs'].
-                    _train_results = _meta.get('train_results', {})
-                    _epoch_list = _train_results.get('epoch', [])
-                    if hasattr(_epoch_list, 'tolist'):
-                        _epoch_list = _epoch_list.tolist()
-                    else:
-                        _epoch_list = list(_epoch_list)
-
-                    if _epoch_list:
-                        # train_results['epoch'] — 1-based список (1, 2, ..., N)
-                        resume_start_epoch = int(_epoch_list[-1])
-                    else:
-                        # Fallback: train_args['epochs'] = total epochs запуска
-                        _train_args = _meta.get('train_args', {})
-                        resume_start_epoch = int(_train_args.get('epochs', 0))
-
-                except Exception:
-                    resume_start_epoch = 0
-
                 model = YOLO(resume_from)
                 log_fn(
                     f"  [RESUME] YOLO загружен с весов: {os.path.basename(resume_from)}"
-                    f" (эпох уже обучено: {resume_start_epoch})"
+                    f", будет обучено: {epochs} эп."
                 )
             else:
                 model = YOLO(f'yolov8{model_size}.pt')
@@ -547,17 +524,9 @@ def _run_training(
                 except Exception:
                     imgsz = 640
 
-            # Число дополнительных эпох — именно столько запускаем lr-schedule.
-            # При resume_start_epoch=0 (обучение с нуля): delta == epochs.
-            # При resume_start_epoch=ep_a, epochs=ep_b: delta = ep_b - ep_a.
-            # Минимум 1 — защита от нулевого запуска при граничных случаях.
-            epochs_delta = max(1, epochs - resume_start_epoch)
-            if resume_start_epoch > 0:
-                log_fn(
-                    f"  [RESUME] Запрошено эпох всего: {epochs}, "
-                    f"уже обучено: {resume_start_epoch}, "
-                    f"дополнительных: {epochs_delta}"
-                )
+            # epochs — это уже дельта (при warm-start) или полное число (с нуля).
+            # Минимум 1 — защита от нулевого запуска.
+            epochs_delta = max(1, epochs)
 
             train_kwargs = dict(
                 data=str(yaml_path),
