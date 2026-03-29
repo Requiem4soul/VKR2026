@@ -1370,7 +1370,7 @@ def _run_search(q: queue.Queue, config: Dict):
                         if _as_ratio_c > 100:
                             # Нет места для подтверждающего прогона C — принимаем
                             # без подтверждения (мы уже на 90%+, дальше некуда).
-                            log(f"  ✅ Подтверждающий прогон невозможен ({_as_ratio_b}%+10% > 100%) — "
+                            log(f"  Подтверждающий прогон невозможен ({_as_ratio_b}%+10% > 100%) — "
                                 f"принимаем {_as_ratio_a}% как достаточный.")
                             screening_ratio = _as_ratio_a
                             fast_epochs = _as_ep_a
@@ -1403,7 +1403,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             f"  (ρ_crit={_rho_crit:.4f})")
 
                         if _rho2 >= _rho_crit:
-                            log(f"  ✅ Двойная проверка пройдена — "
+                            log(f"  Двойная проверка пройдена — "
                                 f"ρ₁={_rho:.4f}, ρ₂={_rho2:.4f} ≥ {_rho_crit:.4f}. "
                                 f"Используем {_as_ratio_a}% скрининга.")
                             screening_ratio = _as_ratio_a
@@ -1412,7 +1412,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             _as_found = True
                             break
                         else:
-                            log(f"  ⚠️  Подтверждение не пройдено "
+                            log(f"   Подтверждение не пройдено "
                                 f"(ρ₂={_rho2:.4f} < {_rho_crit:.4f}). "
                                 f"Первая проверка была ложноположительной.")
                             log(f"  Сдвигаемся: прогон C → новый A ({_as_ratio_c}%)")
@@ -1422,7 +1422,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             _as_ckpts_a  = _as_ckpts_c
                             _as_ratio_a  = _as_ratio_c
                     else:
-                        log(f"  ❌ ρ={_rho:.4f} < ρ_crit={_rho_crit:.4f} — "
+                        log(f"  ρ={_rho:.4f} < ρ_crit={_rho_crit:.4f} — "
                             f"увеличиваем до {_as_ratio_b}%")
                         # Следующая итерация: прогон B становится новым прогоном A.
                         # Scores и чекпоинты прогона B переносятся напрямую —
