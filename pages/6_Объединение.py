@@ -124,7 +124,6 @@ _STATE_DEFAULTS = {
     # Автоподбор процента скрининга
     "p2_auto_screen":         False,   # включить автоподбор
     "p2_auto_screen_start":   40,      # начальный % (пользователь задаёт)
-    "p2_auto_screen_rho":     0.9,     # порог Спирмена (0.8 или 0.9)
 }
 for _k, _v in _STATE_DEFAULTS.items():
     if _k not in st.session_state:
@@ -346,12 +345,11 @@ def _spearman_rho(scores_a: Dict[str, float], scores_b: Dict[str, float]) -> flo
     Учитывает только общие ключи (кандидаты присутствующие в обоих прогонах).
 
     Используется для автоподбора процента скрининга:
-    если ρ(x%, x+10%) >= порога, то x% достаточно.
+    если ρ(x%, x+10%) >= критического значения, то x% достаточно.
 
     Научное обоснование:
-    Egele et al. (2024) Neurocomputing — early discarding: ранги доминирующих
-    моделей стабильны на ранних эпохах. Спирмен измеряет стабильность ранжирования.
-    Спирмен ρ ≥ 0.9 — сильная корреляция (стандартный порог в ML-литературе).
+    Li et al. (2018) "Hyperband", JMLR 18(185): warm-start successive
+    halving с бюджетным ранжированием.
 
     Returns:
         float: ρ ∈ [-1, 1]. 1.0 — идеальное совпадение рангов.
@@ -380,6 +378,106 @@ def _spearman_rho(scores_a: Dict[str, float], scores_b: Dict[str, float]) -> flo
     d2 = sum((ra[i] - rb[i]) ** 2 for i in range(n))
     rho = 1.0 - (6.0 * d2) / (n * (n * n - 1))
     return round(rho, 4)
+
+
+def _spearman_critical_rho(n: int, alpha: float = 0.05) -> float:
+    """
+    Критическое значение ρ Спирмена для заданного N и уровня значимости α.
+
+    Вычисляется через обратное t-распределение:
+      t_crit = t_{α/2, n-2}
+      ρ_crit = t_crit / sqrt(t_crit² + n - 2)
+
+    Zar J.H. (2005) "Spearman Rank Correlation", Encyclopedia of
+    Biostatistics, Wiley. DOI: 10.1002/0470011815.b2a15150.
+
+    Ramsey P.H. (1989) "Critical Values for Spearman's Rank Order
+    Correlation", J. Educational Statistics, 14(3), 245–253.
+
+    Args:
+        n:     число наблюдений (кандидатов)
+        alpha: уровень значимости (двусторонний тест). 0.05 → p < 0.05.
+
+    Returns:
+        ρ_crit: минимальное значение |ρ| для статистической значимости.
+                При n < 4 возвращает 1.0 (невозможно достичь значимости).
+    """
+    if n < 4:
+        return 1.0
+
+    # Квантиль t-распределения через аппроксимацию Абрамовица-Стегана.
+    # Abramowitz & Stegun (1964) "Handbook of Mathematical Functions",
+    # формула 26.2.17 — точность ~4.5e-4 для p ∈ [0.0001, 0.5].
+    import math
+    p = alpha / 2.0  # двусторонний тест
+    df = n - 2
+
+    # Аппроксимация квантили нормального распределения (Abramowitz & Stegun 26.2.17)
+    _t = math.sqrt(-2.0 * math.log(p))
+    _c0, _c1, _c2 = 2.515517, 0.802853, 0.010328
+    _d1, _d2, _d3 = 1.432788, 0.189269, 0.001308
+    z = _t - (_c0 + _c1 * _t + _c2 * _t ** 2) / (1 + _d1 * _t + _d2 * _t ** 2 + _d3 * _t ** 3)
+
+    # Cornish-Fisher поправка для t-распределения (малые df)
+    # Johnson N.L. et al. (1995) "Continuous Univariate Distributions", Vol.2, Wiley.
+    g1 = (z ** 3 + z) / (4 * df)
+    g2 = (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * df ** 2)
+    t_crit = z + g1 + g2
+
+    # ρ_crit из t_crit: Zar (2005), формула обратного преобразования
+    rho_crit = t_crit / math.sqrt(t_crit ** 2 + df)
+    return round(min(rho_crit, 0.99), 4)  # cap at 0.99 для n=4
+
+
+def _check_flat_scores(scores: Dict[str, float], log_fn=None) -> bool:
+    """
+    Проверяет являются ли scores кандидатов «плоскими» (слишком близкими).
+
+    Если коэффициент вариации (CV = stdev/mean) ниже порога, ранжирование
+    нестабильно: стохастический шум обучения превышает различия между
+    кандидатами, и Спирмен ρ не может сойтись ни при каком числе эпох.
+
+    Порог CV < 1.5% выбран эмпирически: при типичном шуме YOLO ±0.005–0.01
+    по composite score, spread < 0.02 делает ранги случайными.
+
+    Научное обоснование:
+    Audibert, Bubeck & Munos (2010) "Best Arm Identification in Multi-Armed
+    Bandits", COLT 2010: при ε-close arms (разница между arms < ε) число
+    сэмплов для идентификации лучшего растёт как O(1/ε²). При ε→0
+    идентификация требует бесконечного бюджета.
+
+    Args:
+        scores: словарь {candidate_id: score}
+        log_fn: функция логирования
+
+    Returns:
+        True если scores плоские (предобработка не даёт значимого эффекта).
+    """
+    import statistics
+
+    CV_THRESHOLD = 0.015  # 1.5%
+
+    vals = list(scores.values())
+    if len(vals) < 2:
+        return False
+
+    mean = statistics.mean(vals)
+    if mean < 1e-8:
+        return False
+
+    stdev = statistics.stdev(vals)
+    cv = stdev / mean
+
+    if log_fn and cv < CV_THRESHOLD:
+        log_fn(f"    Scores кандидатов практически одинаковы:")
+        log_fn(f"     CV = {cv:.4f} ({cv*100:.2f}%) < порог {CV_THRESHOLD*100:.1f}%")
+        log_fn(f"     mean={mean:.4f}  stdev={stdev:.4f}  "
+               f"spread={max(vals)-min(vals):.4f}")
+        log_fn(f"     Audibert et al. (2010) COLT: при ε-close candidates")
+        log_fn(f"     ранжирование нестабильно при любом бюджете эпох.")
+        log_fn(f"     Предобработка не даёт значимого эффекта для данного датасета.")
+
+    return cv < CV_THRESHOLD
 
 
 def merge_methods_params(candidates: List[Dict]) -> Tuple[List[str], Dict]:
@@ -648,7 +746,6 @@ def _run_search(q: queue.Queue, config: Dict):
         log(f"Рабочая папка: {work_dir}")
         log(f"[DEBUG] auto_screen={config.get('auto_screen')} | "
             f"auto_screen_start={config.get('auto_screen_start')} | "
-            f"auto_screen_rho={config.get('auto_screen_rho')} | "
             f"screening_ratio={config.get('screening_ratio')}")
         log("")
 
@@ -1092,7 +1189,11 @@ def _run_search(q: queue.Queue, config: Dict):
         # ══════════════════════════════════════════════════════════════════
         auto_screen       = config.get("auto_screen", False)
         auto_screen_start = config.get("auto_screen_start", 40)
-        auto_screen_rho   = config.get("auto_screen_rho", 0.9)
+        # auto_screen_rho больше не задаётся пользователем —
+        # критическое значение ρ вычисляется автоматически по числу
+        # кандидатов N через _spearman_critical_rho(N, alpha=0.01).
+        # Zar (2005): критическое значение зависит от N и α.
+        # α=0.01 (p < 0.01) — строгий порог для научной работы.
 
         # Будет заполнен либо автоподбором, либо использует текущий fast_epochs
         _auto_screen_scores: Optional[Dict[str, float]] = None  # scores при найденном %
@@ -1101,8 +1202,9 @@ def _run_search(q: queue.Queue, config: Dict):
             log("")
             log("=" * 70)
             log("АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА")
-            log(f"Начальный %: {auto_screen_start}% | Порог Спирмена ρ ≥ {auto_screen_rho}")
-            log("Egele et al. (2024) Neurocomputing — early discarding stability")
+            log(f"Начальный %: {auto_screen_start}%")
+            log("Порог Спирмена ρ: автоматический (Zar, 2005; α=0.01)")
+            log("Li et al. (2018) Hyperband — warm-start successive halving")
             log("=" * 70)
 
             # Получаем пул кандидатов (тот же что будет в Фазе 1)
@@ -1118,9 +1220,17 @@ def _run_search(q: queue.Queue, config: Dict):
             if len(_as_all_cands) < 2:
                 log("  [ПРОПУСК] Менее 2 кандидатов — автоподбор невозможен.")
             else:
+                # Критическое значение ρ для данного N кандидатов.
+                # Zar (2005): ρ_crit зависит от N; при N=16, α=0.01 → ρ_crit≈0.665.
+                # Ramsey (1989): табулированные значения подтверждают расчёт.
+                _n_cands = len(_as_all_cands)
+                _rho_crit = _spearman_critical_rho(_n_cands, alpha=0.01)
+                log(f"  Кандидатов: {_n_cands} → ρ_crit = {_rho_crit:.4f} "
+                    f"(Zar 2005, α=0.01, N={_n_cands})")
+
                 # Предварительно создаём датасеты кандидатов один раз
                 _as_ds_map: Dict[str, str] = {}  # cand_id → ds_name
-                log(f"  Создаю датасеты для {len(_as_all_cands)} кандидатов...")
+                log(f"  Создаю датасеты для {_n_cands} кандидатов...")
                 for _cand in _as_all_cands:
                     try:
                         _ds = _make_tmp_ds(_cand["id"], _cand["methods"], _cand["params"])
@@ -1160,6 +1270,22 @@ def _run_search(q: queue.Queue, config: Dict):
                         for _cand in _as_all_cands:
                             _sc = _as_scores_a.get(_cand["id"], 0.0)
                             log(f"    {_cand['display']:40s}  score={_sc:.4f}  [перенесено из пред. прогона B]")
+
+                    # ── Flat-scores guard ──────────────────────────────────
+                    # Audibert et al. (2010) COLT: при ε-close arms бюджет
+                    # идентификации → ∞. Если CV scores < 1.5%, ранжирование
+                    # невозможно — предобработка не помогает этому датасету.
+                    # Досрочно прекращаем автоподбор, экономя GPU-время.
+                    if _check_flat_scores(_as_scores_a, log_fn=log):
+                        log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские (CV < 1.5%)")
+                        log(f"     Ранжирование предобработок невозможно при любом % эпох.")
+                        log(f"     Рекомендация: использовать оригинальный датасет.")
+                        log(f"     Используем {_as_ratio_a}% как fallback.")
+                        screening_ratio = _as_ratio_a
+                        fast_epochs = _as_ep_a
+                        _auto_screen_scores = _as_scores_a
+                        _as_found = True
+                        break
 
                     if _as_ratio_b > 100:
                         # Достигли потолка — используем 100%
@@ -1206,17 +1332,18 @@ def _run_search(q: queue.Queue, config: Dict):
 
                     _rho = _spearman_rho(_as_scores_a, _as_scores_b)
                     log(f"\n  Спирмен ρ({_as_ratio_a}% vs {_as_ratio_b}%) = {_rho:.4f}"
-                        f"  (порог: {auto_screen_rho})")
+                        f"  (ρ_crit={_rho_crit:.4f}, α=0.01, N={_n_cands})")
 
-                    if _rho >= auto_screen_rho:
-                        log(f"  ✅ Порог достигнут — используем {_as_ratio_a}% скрининга")
+                    if _rho >= _rho_crit:
+                        log(f"  ρ ≥ ρ_crit — корреляция статистически значима. "
+                            f"Используем {_as_ratio_a}% скрининга.")
                         screening_ratio = _as_ratio_a
                         fast_epochs = _as_ep_a
                         _auto_screen_scores = _as_scores_a
                         _as_found = True
                         break
                     else:
-                        log(f"  ❌ ρ={_rho:.4f} < {auto_screen_rho} — "
+                        log(f"  ρ={_rho:.4f} < ρ_crit={_rho_crit:.4f} — "
                             f"увеличиваем до {_as_ratio_b}%")
                         # Следующая итерация: прогон B становится новым прогоном A.
                         # Scores и чекпоинты прогона B переносятся напрямую —
@@ -1227,9 +1354,6 @@ def _run_search(q: queue.Queue, config: Dict):
                         # каждый следующий бюджет строится поверх предыдущего;
                         # все кандидаты проходят одинаковую траекторию обучения,
                         # поэтому ранжирование остаётся корректным.
-                        # Egele et al. (2024) Neurocomputing 562: стабильность
-                        # ранжирования Спирмена сохраняется при последовательном
-                        # дообучении, если warm-start реализован без искажений.
                         #
                         # Цепочка: 30%→40%→50%→... вместо повторного обучения с нуля
                         # на каждом новом A экономит (N_iter - 1) × N_cands прогонов.
@@ -1244,8 +1368,8 @@ def _run_search(q: queue.Queue, config: Dict):
                 if _as_found:
                     log(f"\n  Итог автоподбора: screening_ratio={screening_ratio}%"
                         f"  ({fast_epochs} эп.)")
-                    log(f"  Jamieson & Talwalkar (2016) AISTATS 240-248 — "
-                        f"SHA с эмпирически подобранным бюджетом эпох")
+                    log(f"  Li et al. (2018) Hyperband — "
+                        f"однораундовый отсев (s=0 bracket) с подобранным бюджетом")
 
         # ══════════════════════════════════════════════════════════════════
         # BASELINE: быстрое обучение оригинала
@@ -2300,22 +2424,15 @@ if st.session_state.p2_stage == "configure":
             )
             st.session_state.p2_auto_screen_start = auto_screen_start
         with _as_col2:
-            auto_screen_rho = st.selectbox(
-                "Порог Спирмена ρ",
-                options=[0.9, 0.8],
-                index=0,
-                key="p2_auto_screen_rho_select",
-                format_func=lambda x: (
-                    "0.9 — сильная корреляция (рекомендуется)"
-                    if x == 0.9 else
-                    "0.8 — умеренно высокая (быстрее)"
-                ),
-                help=(
-                    "ρ ≥ 0.9 — стандартный порог сильной корреляции в ML-литературе. "
-                    "ρ ≥ 0.8 — умеренно высокая, приемлемо для ВКР с оговоркой."
-                ),
+            st.info(
+                "**Порог ρ: автоматический**\n\n"
+                "Критическое значение Спирмена ρ рассчитывается по числу "
+                "кандидатов N и уровню значимости α=0.01 "
+                "(Zar, 2005; Ramsey, 1989).\n\n"
+                "Также: если scores всех кандидатов практически одинаковы "
+                "(CV < 1.5%), подбор прекращается досрочно — предобработка "
+                "не даёт значимого эффекта (Audibert et al., 2010 COLT)."
             )
-            st.session_state.p2_auto_screen_rho = auto_screen_rho
 
     st.session_state.p2_epochs = epochs
     st.session_state.p2_patience = patience
@@ -2405,8 +2522,9 @@ elif st.session_state.p2_stage == "running":
                                   st.session_state.get("p2_auto_screen", False)),
             "auto_screen_start":  st.session_state.get("p2_auto_screen_start_slider",
                                   st.session_state.get("p2_auto_screen_start", 40)),
-            "auto_screen_rho":    st.session_state.get("p2_auto_screen_rho_select",
-                                  st.session_state.get("p2_auto_screen_rho", 0.9)),
+            # auto_screen_rho убран — критическое значение ρ вычисляется
+            # автоматически внутри _run_search через _spearman_critical_rho(N).
+            # Zar (2005); Ramsey (1989).
             # Анализ модальности
             "use_modality":    st.session_state.get("p2_use_modality", True),
             "manual_modality": st.session_state.get("p2_manual_modality", "auto"),

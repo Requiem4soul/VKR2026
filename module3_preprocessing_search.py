@@ -40,15 +40,18 @@ FAST_EPOCHS_RATIO = 0.30  # 30% эпох для быстрого обучени�
 
 def composite_score(metrics: Dict[str, float]) -> float:
     """
-    Взвешенная метрика для ранжирования кандидатов.
-    Повторяет логику EarlyModelSelector из Модуля 2.
-    Lin et al. (2014) COCO.
+    Взвешенная метрика для ранжирования кандидатов детекции.
+
+    Веса отражают приоритет mAP50-95 как основной метрики COCO
+    (Lin et al., 2014), с дополнением mAP50 и F1 для робастности
+    ранжирования при close scores.
+
+    Формула унифицирована с score_from_metrics (6_Объединение.py).
     """
     return (
-        0.40 * metrics.get('mAP50-95', 0.0)
-      + 0.30 * metrics.get('mAP50',    0.0)
+        0.45 * metrics.get('mAP50-95', 0.0)
+      + 0.35 * metrics.get('mAP50',    0.0)
       + 0.20 * metrics.get('f1',       0.0)
-      + 0.10 * (1.0 / (1.0 + metrics.get('val_loss', 1.0)))
     )
 
 
@@ -363,7 +366,7 @@ def train_candidate_fast(
 ) -> Dict[str, float]:
     """
     Обучает proxy-модель на предобработанном датасете.
-    Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1', 'val_loss'}.
+    Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1'}.
     Использует механизм очистки памяти из Модуля 2.
 
     ВАЖНО: tmp_dataset удаляется только ПОСЛЕ того как _run_training полностью
@@ -376,7 +379,7 @@ def train_candidate_fast(
     tmp_dataset = work_dir / f'tmp_ds_{candidate_idx}'
     result_dir = work_dir / f'train_{candidate_idx}'
 
-    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0, 'val_loss': 1.0}
+    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
 
     try:
         log_fn(f"    Подготовка датасета: {pipeline.display_name}")
@@ -403,7 +406,7 @@ def train_candidate_fast(
     except Exception as e:
         log_fn(f"    [ERROR] Ошибка обучения кандидата {candidate_name}: {e}")
         log_fn(traceback.format_exc())
-        metrics = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0, 'val_loss': 1.0}
+        metrics = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
 
     finally:
         # Очищаем GPU-память
@@ -437,7 +440,7 @@ def _run_training(
 ) -> Dict[str, float]:
     """
     Запускает обучение через wrapper'ы из Модуля 2.
-    Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1', 'val_loss'}.
+    Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1'}.
 
     resume_from: путь к last.pt для warm-start (YOLO).
         Если указан и файл существует — загружает веса как инициализацию.
@@ -470,7 +473,7 @@ def _run_training(
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_type = model_config.get('type', 'yolo')
-    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0, 'val_loss': 1.0}
+    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
 
     try:
         if model_type == 'yolo':
@@ -610,10 +613,6 @@ def _run_training(
             _pre = float(val_dict.get('metrics/precision(B)', 0.0))
             _rec = float(val_dict.get('metrics/recall(B)', 0.0))
             f1 = 2 * _pre * _rec / (_pre + _rec) if (_pre + _rec) > 0 else 0.0
-            val_loss = float(
-                train_metrics_dict.get('val/box_loss',
-                train_metrics_dict.get('val/cls_loss', 1.0))
-            )
 
             metrics = {
                 'mAP50-95':  map5095,
@@ -621,7 +620,6 @@ def _run_training(
                 'f1':        f1,
                 'precision': _pre,
                 'recall':    _rec,
-                'val_loss':  val_loss,
                 '_ckpt_path': str(result_dir / 'run' / 'weights' / 'last.pt'),
             }
 
@@ -748,7 +746,6 @@ def _run_training(
                 'mAP50-95': float(val_metrics.get('mAP50-95', 0.0)),
                 'mAP50':    float(val_metrics.get('mAP50',    0.0)),
                 'f1':       float(val_metrics.get('f1',       0.0)),
-                'val_loss': float(val_metrics.get('val_loss', 1.0)),
                 # Путь к чекпоинту для warm-start следующего прогона.
                 # При keep_weights=False файл не создаётся — пустая строка.
                 '_ckpt_path': str(result_dir / 'checkpoint_det.pt') if keep_weights else '',
@@ -757,13 +754,13 @@ def _run_training(
             del wrapper, train_loader, val_loader
 
         log_fn(f"    mAP50-95={metrics['mAP50-95']:.4f}  mAP50={metrics['mAP50']:.4f}  "
-               f"f1={metrics['f1']:.4f}  val_loss={metrics['val_loss']:.4f}  "
+               f"f1={metrics['f1']:.4f}  "
                f"[split={eval_split}]")
 
     except Exception as e:
         log_fn(f"    [ERROR] Ошибка при обучении: {e}")
         log_fn(traceback.format_exc())
-        metrics = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0, 'val_loss': 1.0}
+        metrics = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
 
     finally:
         if torch.cuda.is_available():
@@ -808,7 +805,7 @@ def _run_training_final(
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_type = model_config.get('type', 'yolo')
-    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0, 'val_loss': 1.0}
+    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
 
     try:
         if model_type == 'yolo':
@@ -862,10 +859,6 @@ def _run_training_final(
             _pre = float(val_dict.get('metrics/precision(B)', 0.0))
             _rec = float(val_dict.get('metrics/recall(B)', 0.0))
             f1 = 2 * _pre * _rec / (_pre + _rec) if (_pre + _rec) > 0 else 0.0
-            val_loss = float(
-                train_metrics_dict.get('val/box_loss',
-                train_metrics_dict.get('val/cls_loss', 1.0))
-            )
 
             metrics = {
                 'mAP50-95':  map5095,
@@ -873,7 +866,6 @@ def _run_training_final(
                 'f1':        f1,
                 'precision': _pre,
                 'recall':    _rec,
-                'val_loss':  val_loss,
             }
 
             del model, results, eval_model, val_res
@@ -921,19 +913,18 @@ def _run_training_final(
                 'mAP50-95': float(val_metrics.get('mAP50-95', 0.0)),
                 'mAP50':    float(val_metrics.get('mAP50',    0.0)),
                 'f1':       float(val_metrics.get('f1',       0.0)),
-                'val_loss': float(val_metrics.get('val_loss', 1.0)),
             }
 
             del wrapper, train_loader, val_loader
 
         log_fn(f"    [ФИНАЛ] mAP50-95={metrics['mAP50-95']:.4f}  mAP50={metrics['mAP50']:.4f}  "
-               f"f1={metrics['f1']:.4f}  val_loss={metrics['val_loss']:.4f}  "
+               f"f1={metrics['f1']:.4f}  "
                f"[split={eval_split}]")
 
     except Exception as e:
         log_fn(f"    [ERROR] Ошибка при финальном обучении: {e}")
         log_fn(traceback.format_exc())
-        metrics = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0, 'val_loss': 1.0}
+        metrics = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
 
     finally:
         if torch.cuda.is_available():
@@ -1257,7 +1248,6 @@ def run_sfs_sha_search(
     log_fn(f"mAP50-95 (test): {final_map:.4f}")
     log_fn(f"mAP50    (test): {final_metrics.get('mAP50', 0.0):.4f}")
     log_fn(f"f1       (test): {final_metrics.get('f1', 0.0):.4f}")
-    log_fn(f"val_loss (test): {final_metrics.get('val_loss', 0.0):.4f}")
     log_fn(f"Причина стопа:   {stop_reason}")
     log_fn(f"Датасет-победитель: {winner_dataset_path}")
     log_fn("=" * 70)
