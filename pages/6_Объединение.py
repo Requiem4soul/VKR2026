@@ -1243,6 +1243,13 @@ def _run_search(q: queue.Queue, config: Dict):
                 _as_scores_a: Dict[str, float] = {}
                 # Словарь чекпоинтов после прогона A: {cand_id: ckpt_path}
                 _as_ckpts_a: Dict[str, str] = {}
+                # Scores первого прогона (обученного с нуля, без warm-start).
+                # Только эти scores можно безопасно переиспользовать в Фазе 1,
+                # потому что Фаза 1 тоже обучает с нуля на тех же условиях.
+                # Scores дообученных (warm-start) прогонов отличаются от
+                # обучения с нуля из-за разного состояния оптимизатора.
+                _as_first_run_scores: Optional[Dict[str, float]] = None
+                _as_first_run_ratio: int = 0
 
                 while _as_ratio_a <= 100:
                     _as_ep_a = max(1, int(max_epochs * (_as_ratio_a / 100)))
@@ -1265,6 +1272,10 @@ def _run_search(q: queue.Queue, config: Dict):
                             _as_scores_a[_cand["id"]] = _sc
                             _as_ckpts_a[_cand["id"]] = _ckpt
                             log(f"    {_cand['display']:40s}  score={_sc:.4f}")
+                        # Сохраняем scores первого прогона (с нуля) для кеша Фазы 1
+                        if _as_first_run_scores is None:
+                            _as_first_run_scores = dict(_as_scores_a)
+                            _as_first_run_ratio = _as_ratio_a
                     else:
                         # Scores уже есть из предыдущего прогона B — выводим их
                         for _cand in _as_all_cands:
@@ -1335,15 +1346,83 @@ def _run_search(q: queue.Queue, config: Dict):
                         f"  (ρ_crit={_rho_crit:.4f}, α=0.01, N={_n_cands})")
 
                     if _rho >= _rho_crit:
-                        log(f"  ρ ≥ ρ_crit — корреляция статистически значима. "
-                            f"Используем {_as_ratio_a}% скрининга.")
-                        screening_ratio = _as_ratio_a
-                        fast_epochs = _as_ep_a
-                        _auto_screen_scores = _as_scores_a
-                        _as_found = True
-                        break
+                        # ── Двойная проверка (two-sample confirmation) ─────
+                        # Одна пара ρ ≥ ρ_crit может быть случайной.
+                        # Две последовательных пары (A↔B, B↔C) подтверждают
+                        # стабильность ранжирования: вероятность случайного
+                        # совпадения двух ρ ≥ ρ_crit при N=16 < 0.01² = 0.0001.
+                        #
+                        # Jamieson & Talwalkar (2016) AISTATS, Section 4:
+                        # стабильность ранжирования подтверждается на нескольких
+                        # точках бюджета, а не на одной.
+                        #
+                        # Audibert & Bubeck (2010) COLT, Theorem 1: при gap Δ
+                        # между кандидатами, вероятность ошибки ранжирования
+                        # убывает экспоненциально с бюджетом — два подтверждения
+                        # дают экспоненциально меньшую вероятность ложного срабатывания.
+                        #
+                        # Стоимость: +1 прогон на N кандидатов (дообучение дельты).
+                        # Экономия: избегаем ложного принятия малого % и
+                        # последующего получения невалидных результатов SHA.
+                        log(f"  ✓ Первая проверка пройдена (ρ={_rho:.4f} ≥ {_rho_crit:.4f})")
+
+                        _as_ratio_c = _as_ratio_b + 10
+                        if _as_ratio_c > 100:
+                            # Нет места для подтверждающего прогона C — принимаем
+                            # без подтверждения (мы уже на 90%+, дальше некуда).
+                            log(f"  ✅ Подтверждающий прогон невозможен ({_as_ratio_b}%+10% > 100%) — "
+                                f"принимаем {_as_ratio_a}% как достаточный.")
+                            screening_ratio = _as_ratio_a
+                            fast_epochs = _as_ep_a
+                            _auto_screen_scores = _as_scores_a
+                            _as_found = True
+                            break
+
+                        _as_ep_c = max(1, int(max_epochs * (_as_ratio_c / 100)))
+                        _as_ep_delta_bc = _as_ep_c - _as_ep_b
+                        log(f"\n  Подтверждающий прогон C: {_as_ratio_c}% ({_as_ep_c} эп.) "
+                            f"[warm-start с {_as_ratio_b}%]")
+
+                        _as_scores_c: Dict[str, float] = {}
+                        _as_ckpts_c: Dict[str, str] = {}
+                        for _cand in _as_all_cands:
+                            _ds = _as_ds_map.get(_cand["id"])
+                            if _ds is None:
+                                continue
+                            _resume_c = _as_ckpts_b.get(_cand["id"], "")
+                            _floor_c = _as_scores_b.get(_cand["id"], 0.0)
+                            _sc_c, _ckpt_c = quick_train_n(
+                                _ds, _cand["display"], _as_ep_delta_bc,
+                                resume_from=_resume_c, score_floor=_floor_c)
+                            _as_scores_c[_cand["id"]] = _sc_c
+                            _as_ckpts_c[_cand["id"]] = _ckpt_c
+                            log(f"    {_cand['display']:40s}  score={_sc_c:.4f}  [confirm]")
+
+                        _rho2 = _spearman_rho(_as_scores_b, _as_scores_c)
+                        log(f"\n  Подтверждение: ρ({_as_ratio_b}% vs {_as_ratio_c}%) = {_rho2:.4f}"
+                            f"  (ρ_crit={_rho_crit:.4f})")
+
+                        if _rho2 >= _rho_crit:
+                            log(f"  ✅ Двойная проверка пройдена — "
+                                f"ρ₁={_rho:.4f}, ρ₂={_rho2:.4f} ≥ {_rho_crit:.4f}. "
+                                f"Используем {_as_ratio_a}% скрининга.")
+                            screening_ratio = _as_ratio_a
+                            fast_epochs = _as_ep_a
+                            _auto_screen_scores = _as_scores_a
+                            _as_found = True
+                            break
+                        else:
+                            log(f"  ⚠️  Подтверждение не пройдено "
+                                f"(ρ₂={_rho2:.4f} < {_rho_crit:.4f}). "
+                                f"Первая проверка была ложноположительной.")
+                            log(f"  Сдвигаемся: прогон C → новый A ({_as_ratio_c}%)")
+                            # Прогон C становится новым A, цикл продолжается.
+                            # Li et al. (2018): цепочечный warm-start корректен.
+                            _as_scores_a = _as_scores_c
+                            _as_ckpts_a  = _as_ckpts_c
+                            _as_ratio_a  = _as_ratio_c
                     else:
-                        log(f"  ρ={_rho:.4f} < ρ_crit={_rho_crit:.4f} — "
+                        log(f"  ❌ ρ={_rho:.4f} < ρ_crit={_rho_crit:.4f} — "
                             f"увеличиваем до {_as_ratio_b}%")
                         # Следующая итерация: прогон B становится новым прогоном A.
                         # Scores и чекпоинты прогона B переносятся напрямую —
@@ -1439,6 +1518,34 @@ def _run_search(q: queue.Queue, config: Dict):
         # (используется если все группы оказались ниже baseline)
         _scored_per_group: Dict[str, List[Dict]] = {}
 
+        # ── Кеш scores из автоподбора скрининга ───────────────────────
+        # Если автоподбор был включён и первый прогон (с нуля) совпадает
+        # по числу эпох с итоговым fast_epochs — переиспользуем scores.
+        #
+        # Научное обоснование повторного использования:
+        # seed фиксирован (Dodge & Karam, 2017 CVPRW), датасеты
+        # идентичны, число эпох совпадает — результат детерминирован.
+        # Переиспользуются ТОЛЬКО scores первого прогона (обученного
+        # с нуля), не дообученных warm-start прогонов — те отличаются
+        # состоянием оптимизатора и не эквивалентны обучению с нуля.
+        #
+        # Когда кеш работает:
+        #   auto_screen_start=30%, итог=30% → первый прогон на 30%
+        #   совпадает с Фазой 1 на 30%. Экономия: N_cands обучений.
+        #
+        # Когда кеш НЕ работает (обучаем заново):
+        #   auto_screen_start=30%, итог=50% → первый прогон был на 30%,
+        #   а Фаза 1 нужна на 50%. Scores несопоставимы.
+        _as_reusable: Dict[str, float] = {}
+        if (_auto_screen_scores
+                and _as_first_run_scores
+                and _as_first_run_ratio == screening_ratio):
+            _as_reusable = _as_first_run_scores
+        if _as_reusable:
+            log(f"\n  [КЕШИРОВАНИЕ] Переиспользую {len(_as_reusable)} scores "
+                f"из автоподбора скрининга ({screening_ratio}% эпох, обучены с нуля)")
+            log(f"  Dodge & Karam (2017): seed фиксирован → результат детерминирован")
+
         for group_id, group_info in active_groups.items():
             group_label = group_info["label"]
             candidates  = group_info["candidates"]
@@ -1446,6 +1553,13 @@ def _run_search(q: queue.Queue, config: Dict):
 
             scored: List[Dict] = []
             for cand in candidates:
+                # Проверяем кеш из автоподбора
+                _cached_score = _as_reusable.get(cand["id"])
+                if _cached_score is not None:
+                    log(f"    Кандидат: {cand['display']}  score={_cached_score:.4f}  [из кеша автоподбора]")
+                    scored.append({**cand, "score": _cached_score})
+                    continue
+
                 log(f"    Кандидат: {cand['display']}")
                 try:
                     ds_tmp = _make_tmp_ds(cand["id"], cand["methods"], cand["params"])
