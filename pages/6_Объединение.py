@@ -511,23 +511,35 @@ def merge_methods_params(candidates: List[Dict]) -> Tuple[List[str], Dict]:
 
 def score_from_metrics(metrics: Dict) -> float:
     """
-    Вычисляет скалярную оценку из метрик классификации или детекции.
-    Для классификации: AUC (приоритет) или ACC.
-    Для детекции: взвешенная сумма mAP метрик.
+    Скалярная оценка для ранжирования кандидатов предобработки.
+
+    Используется одна метрика — стандарт соответствующей задачи:
+
+    Классификация: AUC (Area Under ROC Curve).
+      Huang & Ling (2005) "Using AUC and Accuracy in Evaluating Learning
+      Algorithms", IEEE TKDE, 17(3): AUC консистентнее и дискриминативнее
+      Accuracy для сравнения моделей. Инвариантен к порогу и дисбалансу.
+      Bradley (1997) Pattern Recognition, 30(7): AUC предпочтительнее
+      для ранжирования классификаторов.
+
+    Детекция: mAP50-95 (COCO primary metric).
+      Lin et al. (2014) "Microsoft COCO", ECCV: mAP усреднённый по IoU
+      от 0.50 до 0.95 — основная метрика для ранжирования детекторов.
+      Используется во всех крупных бенчмарках (COCO, LVIS, Open Images).
+
+    Остальные метрики (mAP50, F1, precision, recall, accuracy)
+    сохраняются в метриках и отображаются в таблицах результатов,
+    но не участвуют в ранжировании.
     """
     if metrics is None:
         return 0.0
-    # Классификация
+    # Классификация — AUC
     if "val_auc" in metrics:
-        return 0.6 * metrics.get("val_auc", 0.0) + 0.4 * metrics.get("val_acc", 0.0)
+        return float(metrics.get("val_auc", 0.0))
     if "auc" in metrics:
-        return 0.6 * metrics.get("auc", 0.0) + 0.4 * metrics.get("acc", 0.0)
-    # Детекция (аналог composite_score из module3)
-    return (
-        0.45 * metrics.get("mAP50-95", 0.0)
-        + 0.35 * metrics.get("mAP50", 0.0)
-        + 0.20 * metrics.get("f1", 0.0)
-    )
+        return float(metrics.get("auc", 0.0))
+    # Детекция — mAP50-95
+    return float(metrics.get("mAP50-95", 0.0))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2825,7 +2837,7 @@ elif st.session_state.p2_stage == "done":
                 b_score = result.get("baseline_score", 0.0)
                 table2_rows = [
                     {
-                        "Метрика":    "Score  (0.6×AUC + 0.4×ACC)",
+                        "Метрика":    "Score  (AUC)",
                         "Baseline":   _fmt(b_score),
                         "Победитель": _fmt(w_score),
                         "Δ":          _delta_fmt(w_score, b_score),
@@ -2882,7 +2894,7 @@ elif st.session_state.p2_stage == "done":
                 b_score = result.get("baseline_score", 0.0)
                 table2_rows = [
                     {
-                        "Метрика":    "Score  (0.45×mAP50-95 + 0.35×mAP50 + 0.2×F1)",
+                        "Метрика":    "Score  (mAP50-95)",
                         "Baseline":   _fmt(b_score),
                         "Победитель": _fmt(w_score),
                         "Δ":          _delta_fmt(w_score, b_score),
