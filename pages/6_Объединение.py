@@ -1262,6 +1262,9 @@ def _run_search(q: queue.Queue, config: Dict):
                 # обучения с нуля из-за разного состояния оптимизатора.
                 _as_first_run_scores: Optional[Dict[str, float]] = None
                 _as_first_run_ratio: int = 0
+                # Счётчик последовательных прогонов с CV < порога.
+                # Flat-scores guard срабатывает при ≥2 подряд.
+                _consecutive_flat: int = 0
 
                 while _as_ratio_a <= 100:
                     _as_ep_a = max(1, int(max_epochs * (_as_ratio_a / 100)))
@@ -1294,21 +1297,42 @@ def _run_search(q: queue.Queue, config: Dict):
                             _sc = _as_scores_a.get(_cand["id"], 0.0)
                             log(f"    {_cand['display']:40s}  score={_sc:.4f}  [перенесено из пред. прогона B]")
 
-                    # ── Flat-scores guard ──────────────────────────────────
-                    # Audibert et al. (2010) COLT: при ε-close arms бюджет
-                    # идентификации → ∞. Если CV scores < 1.5%, ранжирование
-                    # невозможно — предобработка не помогает этому датасету.
-                    # Досрочно прекращаем автоподбор, экономя GPU-время.
-                    if _check_flat_scores(_as_scores_a, log_fn=log):
-                        log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские (CV < 1.5%)")
-                        log(f"     Ранжирование предобработок невозможно при любом % эпох.")
-                        log(f"     Рекомендация: использовать оригинальный датасет.")
-                        log(f"     Используем {_as_ratio_a}% как fallback.")
-                        screening_ratio = _as_ratio_a
-                        fast_epochs = _as_ep_a
-                        _auto_screen_scores = _as_scores_a
-                        _as_found = True
-                        break
+                    # ── Flat-scores guard (двойная проверка) ─────────────
+                    # CV < порога на одном прогоне может быть следствием
+                    # малого бюджета эпох (модель ещё не различает кандидатов).
+                    # Но если CV < порога на двух последовательных бюджетах —
+                    # spread не растёт с увеличением эпох, и ранжирование
+                    # действительно нестабильно на данном датасете.
+                    #
+                    # Audibert et al. (2010) COLT: при ε-close arms
+                    # идентификация требует O(1/ε²) сэмплов. Если ε не
+                    # растёт при увеличении бюджета — ε→0, бюджет → ∞.
+                    # Два подряд flat = подтверждение что gap не растёт.
+                    _is_flat_a = _check_flat_scores(_as_scores_a, log_fn=None)
+                    if _is_flat_a:
+                        _consecutive_flat += 1
+                        if _consecutive_flat >= 2:
+                            _check_flat_scores(_as_scores_a, log_fn=log)
+                            log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские на двух "
+                                f"последовательных бюджетах (CV < 1.5%)")
+                            log(f"     Gap между кандидатами не растёт при увеличении эпох.")
+                            log(f"     Audibert et al. (2010): ранжирование невозможно "
+                                f"при любом бюджете.")
+                            log(f"     Рекомендация: использовать оригинальный датасет.")
+                            log(f"     Используем {_as_ratio_a}% как fallback.")
+                            screening_ratio = _as_ratio_a
+                            fast_epochs = _as_ep_a
+                            _auto_screen_scores = _as_scores_a
+                            _as_found = True
+                            break
+                        else:
+                            import statistics as _st
+                            _vals = list(_as_scores_a.values())
+                            _cv = _st.stdev(_vals) / _st.mean(_vals) if _st.mean(_vals) > 0 else 0
+                            log(f"\n  [INFO] CV={_cv:.4f} ({_cv*100:.2f}%) < 1.5% на {_as_ratio_a}% — "
+                                f"возможно малый бюджет. Продолжаем для подтверждения.")
+                    else:
+                        _consecutive_flat = 0  # сброс — spread вырос
 
                     if _as_ratio_b > 100:
                         # Достигли потолка — используем 100%
@@ -2555,9 +2579,10 @@ if st.session_state.p2_stage == "configure":
                 "Критическое значение Спирмена ρ рассчитывается по числу "
                 "кандидатов N и уровню значимости α=0.01 "
                 "(Zar, 2005; Ramsey, 1989).\n\n"
-                "Также: если scores всех кандидатов практически одинаковы "
-                "(CV < 1.5%), подбор прекращается досрочно — предобработка "
-                "не даёт значимого эффекта (Audibert et al., 2010 COLT)."
+                "Если scores кандидатов одинаковы (CV < 1.5%) на двух "
+                "последовательных бюджетах — подбор прекращается: "
+                "ранжирование нестабильно при любом бюджете "
+                "(Audibert et al., 2010 COLT)."
             )
 
     st.session_state.p2_epochs = epochs

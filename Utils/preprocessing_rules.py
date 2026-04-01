@@ -33,11 +33,15 @@ class PreprocessingRules:
             # === РАЗРЕШЁННЫЕ МЕТОДЫ ===
             'denoise': {
                 'enabled': True,
-                'method': 'median',  # Lee (1981) - лучший для speckle
+                'method': 'median',
                 'params': {
-                    'ksize': 5  # Небольшое окно для сохранения деталей
+                    'ksize': 5
                 },
-                'rationale': 'Median фильтр эффективен против speckle шума (мультипликативного)'
+                'rationale': 'Шумоподавление разрешено для SAR. Median фильтр подходит '
+                            'как простая альтернатива Lee-фильтру. Lee-фильтр (Lee, 1981) '
+                            'оптимален для мультипликативного speckle, но median также '
+                            'применяется в SAR (Gonzalez & Woods, 2018). Конкретный метод '
+                            'определяется алгоритмом подбора из пула кандидатов.'
             },
             
             # === ЗАПРЕЩЁННЫЕ МЕТОДЫ ===
@@ -54,17 +58,19 @@ class PreprocessingRules:
 
             # === ИСКЛЮЧЕНИЕ ===
             'contrast_enhancement': {
-                'enabled': True,  # С оговорками
+                'enabled': True,
                 'method': 'clahe',
                 'params': {
                     'clip_limit': 1.0,
                     'tile_grid_size': (8, 8)
                 },
-                'rationale': 'Разрешено с осторожностью: после подавления speckle-шумов '
-                            'локальное контрастирование (CLAHE) с низким clip_limit может '
-                            'может улучшать визуальную информативность при минимизации искажений статистики сигнала. '
-                            'Однако методы контрастирования применяются только после шумоподавления и с консервативными параметрами. '
-                            'Remote Sens. 2019, 11(13), 1532; ISPRS J. Photogramm. Remote Sens., 2024'
+                'rationale': 'CLAHE разрешён с консервативными параметрами (clip_limit=1.0). '
+                            'После подавления speckle локальное контрастирование может '
+                            'улучшить различимость объектов на SAR-изображениях. '
+                            'Pisano et al. (1998) J. Digital Imaging 11(4):193-200: CLAHE '
+                            'эффективен для низкоконтрастных изображений. '
+                            'Низкий clip_limit минимизирует искажения статистики '
+                            'backscatter-сигнала (Oliver & Quegan, 2004).'
             },
             
             'sharpening': {
@@ -141,32 +147,40 @@ class PreprocessingRules:
         'natural_photo': {
             'denoise': {
                 'enabled': True,
-                'method': 'bilateral',  # Tomasi & Manduchi (1998)
+                'method': 'bilateral',
                 'params': {
                     'd': 9,
                     'sigma_color': 75,
                     'sigma_space': 75
                 },
-                'rationale': 'Bilateral фильтр сохраняет края при подавлении Gaussian шума'
+                'rationale': 'Bilateral фильтр подавляет Gaussian шум сенсора при сохранении '
+                            'краёв объектов. Tomasi & Manduchi (1998) ICCV: bilateral filtering '
+                            'оптимален для естественных изображений с аддитивным шумом.'
             },
             
             'brightness_correction': {
                 'enabled': True,
                 'target_brightness': 0.5,
                 'params': {
-                    'factor_range': (0.5, 2.0)  # Разумные пределы
+                    'factor_range': (0.5, 2.0)
                 },
-                'rationale': 'Естественные фото могут быть недо/переэкспонированы. Коррекция улучшает восприятие.'
+                'rationale': 'Естественные фото часто имеют неоптимальную экспозицию. '
+                            'Гамма-коррекция нормализует яркость без потери информации. '
+                            'Gonzalez & Woods (2018), гл. 3.2: степенные преобразования — '
+                            'базовый инструмент коррекции экспозиции.'
             },
             
             'contrast_enhancement': {
                 'enabled': True,
                 'method': 'clahe',
                 'params': {
-                    'clip_limit': 2.0,  # Стандартное значение
+                    'clip_limit': 2.0,
                     'tile_grid_size': (8, 8)
                 },
-                'rationale': 'CLAHE улучшает локальный контраст без пересветов'
+                'rationale': 'CLAHE улучшает локальный контраст без пересветов. '
+                            'Pisano et al. (1998) J. Digital Imaging 11(4):193-200: CLAHE '
+                            'эффективен для изображений с неравномерным освещением. '
+                            'clip_limit=2.0 — стандартное значение (Gonzalez & Woods, 2018).'
             },
             
             'sharpening': {
@@ -175,11 +189,16 @@ class PreprocessingRules:
                 'params': {
                     'amount': 1.0
                 },
-                'rationale': 'Умеренное sharpening улучшает детализацию'
+                'rationale': 'Unsharp masking повышает визуальную детализацию. '
+                            'Gonzalez & Woods (2018), гл. 3.6: стандартный метод '
+                            'повышения резкости для фотографических изображений.'
             },
             
-            'source': 'Gonzalez & Woods (2018), Tomasi & Manduchi (1998)',
-            'description': 'Естественные фото допускают полный спектр предобработки'
+            'source': 'Gonzalez & Woods (2018) "Digital Image Processing"; '
+                     'Tomasi & Manduchi (1998) ICCV',
+            'description': 'Естественные фото допускают полный спектр предобработки. '
+                          'Lee-фильтр исключён — предназначен для мультипликативного '
+                          'speckle-шума SAR, не для аддитивного шума камер.'
         },
         
         'infrared': {
@@ -191,7 +210,10 @@ class PreprocessingRules:
                     'sigma_color': 75,
                     'sigma_space': 75
                 },
-                'rationale': 'Bilateral фильтр эффективен против шума при сохранении температурных границ'
+                'rationale': 'Bilateral фильтр сохраняет температурные границы объектов '
+                            'при подавлении сенсорного шума (Gaussian + fixed-pattern noise). '
+                            'Tomasi & Manduchi (1998) ICCV: bilateral сохраняет края — '
+                            'критично для IR, где границы объектов имеют малый контраст.'
             },
             
             'brightness_correction': {
@@ -200,31 +222,48 @@ class PreprocessingRules:
                 'params': {
                     'factor_range': (0.7, 1.5)
                 },
-                'rationale': 'Коррекция яркости допустима - она не меняет относительные температуры'
+                'rationale': 'Коррекция яркости допустима для задач детекции/классификации: '
+                            'нейросеть работает с визуальными паттернами, а не абсолютными '
+                            'температурами. Гамма-коррекция (нелинейная) меняет относительные '
+                            'значения, но для распознавания объектов это приемлемо. '
+                            'Gonzalez & Woods (2018) "Digital Image Processing", гл. 3.2.'
             },
             
             'contrast_enhancement': {
                 'enabled': True,
                 'method': 'clahe',
                 'params': {
-                    'clip_limit': 3.0,  # повышенное значение для низкоконтрастных снимков
+                    'clip_limit': 3.0,
                     'tile_grid_size': (8, 8)
                 },
-                'rationale': 'Низкий естественный контраст требует агрессивного улучшения. '
-                            'Источник: Vollmer & Möllmann (2017)'
+                'rationale': 'IR-изображения имеют узкий динамический диапазон — CLAHE '
+                            'с повышенным clip_limit расширяет контраст для выявления объектов. '
+                            'Pisano et al. (1998) J. Digital Imaging 11(4):193-200: CLAHE '
+                            'эффективен для низкоконтрастных изображений (аналогия с рентгеном). '
+                            'Vollmer & Mollmann (2017) "Infrared Thermal Imaging", Wiley — '
+                            'описывают низкий естественный контраст IR и необходимость '
+                            'постобработки для визуального анализа.'
             },
             
             'sharpening': {
                 'enabled': True,
                 'method': 'unsharp_mask',
                 'params': {
-                    'amount': 1.5  # Более агрессивно
+                    'amount': 1.5
                 },
-                'rationale': 'Размытие от атмосферных эффектов требует восстановления резкости'
+                'rationale': 'Unsharp masking повышает визуальную чёткость границ объектов '
+                            'на IR-изображениях, где контраст между объектом и фоном мал. '
+                            'Gonzalez & Woods (2018), гл. 3.6: unsharp masking — стандартный '
+                            'метод повышения резкости для визуального анализа. Повышенный '
+                            'alpha=1.5 компенсирует размытие от низкого контраста IR-сенсора.'
             },
             
-            'source': 'Vollmer & Möllmann (2017), Portmann et al. (2019)',
-            'description': 'Тепловизионные изображения требуют агрессивного улучшения из-за низкого естественного контраста'
+            'source': 'Vollmer & Mollmann (2017) "Infrared Thermal Imaging", Wiley; '
+                     'Gonzalez & Woods (2018) "Digital Image Processing"; '
+                     'Tomasi & Manduchi (1998) ICCV',
+            'description': 'Тепловизионные изображения допускают все четыре группы предобработки. '
+                          'Низкий естественный контраст IR-сенсоров допускает агрессивные '
+                          'параметры контрастирования и резкости.'
         },
         
         'microscopy': {
