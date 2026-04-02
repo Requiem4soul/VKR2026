@@ -130,7 +130,10 @@ def calculate_optimal_batch_size_cls(
 class EarlyStoppingConfig:
     """Конфигурация Early Stopping (Prechelt, 1998)."""
     patience: int = 10
-    min_delta: float = 0.001
+    # Prechelt (1998) "Early Stopping — But When?": min_delta порядка
+    # 0.1% от масштаба метрики. Для AUC в high-accuracy режиме (>0.95)
+    # улучшения идут на тысячные — 0.001 отсекает их. 1e-4 корректнее.
+    min_delta: float = 0.0001
     metric: str = "val_acc"   # или "val_auc", "val_loss"
     mode: str = "max"         # "max" для acc/auc, "min" для loss
     restore_best: bool = True
@@ -739,7 +742,7 @@ class ClassificationTrainer:
         # Early Stopping
         enable_early_stopping: bool = True,
         early_stopping_patience: int = 15,
-        early_stopping_min_delta: float = 0.001,
+        early_stopping_min_delta: float = 0.0001,
         early_stopping_metric: str = "val_auc",
         # Ранний отбор
         enable_early_selection: bool = False,
@@ -1235,7 +1238,7 @@ class ClassificationTrainer:
                 metric_name = es_cfg_dict.get("metric", "val_auc")
                 es_config = EarlyStoppingConfig(
                     patience=es_cfg_dict.get("patience", 15),
-                    min_delta=es_cfg_dict.get("min_delta", 0.001),
+                    min_delta=es_cfg_dict.get("min_delta", 0.0001),
                     metric=metric_name,
                     mode="min" if "loss" in metric_name else "max",
                     restore_best=True,

@@ -62,7 +62,13 @@ from Data.Datasets.dataset_work import get_dataset_path
 class EarlyStoppingConfig:
     """Конфигурация Early Stopping (Prechelt, 1998)"""
     patience: int = 10
-    min_delta: float = 0.001
+    # min_delta=1e-4: минимальное улучшение метрики для сброса patience.
+    # Prechelt (1998) "Early Stopping — But When?", Neural Networks:
+    # рекомендует delta порядка 0.1% от масштаба метрики.
+    # Для AUC/mAP в диапазоне [0,1] при high-accuracy (>0.95)
+    # улучшения идут на тысячные — min_delta=0.001 отсекает их.
+    # 1e-4 фиксирует это, сохраняя защиту от шумовых колебаний.
+    min_delta: float = 0.0001
     metric: str = 'mAP50-95'
     mode: str = 'max'
     restore_best: bool = True
@@ -84,11 +90,11 @@ class EarlyStopping:
         self.best_model_path = None
         self.history = []
         
-        self.is_better = (
-            lambda new, best: new > best + config.min_delta
-            if config.mode == 'max'
-            else lambda new, best: new < best - config.min_delta
-        )
+        # Разделяем if/else для читаемости (вместо тернарного lambda).
+        if config.mode == 'max':
+            self.is_better = lambda new, best: new > best + config.min_delta
+        else:
+            self.is_better = lambda new, best: new < best - config.min_delta
     
     def step(self, metrics: Dict[str, float], epoch: int, model_save_fn=None) -> Tuple[bool, str]:
         """Проверяет, нужно ли продолжать обучение"""
@@ -872,7 +878,7 @@ class UniversalModelTrainer:
         # Early Stopping
         enable_early_stopping: bool = False,
         early_stopping_patience: int = 10,
-        early_stopping_min_delta: float = 0.001,
+        early_stopping_min_delta: float = 0.0001,
         early_stopping_metric: str = 'mAP50-95',
         
         # Ранний отбор
@@ -1638,7 +1644,7 @@ if __name__ == "__main__":
         # Early Stopping
         enable_early_stopping=True,
         early_stopping_patience=10,
-        early_stopping_min_delta=0.001,
+        early_stopping_min_delta=0.0001,
         early_stopping_metric='mAP50-95',
 
         # Ранний отбор
