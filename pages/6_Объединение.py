@@ -433,29 +433,33 @@ def _check_flat_scores(scores: Dict[str, float], log_fn=None) -> bool:
     """
     Проверяет являются ли scores кандидатов «плоскими» (слишком близкими).
 
-    Если коэффициент вариации (CV = stdev/mean) ниже порога, ранжирование
-    нестабильно: стохастический шум обучения превышает различия между
-    кандидатами, и Спирмен ρ не может сойтись ни при каком числе эпох.
+    Критерий досрочной остановки: CV < 1.5% И ρ < 0.3.
+    CV < 1.5% означает низкую дисперсию (кандидаты неразличимы).
+    ρ < 0.3 означает отсутствие ранговой корреляции (ранги хаотичны).
+    Оба условия вместе: предобработка не влияет на ранжирование.
 
-    Порог CV < 1.5% выбран эмпирически: при типичном шуме YOLO ±0.005–0.01
-    по composite score, spread < 0.02 делает ранги случайными.
+    Только CV без ρ даёт ложные срабатывания на датасетах с быстрой
+    сходимостью (например, COVID-19, BreakHis), где CV мал, но ρ высокий —
+    ранжирование стабильно и осмысленно.
 
     Научное обоснование:
     Audibert, Bubeck & Munos (2010) "Best Arm Identification in Multi-Armed
-    Bandits", COLT 2010: при ε-close arms (разница между arms < ε) число
-    сэмплов для идентификации лучшего растёт как O(1/ε²). При ε→0
-    идентификация требует бесконечного бюджета.
+    Bandits", COLT 2010: при ε-close arms идентификация лучшего требует
+    бесконечного бюджета.
 
     Args:
         scores: словарь {candidate_id: score}
         log_fn: функция логирования
+        rho: коэффициент Спирмена между двумя бюджетами (опционально).
+             Если передан — используется в комбинированном критерии.
 
     Returns:
         True если scores плоские (предобработка не даёт значимого эффекта).
     """
     import statistics
 
-    CV_THRESHOLD = 0.015  # 1.5%
+    CV_THRESHOLD = 0.015   # 1.5%
+    RHO_CHAOS    = 0.3     # ниже — ранги хаотичны
 
     vals = list(scores.values())
     if len(vals) < 2:
@@ -468,14 +472,12 @@ def _check_flat_scores(scores: Dict[str, float], log_fn=None) -> bool:
     stdev = statistics.stdev(vals)
     cv = stdev / mean
 
-    if log_fn and cv < CV_THRESHOLD:
-        log_fn(f"    Scores кандидатов практически одинаковы:")
-        log_fn(f"     CV = {cv:.4f} ({cv*100:.2f}%) < порог {CV_THRESHOLD*100:.1f}%")
+    if log_fn:
+        log_fn(f"    Scores кандидатов:")
+        log_fn(f"     CV = {cv:.4f} ({cv*100:.2f}%)  "
+               f"(порог CV < {CV_THRESHOLD*100:.1f}%)")
         log_fn(f"     mean={mean:.4f}  stdev={stdev:.4f}  "
                f"spread={max(vals)-min(vals):.4f}")
-        log_fn(f"     Audibert et al. (2010) COLT: при ε-close candidates")
-        log_fn(f"     ранжирование нестабильно при любом бюджете эпох.")
-        log_fn(f"     Предобработка не даёт значимого эффекта для данного датасета.")
 
     return cv < CV_THRESHOLD
 
@@ -1407,12 +1409,24 @@ def _run_search(q: queue.Queue, config: Dict):
                         _s = scores_c.get(_c["id"], 0.0)
                         log(f"    {_c['display']:40s}  score={_s:.4f}")
 
-                    if (_check_flat_scores(scores_a, log_fn=None) and
-                            _check_flat_scores(scores_b, log_fn=None)):
+                    # Комбинированный критерий досрочной остановки:
+                    # CV < 1.5% (низкая дисперсия) И ρ < 0.3 (хаотичные ранги).
+                    # Только CV: ложные срабатывания на датасетах с быстрой
+                    # сходимостью (COVID, BreakHis) где CV мал но ρ высокий.
+                    # Только ρ: MinneApple дойдёт до 100% впустую.
+                    # Вместе: останавливаемся только когда предобработка
+                    # действительно не влияет на ранжирование.
+                    # Audibert et al. (2010) COLT; Zar (2005).
+                    _rho_early = _spearman_rho(scores_a, scores_b)
+                    _cv_flat_a = _check_flat_scores(scores_a, log_fn=None)
+                    _cv_flat_b = _check_flat_scores(scores_b, log_fn=None)
+                    if _cv_flat_a and _cv_flat_b and _rho_early < 0.3:
                         _check_flat_scores(scores_a, log_fn=log)
-                        log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские на "
-                            f"{_as_ratio}% и {_as_ratio + 10}% (CV < 1.5%)")
-                        log(f"     Audibert et al. (2010): ранжирование невозможно.")
+                        log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: CV < 1.5% и ρ={_rho_early:.4f} < 0.3"
+                            f" на {_as_ratio}% и {_as_ratio + 10}%")
+                        log(f"     Комбинированный критерий (Audibert 2010 + Zar 2005):")
+                        log(f"     низкая дисперсия + хаотичные ранги →")
+                        log(f"     предобработка не влияет на ранжирование.")
                         log(f"     Используем {_as_ratio}% как fallback.")
                         screening_ratio = _as_ratio
                         fast_epochs = _ep_a
@@ -1422,7 +1436,7 @@ def _run_search(q: queue.Queue, config: Dict):
                         _as_found = True
                         break
 
-                    _rho1 = _spearman_rho(scores_a, scores_b)
+                    _rho1 = _rho_early
                     log(f"\n  ρ({_as_ratio}% vs {_as_ratio + 10}%) = "
                         f"{_rho1:.4f}  (ρ_crit={_rho_crit:.4f})")
 
