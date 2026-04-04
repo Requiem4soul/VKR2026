@@ -1397,12 +1397,12 @@ def _run_search(q: queue.Queue, config: Dict):
                         _s = scores_a.get(_c["id"], 0.0)
                         log(f"    {_c['display']:40s}  score={_s:.4f}")
 
-                    log(f"\n  Scores на {_as_ratio}% ({_ep_b} эп.):")
+                    log(f"\n  Scores на {_as_ratio+10}% ({_ep_b} эп.):")
                     for _c in _as_all_cands:
                         _s = scores_b.get(_c["id"], 0.0)
                         log(f"    {_c['display']:40s}  score={_s:.4f}")
 
-                    log(f"\n  Scores на {_as_ratio}% ({_ep_c} эп.):")
+                    log(f"\n  Scores на {_as_ratio+20}% ({_ep_c} эп.):")
                     for _c in _as_all_cands:
                         _s = scores_c.get(_c["id"], 0.0)
                         log(f"    {_c['display']:40s}  score={_s:.4f}")
