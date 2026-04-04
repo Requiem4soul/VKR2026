@@ -1080,7 +1080,8 @@ class ClassificationTrainer:
             # нужна для корректной загрузки весов ES (load_state_dict).
             base_model = model
             if model_cfg.get("use_torch_compile", False) and \
-               torch.cuda.is_available() and hasattr(torch, "compile"):
+               torch.cuda.is_available() and hasattr(torch, "compile") and \
+               "efficientnet" not in model_type.lower():
                 try:
                     model = torch.compile(model)
                     self.log("  [COMPILE] torch.compile активирован")
@@ -1294,7 +1295,22 @@ class ClassificationTrainer:
                     optimizer.zero_grad()
                     # autocast: forward pass в fp16, backward в fp32 через scaler
                     with autocast(device_type="cuda", enabled=use_amp):
-                        logits = model(images)
+                        try:
+                            logits = model(images)
+                        except Exception as _compile_err:
+                            # torch.compile (Triton) может упасть на первом
+                            # forward pass на Windows — особенно для EfficientNet.
+                            # Откатываемся на base_model (без компиляции).
+                            if model is not base_model:
+                                self.log(
+                                    f"  [COMPILE] Ошибка Triton при forward pass: "
+                                    f"{type(_compile_err).__name__} — "
+                                    f"откат на base_model без компиляции"
+                                )
+                                model = base_model
+                                logits = model(images)
+                            else:
+                                raise
                         loss = criterion(logits, labels)
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
