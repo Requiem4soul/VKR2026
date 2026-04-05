@@ -1448,6 +1448,28 @@ def _run_search(q: queue.Queue, config: Dict):
                         _rho2 = _rho1
                         log(f"  Вторая пара невозможна ({_as_ratio + 20}% > 100%)")
 
+                    # Критерий остановки по двум отрицательным ρ подряд.
+                    # Два отрицательных ρ означают инверсию рангов при
+                    # увеличении бюджета — сигнал что шум обучения превышает
+                    # различия между кандидатами (Δᵢ → 0).
+                    # Audibert et al. (2010) COLT: число сэмплов для
+                    # идентификации лучшего ~ 1/Δᵢ² → ∞ при Δᵢ → 0.
+                    # Продолжение не имеет смысла ни при каком бюджете.
+                    if _rho1 < 0 and _rho2 < 0:
+                        log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: ρ₁={_rho1:.4f} и "
+                            f"ρ₂={_rho2:.4f} — оба отрицательные")
+                        log(f"     Инверсия рангов при увеличении бюджета.")
+                        log(f"     Audibert et al. (2010): при Δᵢ→0 идентификация")
+                        log(f"     лучшего кандидата требует бесконечного бюджета.")
+                        log(f"     Используем {_as_ratio}% как fallback.")
+                        screening_ratio = _as_ratio
+                        fast_epochs = _ep_a
+                        _auto_screen_scores = scores_a
+                        _as_first_run_scores = dict(scores_a)
+                        _as_first_run_ratio = _as_ratio
+                        _as_found = True
+                        break
+
                     if _rho1 >= _rho_crit and _rho2 >= _rho_crit:
                         log(f"\n  Двойная проверка пройдена — "
                             f"ρ₁={_rho1:.4f}, ρ₂={_rho2:.4f} ≥ {_rho_crit:.4f}.")
