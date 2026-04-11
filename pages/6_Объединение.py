@@ -1332,11 +1332,11 @@ def _run_search(q: queue.Queue, config: Dict):
                         _consecutive_flat += 1
                         if _consecutive_flat >= 2:
                             _check_flat_scores(_as_scores_a, log_fn=log)
-                            log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские на двух "
-                                f"последовательных бюджетах (CV < 1.5%)")
+                            log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские на двух ")
+                            log(f"последовательных бюджетах (CV < 1.5%)")
                             log(f"     Gap между кандидатами не растёт при увеличении эпох.")
-                            log(f"     Audibert et al. (2010): ранжирование невозможно "
-                                f"при любом бюджете.")
+                            log(f"     Audibert et al. (2010): ранжирование невозможно ")
+                            log(f"при любом бюджете.")
                             log(f"     Рекомендация: использовать оригинальный датасет.")
                             log(f"     Используем {_as_ratio_a}% как fallback.")
                             screening_ratio = _as_ratio_a
@@ -1348,8 +1348,8 @@ def _run_search(q: queue.Queue, config: Dict):
                             import statistics as _st
                             _vals = list(_as_scores_a.values())
                             _cv = _st.stdev(_vals) / _st.mean(_vals) if _st.mean(_vals) > 0 else 0
-                            log(f"\n  [INFO] CV={_cv:.4f} ({_cv*100:.2f}%) < 1.5% на {_as_ratio_a}% — "
-                                f"возможно малый бюджет. Продолжаем для подтверждения.")
+                            log(f"\n  [INFO] CV={_cv:.4f} ({_cv*100:.2f}%) < 1.5% на {_as_ratio_a}% — ")
+                            log(f"возможно малый бюджет. Продолжаем для подтверждения.")
                     else:
                         _consecutive_flat = 0  # сброс — spread вырос
 
@@ -2585,7 +2585,7 @@ if st.session_state.p2_stage == "configure":
         with _as_col1:
             auto_screen_start = st.slider(
                 "Начальный % для проверки",
-                min_value=20, max_value=60,
+                min_value=30, max_value=100,
                 value=st.session_state.get("p2_auto_screen_start", 30),
                 step=10,
                 key="p2_auto_screen_start_slider",
