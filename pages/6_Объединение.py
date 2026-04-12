@@ -1009,7 +1009,13 @@ def _run_search(q: queue.Queue, config: Dict):
                     return sc, ckpt_path
                 else:
                     safe_label = label[:20].replace(" ", "_").replace("+", "_")
-                    subdir = f"det_qas_{safe_label}_{n_epochs}ep"
+                    # Добавляем короткий уникальный суффикс чтобы прогоны A / B / C
+                    # одного кандидата с одинаковым n_epochs не перезаписывали
+                    # папку и last.pt друг друга.
+                    # Проблема: прогон C (подтверждение) может иметь ту же дельту
+                    # что прогон A → одинаковый subdir → last.pt перезаписывается.
+                    import uuid as _uuid
+                    subdir = f"det_qas_{safe_label}_{n_epochs}ep_{_uuid.uuid4().hex[:6]}"
                     # YOLO: передаём resume через result_subdir last.pt если есть
                     _resume_arg = resume_from if resume_from and os.path.exists(
                         resume_from) else False
@@ -1031,7 +1037,24 @@ def _run_search(q: queue.Queue, config: Dict):
                     _det_dir = str(work_dir / subdir)
                     _last_pt = os.path.join(_det_dir, "run", "weights", "last.pt")
                     ckpt_path = _last_pt if os.path.exists(_last_pt) else ""
-                    return score_from_metrics(m), ckpt_path
+                    sc = score_from_metrics(m)
+                    # score_floor для детекции: гарантируем что warm-start прогон B/C
+                    # не возвращает score хуже прогона A.
+                    #
+                    # В _run_training метрики берутся через best.pt (module3, _run_training
+                    # строка: eval_model = YOLO(best_pt if best_pt.exists() else ...)).
+                    # best.pt в прогоне B охватывает только дельта-эпохи — если за них
+                    # улучшения не было, best.pt может быть хуже финального best.pt
+                    # всей траектории A+B. Без score_floor score прогона B < score прогона A
+                    # — это инвертирует ранги и ρ не сходится.
+                    #
+                    # Нижняя граница max(sc, score_floor) зеркалит логику классификации
+                    # (return_last + score_floor в _train_cls).
+                    # Li et al. (2018) JMLR 18(185): warm-start SHA сохраняет
+                    # лучших кандидатов — score не должен деградировать.
+                    if score_floor > 0.0:
+                        sc = max(sc, score_floor)
+                    return sc, ckpt_path
             except Exception:
                 return 0.0, ""
             finally:
