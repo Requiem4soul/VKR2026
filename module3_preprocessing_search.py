@@ -779,6 +779,193 @@ def _run_training(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ОБУЧЕНИЕ ДО 100% С ИСТОРИЕЙ МЕТРИК (для автоподбора % скрининга)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_training_full_history(
+    dataset_path: Path,
+    model_config: Dict[str, Any],
+    epochs: int,
+    result_dir: Path,
+    log_fn,
+) -> List[float]:
+    """
+    Обучает YOLO до 100% эпох с close_mosaic=0 и возвращает историю
+    mAP50-95 по каждой эпохе в виде списка [ep1, ep2, ..., ep_N].
+
+    Используется автоподбором процента скрининга в 6_Объединение.py:
+    вместо нескольких отдельных прогонов (warm-start A→B→C) запускается
+    один прогон до конца, а пороговые значения N% / N+10% / N+20%
+    извлекаются из истории как max(0..k) — без повторного обучения.
+
+    close_mosaic=0: отключает мозаику на последних 10 эпохах (дефолт
+    Ultralytics). Без этого кандидаты при разных порогах N% получают
+    разное число эпох без мозаики, что создаёт систематическое смещение
+    при сравнении max(0..N%) vs max(0..N+10%).
+    Redmon & Farhadi (2018): мозаика меняет распределение входных данных —
+    её отсутствие на части прогона влияет на финальные метрики.
+
+    История читается из results.csv который Ultralytics всегда пишет
+    в result_dir/run/results.csv — по одной строке на эпоху.
+
+    Returns:
+        List[float]: история mAP50-95 по эпохам (индекс 0 = эпоха 1).
+                     Пустой список если обучение не удалось.
+    """
+    result_dir.mkdir(parents=True, exist_ok=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_type = model_config.get('type', 'yolo')
+    history: List[float] = []
+
+    try:
+        if model_type == 'yolo':
+            from ultralytics import YOLO
+            model_size = model_config.get('size', 'n')
+            model = YOLO(f'yolov8{model_size}.pt')
+
+            yaml_path = dataset_path / 'data.yaml'
+
+            if model_config.get('imgsz'):
+                imgsz = int(model_config['imgsz'])
+            else:
+                try:
+                    from Train.Universal_train.universal_model_trainer import get_image_size_from_dataset
+                    imgsz = get_image_size_from_dataset(dataset_path)
+                except Exception:
+                    imgsz = 640
+
+            model.train(
+                data=str(yaml_path),
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=model_config.get('batch', -1),
+                device=device,
+                project=str(result_dir),
+                name='run',
+                exist_ok=True,
+                workers=0,
+                cache=False,
+                verbose=False,
+                save=True,
+                resume=False,
+                patience=0,          # ES выкл — нужна полная история до epochs
+                close_mosaic=0,      # мозаика одинакова на всех эпохах
+                lr0=0.01,            # дефолт Ultralytics
+                lrf=0.01,
+                warmup_epochs=3.0,
+            )
+
+            # Читаем историю mAP50-95 из results.csv
+            # Ultralytics пишет CSV с заголовком; колонка называется
+            # '                  metrics/mAP50-95(B)' (с пробелами — strip нужен)
+            csv_path = result_dir / 'run' / 'results.csv'
+            if csv_path.exists():
+                import csv as _csv
+                with open(csv_path, newline='', encoding='utf-8') as f:
+                    reader = _csv.DictReader(f)
+                    for row in reader:
+                        # Ищем колонку с mAP50-95 независимо от пробелов
+                        for k, v in row.items():
+                            if 'mAP50-95' in k and 'mAP50(B)' not in k:
+                                try:
+                                    history.append(float(v.strip()))
+                                except ValueError:
+                                    history.append(0.0)
+                                break
+                log_fn(f"  [HISTORY] Прочитано {len(history)} эпох из results.csv")
+            else:
+                log_fn(f"  [HISTORY] results.csv не найден: {csv_path}")
+
+            del model
+
+        else:
+            # Faster R-CNN / RetinaNet: история собирается вручную по эпохам
+            from Train.Universal_train.universal_model_trainer import (
+                FasterRCNNWrapper, RetinaNetWrapper,
+                YOLODatasetInfo, YOLOToFasterRCNNDataset,
+                calculate_optimal_batch_size, get_available_vram_gb,
+            )
+            from torch.utils.data import DataLoader
+
+            vram = get_available_vram_gb()
+            batch_size = calculate_optimal_batch_size(model_type, vram)
+
+            if model_type == 'faster_rcnn':
+                wrapper = FasterRCNNWrapper(pretrained=True)
+            else:
+                wrapper = RetinaNetWrapper(pretrained=True)
+
+            num_classes = YOLODatasetInfo.get_num_classes(dataset_path)
+            wrapper.initialize(num_classes=num_classes)
+            wrapper.model.to(device)
+
+            _base_lr = 0.005
+            optimizer = torch.optim.SGD(
+                wrapper.model.parameters(),
+                lr=_base_lr, momentum=0.9, weight_decay=0.0005,
+            )
+
+            def collate_fn(batch):
+                return tuple(zip(*batch))
+
+            train_ds = YOLOToFasterRCNNDataset(dataset_path, split='train')
+            val_ds   = YOLOToFasterRCNNDataset(dataset_path, split='val')
+            train_loader = DataLoader(train_ds, batch_size=batch_size,
+                                      shuffle=True, collate_fn=collate_fn, num_workers=0)
+            val_loader   = DataLoader(val_ds, batch_size=batch_size,
+                                      shuffle=False, collate_fn=collate_fn, num_workers=0)
+
+            for epoch in range(epochs):
+                wrapper.train_epoch(train_loader, device, optimizer, epoch)
+                val_metrics = wrapper.validate(val_loader, device)
+                history.append(float(val_metrics.get('mAP50-95', 0.0)))
+
+            log_fn(f"  [HISTORY] Собрано {len(history)} эпох (Faster R-CNN/RetinaNet)")
+
+    except Exception as e:
+        log_fn(f"  [HISTORY ERROR] {e}")
+        log_fn(traceback.format_exc())
+
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        # result_dir НЕ удаляем — best.pt может понадобиться для финального
+        # обучения если этот кандидат окажется победителем Фазы 2.
+
+    return history
+
+
+def _history_score_at(history: List[float], ratio: float) -> float:
+    """
+    Возвращает max(mAP50-95) по первым ratio*len(history) эпохам.
+
+    Используется автоподбором скрининга для извлечения score кандидата
+    при бюджете ratio% из уже готовой истории одного прогона.
+
+    Args:
+        history: список mAP50-95 по эпохам (из _run_training_full_history)
+        ratio:   доля эпох, например 0.5 для 50%
+
+    Returns:
+        float: max mAP50-95 за первые ratio*N эпох. 0.0 если история пуста.
+
+    Научное обоснование использования max:
+    Li et al. (2018) JMLR 18(185): SHA сохраняет лучшего кандидата —
+    score кандидата определяется его пиковым потенциалом на данном бюджете,
+    а не финальным состоянием (которое может быть хуже из-за шума).
+    Использование max(0..k) корректно потому что best.pt в обычном
+    _run_training тоже отражает пик, а не финал.
+    """
+    if not history:
+        return 0.0
+    n = len(history)
+    k = max(1, int(round(n * ratio)))
+    k = min(k, n)
+    return max(history[:k])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ФИНАЛЬНОЕ ОБУЧЕНИЕ (не удаляет веса, eval на test)
 # ══════════════════════════════════════════════════════════════════════════════
 

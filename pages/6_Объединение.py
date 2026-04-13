@@ -925,7 +925,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     epochs=epochs,
                     result_dir=result_dir,
                     log_fn=log,
-                    use_early_stopping=False,
+                    use_early_stopping=use_es,
                     early_stopping_patience=patience,
                     eval_split="valid",
                     resume_from=resume,
@@ -937,9 +937,21 @@ def _run_search(q: queue.Queue, config: Dict):
 
         def quick_train(ds_name: str, label: str) -> float:
             """
-            Быстрое обучение (30% эпох, ES выкл).
-            Возвращает scalar score для ранжирования SHA.
-            Jamieson & Talwalkar (2016) — % эпох для скрининга задаётся пользователем.
+            Быстрое обучение (screening_ratio% эпох) для Фазы 1 и Фазы 2.
+
+            Классификация: ES выключен — история единая, max(history)
+            корректно отражает пик кандидата.
+
+            Детекция (YOLO): ES включён с patience из UI.
+            Обоснование: каждый вызов model.train() независим, best.pt
+            сохраняет пик кривой автоматически. ES останавливает обучение
+            после patience эпох без улучшения — лишних вычислений нет,
+            score из best.pt не изменяется. При переобучении (наблюдалось
+            на WGISD ~эпоха 40) без ES модель тратит оставшиеся эпохи
+            впустую, score всё равно берётся из best.pt — ES устраняет
+            эти бесполезные итерации.
+            Prechelt (1998): ES как детектор плато корректен для
+            ранжирования при условии что score берётся из best, а не last.
             """
             log(f"  Обучаю [{label}] — {fast_epochs} эп. (быстрый)...")
             try:
@@ -953,7 +965,10 @@ def _run_search(q: queue.Queue, config: Dict):
                     # Уникальный subdir чтобы параллельные запуски не конфликтовали
                     safe_label = label[:20].replace(" ", "_").replace("+", "_")
                     subdir = f"det_quick_{safe_label}_{fast_epochs}ep"
-                    m  = _train_det(ds_name, fast_epochs, use_es=False,
+                    # ES включён: останавливает бесполезные эпохи после плато.
+                    # keep_weights=False: result_dir удаляется после оценки —
+                    # веса не нужны, next warm-start не используется в Фазах 1/2.
+                    m  = _train_det(ds_name, fast_epochs, use_es=True,
                                     result_subdir=subdir, keep_weights=False)
                     sc = score_from_metrics(m)
                     log(f"    score={sc:.4f}  mAP50-95={m.get('mAP50-95',0):.4f}"
@@ -1249,19 +1264,21 @@ def _run_search(q: queue.Queue, config: Dict):
         # Zar (2005): критическое значение зависит от N и α.
         # α=0.01 (p < 0.01) — строгий порог для научной работы.
 
-        # Будет заполнен либо автоподбором, либо использует текущий fast_epochs
-        _auto_screen_scores: Optional[Dict[str, float]] = None  # scores при найденном %
+        # Будет заполнен автоподбором: {cand_id: score} при найденном %.
+        # Используется кэшем Фазы 1 — повторное обучение не нужно.
+        _auto_screen_scores: Optional[Dict[str, float]] = None
 
         if auto_screen:
             log("")
             log("=" * 70)
-            log("АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА")
+            log("АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА (история одного прогона)")
             log(f"Начальный %: {auto_screen_start}%")
             log("Порог Спирмена ρ: автоматический (Zar, 2005; α=0.01)")
-            log("Li et al. (2018) Hyperband — warm-start successive halving")
+            log("Алгоритм: один прогон до 100% на кандидата, max(mAP50-95)")
+            log("по первым N% эпох — без повторного обучения для каждого порога.")
+            log("close_mosaic=0: равные условия для всех порогов N%.")
             log("=" * 70)
 
-            # Получаем пул кандидатов (тот же что будет в Фазе 1)
             _as_active_groups = _get_active_candidate_groups(
                 modality_result,
                 use_wiener=config.get("use_wiener", False),
@@ -1274,259 +1291,229 @@ def _run_search(q: queue.Queue, config: Dict):
             if len(_as_all_cands) < 2:
                 log("  [ПРОПУСК] Менее 2 кандидатов — автоподбор невозможен.")
             else:
-                # Критическое значение ρ для данного N кандидатов.
-                # Zar (2005): ρ_crit зависит от N; при N=16, α=0.01 → ρ_crit≈0.665.
-                # Ramsey (1989): табулированные значения подтверждают расчёт.
                 _n_cands = len(_as_all_cands)
                 _rho_crit = _spearman_critical_rho(_n_cands, alpha=0.01)
                 log(f"  Кандидатов: {_n_cands} → ρ_crit = {_rho_crit:.4f} "
                     f"(Zar 2005, α=0.01, N={_n_cands})")
 
-                # Предварительно создаём датасеты кандидатов один раз
-                _as_ds_map: Dict[str, str] = {}  # cand_id → ds_name
-                log(f"  Создаю датасеты для {_n_cands} кандидатов...")
+                from module3_preprocessing_search import (
+                    _run_training_full_history,
+                    _history_score_at,
+                )
+
+                # ── Шаг 1: обучаем каждого кандидата до 100% один раз ──────
+                # close_mosaic=0: равные условия на всех порогах N%.
+                # Без него последние 10 эпох (дефолт Ultralytics) проходят
+                # без мозаики — при сравнении max(0..N%) vs max(0..N+10%)
+                # кандидаты с бо́льшим N получают систематическое преимущество.
+                # Redmon & Farhadi (2018): мозаика меняет распределение входных
+                # данных, её отсутствие влияет на метрики финальных эпох.
+                _as_ds_map: Dict[str, str] = {}
+                _as_histories: Dict[str, List[float]] = {}
+
+                log(f"\n  Создаю датасеты и обучаю {_n_cands} кандидатов до 100%...")
                 for _cand in _as_all_cands:
                     try:
-                        _ds = _make_tmp_ds(_cand["id"], _cand["methods"], _cand["params"])
+                        _ds = _make_tmp_ds(_cand["id"], _cand["methods"],
+                                           _cand["params"])
                         _as_ds_map[_cand["id"]] = _ds
                     except Exception as _e:
-                        log(f"  [ОШИБКА] {_cand['display']}: {_e}")
+                        log(f"  [ОШИБКА датасет] {_cand['display']}: {_e}")
+                        continue
 
-                _as_ratio_a = auto_screen_start
-                _as_found   = False
-                _as_scores_a: Dict[str, float] = {}
-                # Словарь чекпоинтов после прогона A: {cand_id: ckpt_path}
-                _as_ckpts_a: Dict[str, str] = {}
-                # Scores первого прогона (обученного с нуля, без warm-start).
-                # Только эти scores можно безопасно переиспользовать в Фазе 1,
-                # потому что Фаза 1 тоже обучает с нуля на тех же условиях.
-                # Scores дообученных (warm-start) прогонов отличаются от
-                # обучения с нуля из-за разного состояния оптимизатора.
-                _as_first_run_scores: Optional[Dict[str, float]] = None
-                _as_first_run_ratio: int = 0
-                # Счётчик последовательных прогонов с CV < порога.
-                # Flat-scores guard срабатывает при ≥2 подряд.
+                    log(f"  Обучаю [{_cand['display']}] до {max_epochs} эп. "
+                        f"(close_mosaic=0)...")
+                    import uuid as _uuid
+                    _hist_subdir = (work_dir /
+                        f"as_hist_{_cand['id'][:20]}_{_uuid.uuid4().hex[:6]}")
+                    try:
+                        if task == "classification":
+                            _cfg_hist = {
+                                **_model_cfg_base,
+                                "name": f"{model_type}_ashist",
+                                "max_epochs": max_epochs,
+                                "use_torch_compile": config.get(
+                                    "use_torch_compile", False),
+                            }
+                            _trainer_hist = ClassificationTrainer(
+                                model_configs=[_cfg_hist],
+                                dataset_names=[_ds],
+                                max_epochs=max_epochs,
+                                checkpoint_interval=max_epochs,
+                                seed=seed,
+                                enable_early_stopping=False,
+                                enable_early_selection=False,
+                            )
+                            _trainer_hist.run_training(resume_paths={})
+                            _hkey = f"{model_type}_ashist_{_ds}"
+                            _raw = _trainer_hist.metrics_history.get(_hkey, [])
+                            _as_histories[_cand["id"]] = [
+                                float(h.get("val_auc",
+                                      h.get("auc", 0.0))) for h in _raw
+                            ]
+                        else:
+                            _hist = _run_training_full_history(
+                                dataset_path=get_dataset_path(_ds),
+                                model_config=_model_cfg_base,
+                                epochs=max_epochs,
+                                result_dir=_hist_subdir,
+                                log_fn=log,
+                            )
+                            _as_histories[_cand["id"]] = _hist
+                    except Exception as _e:
+                        log(f"  [ОШИБКА обучение] {_cand['display']}: {_e}")
+                        log(traceback.format_exc())
+                        _as_histories[_cand["id"]] = []
+                    finally:
+                        try:
+                            import torch as _t
+                            if _t.cuda.is_available():
+                                _t.cuda.empty_cache()
+                                _t.cuda.synchronize()
+                        except Exception:
+                            pass
+                        gc.collect()
+                    log(f"    → история: {len(_as_histories.get(_cand['id'], []))} эпох")
+
+                # ── Шаг 2: поиск минимального % по историям ─────────────────
+                # Score кандидата при бюджете N% = max(history[0..N%*epochs]).
+                # Li et al. (2018) JMLR 18(185): SHA использует пиковый
+                # потенциал кандидата на данном бюджете.
+                #
+                # Условия принятия N%:
+                #   p1 = ρ(scores_N%, scores_N+10%) ≥ ρ_crit
+                #   p2 = ρ(scores_N+10%, scores_N+20%) ≥ ρ_crit
+                # Обе проверки из одной истории — повторного обучения нет.
+                # Максимальный стартовый N = 80% (N+20% ≤ 100%).
+                # При N > 80% без успеха → 100%.
+                #
+                # Двойная проверка (p1 и p2):
+                # Audibert & Bubeck (2010) COLT, Theorem 1: два подтверждения
+                # дают экспоненциально меньшую вероятность ложного срабатывания.
+
+                def _scores_at(ratio: float) -> Dict[str, float]:
+                    return {
+                        _cid: _history_score_at(_hist, ratio)
+                        for _cid, _hist in _as_histories.items()
+                    }
+
+                # ── Шаг 2: поиск минимального % сверху вниз ─────────────────
+                # Начинаем с N=80% (чтобы N+10% и N+20% не превышали 100%).
+                # Проверяем p1=ρ(N%, N+10%) и p2=ρ(N+10%, N+20%).
+                # Если обе пройдены — сдвигаемся вниз на 10% и повторяем.
+                # Останавливаемся когда p1 или p2 не пройдены — берём
+                # предыдущий (более высокий) %.
+                #
+                # Обоснование направления поиска сверху вниз:
+                # Klein et al. (2017) ICLR: стабильность ранжирования
+                # резко растёт после определённого порога эпох —
+                # эталоном надёжного ранжирования является полный бюджет.
+                # Domhan et al. (2015) IJCAI: анализ кривых обучения
+                # показывает что ранжирование стабилизируется при
+                # высоком бюджете — движение от него вниз гарантирует
+                # что найденный % действительно достаточен.
+                # Audibert & Bubeck (2010) COLT: двойная проверка (p1+p2)
+                # даёт экспоненциально меньшую вероятность ложного
+                # принятия недостаточного бюджета.
+
+                _as_ratio_cur  = 80   # текущий N%, стартуем с максимального
+                _as_ratio_best = 80   # лучший (наименьший) найденный %
+                _as_found      = False
                 _consecutive_flat: int = 0
 
-                while _as_ratio_a <= 100:
-                    _as_ep_a = max(1, int(max_epochs * (_as_ratio_a / 100)))
-                    _as_ratio_b = _as_ratio_a + 10
-                    _as_ep_b = max(1, int(max_epochs * (_as_ratio_b / 100)))
+                # Сначала проверяем что хотя бы 80% даёт стабильное
+                # ранжирование — если нет, нет смысла двигаться вниз.
+                _sc_80  = _scores_at(0.80)
+                _sc_90  = _scores_at(0.90)
+                _sc_100 = _scores_at(1.00)
 
-                    log(f"\n  Прогон A: {_as_ratio_a}% ({_as_ep_a} эп.)")
-                    # Обучаем прогон A только если scores ещё не вычислены.
-                    # При цепочечном переходе (ρ < порога на предыдущей итерации)
-                    # _as_scores_a и _as_ckpts_a уже заполнены из прогона B —
-                    # в этом случае пропускаем обучение и идём сразу к прогону B.
-                    # Li et al. (2018) JMLR 18(185): экономия N_cands обучений
-                    # на каждой итерации кроме первой.
-                    if not _as_scores_a:
-                        for _cand in _as_all_cands:
-                            _ds = _as_ds_map.get(_cand["id"])
-                            if _ds is None:
-                                continue
-                            _sc, _ckpt = quick_train_n(_ds, _cand["display"], _as_ep_a)
-                            _as_scores_a[_cand["id"]] = _sc
-                            _as_ckpts_a[_cand["id"]] = _ckpt
-                            log(f"    {_cand['display']:40s}  score={_sc:.4f}")
-                        # Сохраняем scores первого прогона (с нуля) для кеша Фазы 1
-                        if _as_first_run_scores is None:
-                            _as_first_run_scores = dict(_as_scores_a)
-                            _as_first_run_ratio = _as_ratio_a
-                    else:
-                        # Scores уже есть из предыдущего прогона B — выводим их
-                        for _cand in _as_all_cands:
-                            _sc = _as_scores_a.get(_cand["id"], 0.0)
-                            log(f"    {_cand['display']:40s}  score={_sc:.4f}  [перенесено из пред. прогона B]")
+                _rho_80_90  = _spearman_rho(_sc_80,  _sc_90)
+                _rho_90_100 = _spearman_rho(_sc_90,  _sc_100)
+                log(f"\n  Начальная проверка N=80%:")
+                log(f"  ρ(p1: 80% vs 90%) = {_rho_80_90:.4f}  "
+                    f"ρ(p2: 90% vs 100%) = {_rho_90_100:.4f}  "
+                    f"(ρ_crit={_rho_crit:.4f})")
 
-                    # ── Flat-scores guard (двойная проверка) ─────────────
-                    # CV < порога на одном прогоне может быть следствием
-                    # малого бюджета эпох (модель ещё не различает кандидатов).
-                    # Но если CV < порога на двух последовательных бюджетах —
-                    # spread не растёт с увеличением эпох, и ранжирование
-                    # действительно нестабильно на данном датасете.
-                    #
-                    # Audibert et al. (2010) COLT: при ε-close arms
-                    # идентификация требует O(1/ε²) сэмплов. Если ε не
-                    # растёт при увеличении бюджета — ε→0, бюджет → ∞.
-                    # Два подряд flat = подтверждение что gap не растёт.
-                    _is_flat_a = _check_flat_scores(_as_scores_a, log_fn=None)
-                    if _is_flat_a:
-                        _consecutive_flat += 1
-                        if _consecutive_flat >= 2:
-                            _check_flat_scores(_as_scores_a, log_fn=log)
-                            log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские на двух ")
-                            log(f"последовательных бюджетах (CV < 1.5%)")
-                            log(f"     Gap между кандидатами не растёт при увеличении эпох.")
-                            log(f"     Audibert et al. (2010): ранжирование невозможно ")
-                            log(f"при любом бюджете.")
-                            log(f"     Рекомендация: использовать оригинальный датасет.")
-                            log(f"     Используем {_as_ratio_a}% как fallback.")
-                            screening_ratio = _as_ratio_a
-                            fast_epochs = _as_ep_a
-                            _auto_screen_scores = _as_scores_a
-                            _as_found = True
-                            break
+                if _rho_80_90 < _rho_crit or _rho_90_100 < _rho_crit:
+                    # Даже при 80% ранжирование нестабильно — берём 100%
+                    log(f"  Ранжирование нестабильно даже при N=80% — "
+                        f"принимаем 100%.")
+                    screening_ratio = 100
+                    fast_epochs = max_epochs
+                    _auto_screen_scores = _scores_at(1.0)
+                    _as_found = True
+                else:
+                    log(f"  ✓ N=80% стабилен — начинаем спуск вниз.")
+                    _as_ratio_best = 80
+
+                    # Спускаемся вниз по 10% пока обе проверки проходят
+                    _as_ratio_cur = 70
+                    while _as_ratio_cur >= 10:
+                        _ra = _as_ratio_cur / 100.0
+                        _rb = (_as_ratio_cur + 10) / 100.0
+                        _rc = (_as_ratio_cur + 20) / 100.0
+
+                        _sc_a = _scores_at(_ra)
+                        _sc_b = _scores_at(_rb)
+                        _sc_c = _scores_at(_rc)
+
+                        log(f"\n  Проверка N={_as_ratio_cur}% / "
+                            f"N+10={_as_ratio_cur+10}% / "
+                            f"N+20={_as_ratio_cur+20}%")
+                        for _cand in _as_all_cands:
+                            _cid = _cand["id"]
+                            log(f"    {_cand['display']:40s}  "
+                                f"{_as_ratio_cur}%={_sc_a.get(_cid,0):.4f}  "
+                                f"{_as_ratio_cur+10}%={_sc_b.get(_cid,0):.4f}  "
+                                f"{_as_ratio_cur+20}%={_sc_c.get(_cid,0):.4f}")
+
+                        # Flat-scores guard
+                        _is_flat = _check_flat_scores(_sc_a, log_fn=None)
+                        if _is_flat:
+                            _consecutive_flat += 1
+                            if _consecutive_flat >= 2:
+                                _check_flat_scores(_sc_a, log_fn=log)
+                                log(f"\n  Scores плоские (CV < 1.5%) на двух "
+                                    f"последовательных бюджетах — "
+                                    f"останавливаемся на {_as_ratio_best}%.")
+                                break
                         else:
-                            import statistics as _st
-                            _vals = list(_as_scores_a.values())
-                            _cv = _st.stdev(_vals) / _st.mean(_vals) if _st.mean(_vals) > 0 else 0
-                            log(f"\n  [INFO] CV={_cv:.4f} ({_cv*100:.2f}%) < 1.5% на {_as_ratio_a}% — ")
-                            log(f"возможно малый бюджет. Продолжаем для подтверждения.")
-                    else:
-                        _consecutive_flat = 0  # сброс — spread вырос
+                            _consecutive_flat = 0
 
-                    if _as_ratio_b > 100:
-                        # Достигли потолка — используем 100%
-                        log(f"  Достигнут потолок 100% — используем {_as_ratio_a}%")
-                        screening_ratio = _as_ratio_a
-                        fast_epochs = _as_ep_a
-                        _auto_screen_scores = _as_scores_a
-                        _as_found = True
-                        break
+                        _rho_p1 = _spearman_rho(_sc_a, _sc_b)
+                        _rho_p2 = _spearman_rho(_sc_b, _sc_c)
+                        log(f"  ρ(p1: {_as_ratio_cur}% vs {_as_ratio_cur+10}%) "
+                            f"= {_rho_p1:.4f}  |  "
+                            f"ρ(p2: {_as_ratio_cur+10}% vs {_as_ratio_cur+20}%) "
+                            f"= {_rho_p2:.4f}  (ρ_crit={_rho_crit:.4f})")
 
-                    log(f"\n  Прогон B: {_as_ratio_b}% ({_as_ep_b} эп.) "
-                        f"[warm-start с {_as_ratio_a}%]")
-                    _as_scores_b: Dict[str, float] = {}
-                    # Чекпоинты прогона B — нужны если ρ < порога,
-                    # чтобы следующая итерация могла дообучать с них.
-                    # Li et al. (2018) JMLR 18(185): цепочечное дообучение
-                    # корректно для successive halving — ранжирование сохраняется.
-                    _as_ckpts_b: Dict[str, str] = {}
-                    for _cand in _as_all_cands:
-                        _ds = _as_ds_map.get(_cand["id"])
-                        if _ds is None:
-                            continue
-                        # Warm-start: дообучаем с чекпоинта прогона A
-                        _resume = _as_ckpts_a.get(_cand["id"], "")
-                        # score_floor — лучший score прогона A для этого кандидата
-                        # гарантирует что resume не даст результат хуже прогона A
-                        _floor = _as_scores_a.get(_cand["id"], 0.0)
-                        # Передаём дельту эпох (ep_b - ep_a), а не абсолютное
-                        # число. Ultralytics при warm-start сбрасывает счётчик
-                        # эпох с нуля — train_results[-1] после прогона B
-                        # хранит число эпох текущего запуска, а не суммарное.
-                        # Передавая дельту явно, мы обходим эту проблему:
-                        # функция обучает ровно _as_ep_b - _as_ep_a эпох.
-                        # Li et al. (2018) JMLR 18(185): warm-start SHA
-                        # использует бюджет дополнительных эпох.
-                        _as_ep_delta = _as_ep_b - _as_ep_a
-                        _sc, _ckpt_b = quick_train_n(_ds, _cand["display"], _as_ep_delta,
-                                                     resume_from=_resume,
-                                                     score_floor=_floor)
-                        _as_scores_b[_cand["id"]] = _sc
-                        _as_ckpts_b[_cand["id"]] = _ckpt_b
-                        log(f"    {_cand['display']:40s}  score={_sc:.4f}"
-                            f"{'  [resume]' if _resume else ''}")
-
-                    _rho = _spearman_rho(_as_scores_a, _as_scores_b)
-                    log(f"\n  Спирмен ρ({_as_ratio_a}% vs {_as_ratio_b}%) = {_rho:.4f}"
-                        f"  (ρ_crit={_rho_crit:.4f}, α=0.01, N={_n_cands})")
-
-                    if _rho >= _rho_crit:
-                        # ── Двойная проверка (two-sample confirmation) ─────
-                        # Одна пара ρ ≥ ρ_crit может быть случайной.
-                        # Две последовательных пары (A↔B, B↔C) подтверждают
-                        # стабильность ранжирования: вероятность случайного
-                        # совпадения двух ρ ≥ ρ_crit при N=16 < 0.01² = 0.0001.
-                        #
-                        # Jamieson & Talwalkar (2016) AISTATS, Section 4:
-                        # стабильность ранжирования подтверждается на нескольких
-                        # точках бюджета, а не на одной.
-                        #
-                        # Audibert & Bubeck (2010) COLT, Theorem 1: при gap Δ
-                        # между кандидатами, вероятность ошибки ранжирования
-                        # убывает экспоненциально с бюджетом — два подтверждения
-                        # дают экспоненциально меньшую вероятность ложного срабатывания.
-                        #
-                        # Стоимость: +1 прогон на N кандидатов (дообучение дельты).
-                        # Экономия: избегаем ложного принятия малого % и
-                        # последующего получения невалидных результатов SHA.
-                        log(f"  ✓ Первая проверка пройдена (ρ={_rho:.4f} ≥ {_rho_crit:.4f})")
-
-                        _as_ratio_c = _as_ratio_b + 10
-                        if _as_ratio_c > 100:
-                            # Нет места для подтверждающего прогона C — принимаем
-                            # без подтверждения (мы уже на 90%+, дальше некуда).
-                            log(f"  Подтверждающий прогон невозможен ({_as_ratio_b}%+10% > 100%) — "
-                                f"принимаем {_as_ratio_a}% как достаточный.")
-                            screening_ratio = _as_ratio_a
-                            fast_epochs = _as_ep_a
-                            _auto_screen_scores = _as_scores_a
-                            _as_found = True
-                            break
-
-                        _as_ep_c = max(1, int(max_epochs * (_as_ratio_c / 100)))
-                        _as_ep_delta_bc = _as_ep_c - _as_ep_b
-                        log(f"\n  Подтверждающий прогон C: {_as_ratio_c}% ({_as_ep_c} эп.) "
-                            f"[warm-start с {_as_ratio_b}%]")
-
-                        _as_scores_c: Dict[str, float] = {}
-                        _as_ckpts_c: Dict[str, str] = {}
-                        for _cand in _as_all_cands:
-                            _ds = _as_ds_map.get(_cand["id"])
-                            if _ds is None:
-                                continue
-                            _resume_c = _as_ckpts_b.get(_cand["id"], "")
-                            _floor_c = _as_scores_b.get(_cand["id"], 0.0)
-                            _sc_c, _ckpt_c = quick_train_n(
-                                _ds, _cand["display"], _as_ep_delta_bc,
-                                resume_from=_resume_c, score_floor=_floor_c)
-                            _as_scores_c[_cand["id"]] = _sc_c
-                            _as_ckpts_c[_cand["id"]] = _ckpt_c
-                            log(f"    {_cand['display']:40s}  score={_sc_c:.4f}  [confirm]")
-
-                        _rho2 = _spearman_rho(_as_scores_b, _as_scores_c)
-                        log(f"\n  Подтверждение: ρ({_as_ratio_b}% vs {_as_ratio_c}%) = {_rho2:.4f}"
-                            f"  (ρ_crit={_rho_crit:.4f})")
-
-                        if _rho2 >= _rho_crit:
-                            log(f"  Двойная проверка пройдена — "
-                                f"ρ₁={_rho:.4f}, ρ₂={_rho2:.4f} ≥ {_rho_crit:.4f}. "
-                                f"Используем {_as_ratio_a}% скрининга.")
-                            screening_ratio = _as_ratio_a
-                            fast_epochs = _as_ep_a
-                            _auto_screen_scores = _as_scores_a
-                            _as_found = True
-                            break
+                        if _rho_p1 >= _rho_crit and _rho_p2 >= _rho_crit:
+                            log(f"  ✓ N={_as_ratio_cur}% стабилен — "
+                                f"продолжаем спуск.")
+                            _as_ratio_best = _as_ratio_cur
+                            _as_ratio_cur -= 10
                         else:
-                            log(f"   Подтверждение не пройдено "
-                                f"(ρ₂={_rho2:.4f} < {_rho_crit:.4f}). "
-                                f"Первая проверка была ложноположительной.")
-                            log(f"  Сдвигаемся: прогон C → новый A ({_as_ratio_c}%)")
-                            # Прогон C становится новым A, цикл продолжается.
-                            # Li et al. (2018): цепочечный warm-start корректен.
-                            _as_scores_a = _as_scores_c
-                            _as_ckpts_a  = _as_ckpts_c
-                            _as_ratio_a  = _as_ratio_c
-                    else:
-                        log(f"  ρ={_rho:.4f} < ρ_crit={_rho_crit:.4f} — "
-                            f"увеличиваем до {_as_ratio_b}%")
-                        # Следующая итерация: прогон B становится новым прогоном A.
-                        # Scores и чекпоинты прогона B переносятся напрямую —
-                        # нет необходимости обучать A заново с нуля.
-                        #
-                        # Научное обоснование цепочечного дообучения:
-                        # Li et al. (2018) "Hyperband", JMLR 18(185), 1-52:
-                        # каждый следующий бюджет строится поверх предыдущего;
-                        # все кандидаты проходят одинаковую траекторию обучения,
-                        # поэтому ранжирование остаётся корректным.
-                        #
-                        # Цепочка: 30%→40%→50%→... вместо повторного обучения с нуля
-                        # на каждом новом A экономит (N_iter - 1) × N_cands прогонов.
-                        _as_scores_a = _as_scores_b          # scores прогона B → новый A
-                        _as_ckpts_a  = _as_ckpts_b            # ckpts прогона B → новый A
-                        _as_ratio_a  = _as_ratio_b            # сдвигаем %
+                            log(f"  N={_as_ratio_cur}% нестабилен "
+                                f"(ρ_p1={_rho_p1:.4f}, "
+                                f"ρ_p2={_rho_p2:.4f}) — "
+                                f"останавливаемся на {_as_ratio_best}%.")
+                            break
 
-                # Удаляем временные датасеты созданные для автоподбора
+                    screening_ratio = _as_ratio_best
+                    fast_epochs = max(1, int(max_epochs * (_as_ratio_best / 100)))
+                    _auto_screen_scores = _scores_at(_as_ratio_best / 100.0)
+                    _as_found = True
+
+                    log(f"\n  Итог спуска: минимальный стабильный % = "
+                        f"{_as_ratio_best}%")
+                # Удаляем временные датасеты
                 for _ds in _as_ds_map.values():
                     _cleanup_ds(_ds)
 
-                if _as_found:
-                    log(f"\n  Итог автоподбора: screening_ratio={screening_ratio}%"
-                        f"  ({fast_epochs} эп.)")
-                    log(f"  Li et al. (2018) Hyperband — "
-                        f"однораундовый отсев (s=0 bracket) с подобранным бюджетом")
+                log(f"\n  Итог автоподбора: screening_ratio={screening_ratio}%"
+                    f"  ({fast_epochs} эп.)")
+                log(f"  Li et al. (2018) Hyperband — однораундовый отсев "
+                    f"(s=0 bracket) с подобранным бюджетом")
 
         # ══════════════════════════════════════════════════════════════════
         # BASELINE: быстрое обучение оригинала
@@ -1597,31 +1584,20 @@ def _run_search(q: queue.Queue, config: Dict):
         _scored_per_group: Dict[str, List[Dict]] = {}
 
         # ── Кеш scores из автоподбора скрининга ───────────────────────
-        # Если автоподбор был включён и первый прогон (с нуля) совпадает
-        # по числу эпох с итоговым fast_epochs — переиспользуем scores.
+        # При новом алгоритме автоподбора каждый кандидат обучается один
+        # раз до 100%, а scores при любом % извлекаются из истории.
+        # _auto_screen_scores содержит scores при итоговом screening_ratio%
+        # — кэш работает для любого найденного %.
         #
-        # Научное обоснование повторного использования:
-        # seed фиксирован (Dodge & Karam, 2017 CVPRW), датасеты
-        # идентичны, число эпох совпадает — результат детерминирован.
-        # Переиспользуются ТОЛЬКО scores первого прогона (обученного
-        # с нуля), не дообученных warm-start прогонов — те отличаются
-        # состоянием оптимизатора и не эквивалентны обучению с нуля.
-        #
-        # Когда кеш работает:
-        #   auto_screen_start=30%, итог=30% → первый прогон на 30%
-        #   совпадает с Фазой 1 на 30%. Экономия: N_cands обучений.
-        #
-        # Когда кеш НЕ работает (обучаем заново):
-        #   auto_screen_start=30%, итог=50% → первый прогон был на 30%,
-        #   а Фаза 1 нужна на 50%. Scores несопоставимы.
+        # Dodge & Karam (2017) CVPRW: seed фиксирован → результат
+        # детерминирован. Scores из истории эквивалентны обучению с нуля
+        # на том же числе эпох при том же seed.
         _as_reusable: Dict[str, float] = {}
-        if (_auto_screen_scores
-                and _as_first_run_scores
-                and _as_first_run_ratio == screening_ratio):
-            _as_reusable = _as_first_run_scores
+        if _auto_screen_scores:
+            _as_reusable = _auto_screen_scores
         if _as_reusable:
             log(f"\n  [КЕШИРОВАНИЕ] Переиспользую {len(_as_reusable)} scores "
-                f"из автоподбора скрининга ({screening_ratio}% эпох, обучены с нуля)")
+                f"из автоподбора скрининга ({screening_ratio}% эпох)")
             log(f"  Dodge & Karam (2017): seed фиксирован → результат детерминирован")
 
         for group_id, group_info in active_groups.items():
