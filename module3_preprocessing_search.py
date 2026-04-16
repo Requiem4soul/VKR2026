@@ -435,6 +435,7 @@ def _run_training(
     keep_weights: bool = False,
     max_epochs_for_schedule: int = 0,
     disable_mosaic: bool = False,
+    seed: int = 0,
 ) -> Dict[str, float]:
     """
     Запускает обучение через wrapper'ы из Модуля 2.
@@ -613,6 +614,10 @@ def _run_training(
                 # Redmon & Farhadi (2018): мозаика влияет на метрики —
                 # равные условия требуют одинакового режима мозаики.
                 close_mosaic=0 if disable_mosaic else 10,
+                # seed: фиксирует случайность внутри Ultralytics
+                # (инициализация весов, порядок батчей, аугментации).
+                # Dodge & Karam (2017): seed фиксирован → воспроизводимость.
+                seed=seed,
             )
             if use_early_stopping:
                 train_kwargs['patience'] = early_stopping_patience
@@ -824,6 +829,7 @@ def _run_training_full_history(
     result_dir: Path,
     log_fn,
     early_stopping_patience: int = 20,
+    seed: int = 0,
 ) -> List[float]:
     """
     Обучает YOLO до 100% эпох с close_mosaic=0 и возвращает историю
@@ -889,6 +895,7 @@ def _run_training_full_history(
                 lr0=0.01,            # дефолт Ultralytics
                 lrf=0.01,
                 warmup_epochs=3.0,
+                seed=seed,
             )
 
             # Читаем историю mAP50-95 из results.csv
@@ -1028,6 +1035,7 @@ def _run_training_final(
     log_fn,
     early_stopping_patience: int = 10,
     eval_split: str = 'test',
+    seed: int = 0,
 ) -> Dict[str, float]:
     """
     Финальное обучение победителя на постоянном датасете.
@@ -1073,6 +1081,7 @@ def _run_training_final(
                 verbose=False,
                 save=True,
                 patience=early_stopping_patience,
+                seed=seed,
             )
             train_metrics_dict = results.results_dict
 
