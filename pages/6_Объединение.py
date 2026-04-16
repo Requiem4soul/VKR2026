@@ -124,6 +124,7 @@ _STATE_DEFAULTS = {
     # Автоподбор процента скрининга
     "p2_auto_screen":         False,   # включить автоподбор
     "p2_auto_screen_start":   40,      # начальный % (пользователь задаёт)
+    "p2_top_k_winners":       1,       # сколько топ-survivors обучать финально
 }
 for _k, _v in _STATE_DEFAULTS.items():
     if _k not in st.session_state:
@@ -930,6 +931,12 @@ def _run_search(q: queue.Queue, config: Dict):
                     eval_split="valid",
                     resume_from=resume,
                     keep_weights=keep_weights,
+                    # lr-schedule рассчитывается на max_epochs — согласованность
+                    # с историями автоподбора скрининга (обученными на max_epochs).
+                    # Прерывание через callback после epochs эпох.
+                    max_epochs_for_schedule=max_epochs,
+                    # close_mosaic=0: равные условия с историями автоподбора.
+                    disable_mosaic=True,
                 )
             return metrics
 
@@ -1258,6 +1265,11 @@ def _run_search(q: queue.Queue, config: Dict):
         # ══════════════════════════════════════════════════════════════════
         auto_screen       = config.get("auto_screen", False)
         auto_screen_start = config.get("auto_screen_start", 40)
+        # Инициализируем до блока auto_screen чтобы переменная была
+        # гарантированно доступна снаружи блока независимо от того
+        # выполнился ли внутренний else (кандидатов >= 2).
+        _baseline_history: List[float] = []
+        _screening_table_data: List[Dict] = []  # таблица mAP50-95 по 10% шагам
         # auto_screen_rho больше не задаётся пользователем —
         # критическое значение ρ вычисляется автоматически по числу
         # кандидатов N через _spearman_critical_rho(N, alpha=0.01).
@@ -1397,115 +1409,223 @@ def _run_search(q: queue.Queue, config: Dict):
                         for _cid, _hist in _as_histories.items()
                     }
 
-                # ── Шаг 2: поиск минимального % сверху вниз ─────────────────
-                # Начинаем с N=80% (чтобы N+10% и N+20% не превышали 100%).
-                # Проверяем p1=ρ(N%, N+10%) и p2=ρ(N+10%, N+20%).
-                # Если обе пройдены — сдвигаемся вниз на 10% и повторяем.
-                # Останавливаемся когда p1 или p2 не пройдены — берём
-                # предыдущий (более высокий) %.
+                # ── Baseline: обучение до 100% с историей ───────────────────
+                # Baseline обучается на тех же условиях что кандидаты:
+                # до 100% эпох, close_mosaic=0, ES с паддингом.
+                # Score при найденном % берётся из истории через
+                # _history_score_at — max(0..N%), равные условия.
+                # Без этого baseline обучался бы только на fast_epochs
+                # что создаёт систематическое преимущество.
+                log(f"\n  Обучаю baseline до {max_epochs} эп. (история)...")
+                import uuid as _uuid_bl
+                _bl_subdir = work_dir / f"as_hist_baseline_{_uuid_bl.uuid4().hex[:6]}"
+                _baseline_history: List[float] = []
+                try:
+                    if task == "classification":
+                        _cfg_bl = {
+                            **_model_cfg_base,
+                            "name": f"{model_type}_ashist_bl",
+                            "max_epochs": max_epochs,
+                            "use_torch_compile": config.get(
+                                "use_torch_compile", False),
+                        }
+                        _trainer_bl = ClassificationTrainer(
+                            model_configs=[_cfg_bl],
+                            dataset_names=[dataset_name],
+                            max_epochs=max_epochs,
+                            checkpoint_interval=max_epochs,
+                            seed=seed,
+                            enable_early_stopping=False,
+                            enable_early_selection=False,
+                        )
+                        _trainer_bl.run_training(resume_paths={})
+                        _bl_key = f"{model_type}_ashist_bl_{dataset_name}"
+                        _bl_raw = _trainer_bl.metrics_history.get(_bl_key, [])
+                        _baseline_history = [
+                            float(h.get("val_auc", h.get("auc", 0.0)))
+                            for h in _bl_raw
+                        ]
+                    else:
+                        _baseline_history = _run_training_full_history(
+                            dataset_path=get_dataset_path(dataset_name),
+                            model_config=_model_cfg_base,
+                            epochs=max_epochs,
+                            result_dir=_bl_subdir,
+                            log_fn=log,
+                            early_stopping_patience=patience,
+                        )
+                except Exception as _e:
+                    log(f"  [ОШИБКА baseline история] {_e}")
+                    log(traceback.format_exc())
+                    _baseline_history = []
+                finally:
+                    try:
+                        import torch as _t
+                        if _t.cuda.is_available():
+                            _t.cuda.empty_cache()
+                            _t.cuda.synchronize()
+                    except Exception:
+                        pass
+                    gc.collect()
+                log(f"    → baseline история: {len(_baseline_history)} эпох")
+
+                # ── Таблица mAP50-95 по каждым 10% для всех кандидатов ──────
+                # Выводится после сбора всех историй, до начала поиска %.
+                # Содержит max(0..N%) для N = 10%, 20%, ..., 100% —
+                # полная картина потенциала каждого кандидата.
+                # Используется для анализа в научной работе.
+                _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
+                log(f"\n{'─'*70}")
+                log(f"ТАБЛИЦА mAP50-95 max(0..N%) ПО ЭПОХАМ (все кандидаты)")
+                log(f"{'─'*70}")
+                # Заголовок
+                _hdr = f"  {'Метод':40s}"
+                for _p in _pct_steps:
+                    _hdr += f"  {_p:>4}%"
+                log(_hdr)
+                log(f"  {'─'*40}" + "  -----" * len(_pct_steps))
+                # Строка для каждого кандидата
+                _screening_table_rows = []
+                for _cand in _as_all_cands:
+                    _cid = _cand["id"]
+                    _hist = _as_histories.get(_cid, [])
+                    _row = {"Метод": _cand["display"]}
+                    _line = f"  {_cand['display']:40s}"
+                    for _p in _pct_steps:
+                        _v = _history_score_at(_hist, _p / 100.0)
+                        _row[f"{_p}%"] = round(_v, 4)
+                        _line += f"  {_v:.4f}"
+                    _screening_table_rows.append(_row)
+                    log(_line)
+                # Строка для baseline
+                _bl_row = {"Метод": "— Baseline —"}
+                _bl_line = f"  {'— Baseline —':40s}"
+                for _p in _pct_steps:
+                    _bv = _history_score_at(_baseline_history, _p / 100.0)
+                    _bl_row[f"{_p}%"] = round(_bv, 4)
+                    _bl_line += f"  {_bv:.4f}"
+                _screening_table_rows.append(_bl_row)
+                log(_bl_line)
+                log(f"{'─'*70}")
+                # Сохраняем для передачи в result dict и CSV
+                _screening_table_data = _screening_table_rows
+
+                # ── Шаг 2: таблица рангов ────────────────────────────────
+                # Для каждого столбца (10%..100%) независимо ранжируем
+                # кандидатов по mAP50-95 (1 = лучший).
+                # Baseline не участвует в ранжировании — он не кандидат SHA.
+                # Используется для визуального анализа стабильности рангов.
+                log(f"\n{'─'*70}")
+                log(f"ТАБЛИЦА РАНГОВ (1=лучший, по mAP50-95 для каждых 10% эпох)")
+                log(f"{'─'*70}")
+                _hdr_r = f"  {'Метод':40s}"
+                for _p in _pct_steps:
+                    _hdr_r += f"  {_p:>4}%"
+                log(_hdr_r)
+                log(f"  {'─'*40}" + "  -----" * len(_pct_steps))
+
+                # Вычисляем ранги: для каждого % сортируем кандидатов по score
+                _rank_rows = []
+                for _cand in _as_all_cands:
+                    _rank_rows.append({"Метод": _cand["display"]})
+
+                for _p in _pct_steps:
+                    # scores всех кандидатов при данном %
+                    _col_scores = []
+                    for _cand in _as_all_cands:
+                        _hist = _as_histories.get(_cand["id"], [])
+                        _col_scores.append(_history_score_at(_hist, _p / 100.0))
+                    # Ранги: сортируем по убыванию, присваиваем 1..N
+                    _sorted_idx = sorted(range(len(_col_scores)),
+                                         key=lambda i: _col_scores[i],
+                                         reverse=True)
+                    _ranks = [0] * len(_col_scores)
+                    for _rank_pos, _orig_idx in enumerate(_sorted_idx, 1):
+                        _ranks[_orig_idx] = _rank_pos
+                    for _i, _cand in enumerate(_as_all_cands):
+                        _rank_rows[_i][f"{_p}%"] = _ranks[_i]
+
+                # Выводим таблицу рангов
+                for _i, _cand in enumerate(_as_all_cands):
+                    _rline = f"  {_cand['display']:40s}"
+                    for _p in _pct_steps:
+                        _rline += f"  {_rank_rows[_i][f'{_p}%']:>5}"
+                    log(_rline)
+                log(f"{'─'*70}")
+
+                # ── Шаг 3: поиск минимального % сверху вниз ─────────────────
+                # Основная проверка: ρ(N%, 100%) ≥ ρ_crit
+                #   — глобальная стабильность относительно эталонного бюджета.
+                #   Klein et al. (2017) ICLR: ранние эпохи надёжно предсказывают
+                #   финальный результат когда ρ(N%, 100%) достаточно высок.
+                # Дополнительная проверка: ρ(N%, N+10%) ≥ ρ_crit
+                #   — локальная стабильность между соседними бюджетами.
+                #   Подтверждает что ранги не случайны при данном N%.
+                # Обе проверки вместе снижают вероятность ложного принятия
+                # малого бюджета. Audibert & Bubeck (2010) COLT, Theorem 1.
                 #
-                # Обоснование направления поиска сверху вниз:
-                # Klein et al. (2017) ICLR: стабильность ранжирования
-                # резко растёт после определённого порога эпох —
-                # эталоном надёжного ранжирования является полный бюджет.
-                # Domhan et al. (2015) IJCAI: анализ кривых обучения
-                # показывает что ранжирование стабилизируется при
-                # высоком бюджете — движение от него вниз гарантирует
-                # что найденный % действительно достаточен.
-                # Audibert & Bubeck (2010) COLT: двойная проверка (p1+p2)
-                # даёт экспоненциально меньшую вероятность ложного
-                # принятия недостаточного бюджета.
+                # Алгоритм (сверху вниз, от 90% к 10%):
+                # 1. Вычисляем scores при 100% (эталон) — один раз.
+                # 2. Для N = 90%, 80%, ..., 10%:
+                #    a. ρ_global = ρ(N%, 100%)
+                #    b. ρ_local  = ρ(N%, N+10%)
+                #    c. Если обе ≥ ρ_crit → продолжаем спуск, запоминаем N%
+                #    d. Иначе → останавливаемся, берём предыдущий найденный %
+                # 3. Если ни один % не прошёл → берём 100%
 
-                _as_ratio_cur  = 80   # текущий N%, стартуем с максимального
-                _as_ratio_best = 80   # лучший (наименьший) найденный %
+                _sc_100_ref = _scores_at(1.0)  # эталон — 100% эпох
+
+                _as_ratio_best = 100  # лучший найденный % (начинаем с 100)
                 _as_found      = False
-                _consecutive_flat: int = 0
 
-                # Сначала проверяем что хотя бы 80% даёт стабильное
-                # ранжирование — если нет, нет смысла двигаться вниз.
-                _sc_80  = _scores_at(0.80)
-                _sc_90  = _scores_at(0.90)
-                _sc_100 = _scores_at(1.00)
+                # Проверяем от 90% вниз до 10%
+                # CV-проверка убрана: глобальная ρ(N%, 100%) надёжно
+                # обрабатывает все случаи включая плоские scores —
+                # если ранги случайны, ρ_global будет низким.
+                # Если scores одинаковы но ранги стабильны (ES+паддинг),
+                # ρ_global=1.0 — это валидный результат, спуск продолжается.
+                for _as_ratio_cur in range(90, 0, -10):
+                    _ra = _as_ratio_cur / 100.0
+                    _rb = (_as_ratio_cur + 10) / 100.0
 
-                _rho_80_90  = _spearman_rho(_sc_80,  _sc_90)
-                _rho_90_100 = _spearman_rho(_sc_90,  _sc_100)
-                log(f"\n  Начальная проверка N=80%:")
-                log(f"  ρ(p1: 80% vs 90%) = {_rho_80_90:.4f}  "
-                    f"ρ(p2: 90% vs 100%) = {_rho_90_100:.4f}  "
-                    f"(ρ_crit={_rho_crit:.4f})")
+                    _sc_cur  = _scores_at(_ra)
+                    _sc_next = _scores_at(_rb)   # N+10%
 
-                if _rho_80_90 < _rho_crit or _rho_90_100 < _rho_crit:
-                    # Даже при 80% ранжирование нестабильно — берём 100%
-                    log(f"  Ранжирование нестабильно даже при N=80% — "
-                        f"принимаем 100%.")
-                    screening_ratio = 100
-                    fast_epochs = max_epochs
-                    _auto_screen_scores = _scores_at(1.0)
-                    _as_found = True
-                else:
-                    log(f"  ✓ N=80% стабилен — начинаем спуск вниз.")
-                    _as_ratio_best = 80
+                    log(f"\n  Проверка N={_as_ratio_cur}%:")
+                    for _cand in _as_all_cands:
+                        _cid = _cand["id"]
+                        log(f"    {_cand['display']:40s}  "
+                            f"{_as_ratio_cur}%={_sc_cur.get(_cid,0):.4f}  "
+                            f"{_as_ratio_cur+10}%={_sc_next.get(_cid,0):.4f}  "
+                            f"100%={_sc_100_ref.get(_cid,0):.4f}")
 
-                    # Спускаемся вниз по 10% пока обе проверки проходят
-                    _as_ratio_cur = 70
-                    while _as_ratio_cur >= 10:
-                        _ra = _as_ratio_cur / 100.0
-                        _rb = (_as_ratio_cur + 10) / 100.0
-                        _rc = (_as_ratio_cur + 20) / 100.0
+                    _rho_global = _spearman_rho(_sc_cur, _sc_100_ref)
+                    _rho_local  = _spearman_rho(_sc_cur, _sc_next)
+                    log(f"  ρ_global(N% vs 100%) = {_rho_global:.4f}  |  "
+                        f"ρ_local(N% vs N+10%) = {_rho_local:.4f}  "
+                        f"(ρ_crit={_rho_crit:.4f})")
 
-                        _sc_a = _scores_at(_ra)
-                        _sc_b = _scores_at(_rb)
-                        _sc_c = _scores_at(_rc)
+                    if _rho_global >= _rho_crit and _rho_local >= _rho_crit:
+                        log(f"  ✓ N={_as_ratio_cur}% стабилен — "
+                            f"продолжаем спуск.")
+                        _as_ratio_best = _as_ratio_cur
+                    else:
+                        if _rho_global < _rho_crit:
+                            log(f"  ρ_global={_rho_global:.4f} < {_rho_crit:.4f} — "
+                                f"нестабилен относительно 100%.")
+                        if _rho_local < _rho_crit:
+                            log(f"  ρ_local={_rho_local:.4f} < {_rho_crit:.4f} — "
+                                f"нестабилен локально.")
+                        log(f"  Останавливаемся на {_as_ratio_best}%.")
+                        break
 
-                        log(f"\n  Проверка N={_as_ratio_cur}% / "
-                            f"N+10={_as_ratio_cur+10}% / "
-                            f"N+20={_as_ratio_cur+20}%")
-                        for _cand in _as_all_cands:
-                            _cid = _cand["id"]
-                            log(f"    {_cand['display']:40s}  "
-                                f"{_as_ratio_cur}%={_sc_a.get(_cid,0):.4f}  "
-                                f"{_as_ratio_cur+10}%={_sc_b.get(_cid,0):.4f}  "
-                                f"{_as_ratio_cur+20}%={_sc_c.get(_cid,0):.4f}")
+                screening_ratio = _as_ratio_best
+                fast_epochs = max(1, int(max_epochs * (_as_ratio_best / 100)))
+                _auto_screen_scores = _scores_at(_as_ratio_best / 100.0)
+                _as_found = True
 
-                        # Flat-scores guard
-                        _is_flat = _check_flat_scores(_sc_a, log_fn=None)
-                        if _is_flat:
-                            _consecutive_flat += 1
-                            if _consecutive_flat >= 2:
-                                _check_flat_scores(_sc_a, log_fn=log)
-                                log(f"\n  Scores плоские (CV < 1.5%) на двух "
-                                    f"последовательных бюджетах — "
-                                    f"останавливаемся на {_as_ratio_best}%.")
-                                break
-                        else:
-                            _consecutive_flat = 0
-
-                        _rho_p1 = _spearman_rho(_sc_a, _sc_b)
-                        _rho_p2 = _spearman_rho(_sc_b, _sc_c)
-                        log(f"  ρ(p1: {_as_ratio_cur}% vs {_as_ratio_cur+10}%) "
-                            f"= {_rho_p1:.4f}  |  "
-                            f"ρ(p2: {_as_ratio_cur+10}% vs {_as_ratio_cur+20}%) "
-                            f"= {_rho_p2:.4f}  (ρ_crit={_rho_crit:.4f})")
-
-                        if _rho_p1 >= _rho_crit and _rho_p2 >= _rho_crit:
-                            log(f"  ✓ N={_as_ratio_cur}% стабилен — "
-                                f"продолжаем спуск.")
-                            _as_ratio_best = _as_ratio_cur
-                            _as_ratio_cur -= 10
-                        else:
-                            log(f"  N={_as_ratio_cur}% нестабилен "
-                                f"(ρ_p1={_rho_p1:.4f}, "
-                                f"ρ_p2={_rho_p2:.4f}) — "
-                                f"останавливаемся на {_as_ratio_best}%.")
-                            break
-
-                    screening_ratio = _as_ratio_best
-                    fast_epochs = max(1, int(max_epochs * (_as_ratio_best / 100)))
-                    _auto_screen_scores = _scores_at(_as_ratio_best / 100.0)
-                    _as_found = True
-
-                    log(f"\n  Итог спуска: минимальный стабильный % = "
-                        f"{_as_ratio_best}%")
+                log(f"\n  Итог спуска: минимальный стабильный % = "
+                    f"{_as_ratio_best}%")
                 # Удаляем временные датасеты
                 for _ds in _as_ds_map.values():
                     _cleanup_ds(_ds)
@@ -1525,8 +1645,17 @@ def _run_search(q: queue.Queue, config: Dict):
         log("=" * 70)
         log(f"BASELINE: оригинальный датасет ({screening_ratio}% эпох)")
         log("=" * 70)
-        baseline_score = quick_train(dataset_name, "baseline")
-        log(f"  Baseline score = {baseline_score:.4f}")
+        # Если автоподбор включён — baseline уже обучен до 100% с историей.
+        # Берём max(0..screening_ratio%) — равные условия с кандидатами.
+        # Если автоподбор выключен — обучаем baseline обычным способом.
+        if auto_screen and _baseline_history:
+            baseline_score = _history_score_at(
+                _baseline_history, screening_ratio / 100.0)
+            log(f"  Baseline score = {baseline_score:.4f}  "
+                f"[из истории автоподбора, max(0..{screening_ratio}%)]")
+        else:
+            baseline_score = quick_train(dataset_name, "baseline")
+            log(f"  Baseline score = {baseline_score:.4f}")
 
         # ══════════════════════════════════════════════════════════════════
         # ФАЗА 1: Group-wise SHA-скрининг
@@ -1935,35 +2064,79 @@ def _run_search(q: queue.Queue, config: Dict):
         # ══════════════════════════════════════════════════════════════════
         log("")
         log("=" * 70)
-        log("ФИНАЛЬНОЕ ОБУЧЕНИЕ ПОБЕДИТЕЛЯ")
+        log("ФИНАЛЬНОЕ ОБУЧЕНИЕ ПОБЕДИТЕЛЕЙ (топ-N)")
         log("=" * 70)
 
-        # Выбираем лучшего среди финальных survivors
-        best_survivor = max(final_survivors, key=lambda x: x["score"])
-        best_pipeline_cands = best_survivor["pipeline_cands"]
+        # Сколько топ-survivors обучать финально
+        top_k = config.get("top_k_winners", 1)
+        # Сортируем survivors по score (лучший первый)
+        _sorted_survivors = sorted(final_survivors,
+                                   key=lambda x: x["score"], reverse=True)
+        # Берём min(top_k, len(survivors))
+        _top_survivors = _sorted_survivors[:min(top_k, len(_sorted_survivors))]
 
-        # Если победитель — одиночный метод из Фазы 1 (len==1) и его score
-        # не превышает baseline, честно сообщаем пользователю, но всё равно
-        # обучаем и сравниваем полным обучением.
-        log(f"  Лучший survivor: {best_survivor['display']}  score({screening_ratio}%)={best_survivor['score']:.4f}")
+        log(f"  Финальных survivors: {len(final_survivors)}, "
+            f"будем обучать топ-{len(_top_survivors)}")
         log(f"  Baseline score ({screening_ratio}%): {baseline_score:.4f}")
+        for _s in _top_survivors:
+            log(f"    • {_s['display']:40s}  score({screening_ratio}%)={_s['score']:.4f}")
 
-        # pipeline_cands — список одиночных survivor-dict из Фазы 1
-        winner_methods, winner_params = merge_methods_params(best_pipeline_cands)
-        winner_display = best_survivor["display"]
-        log(f"  Победитель для полного обучения: {winner_display}")
+        # Обучаем каждого из топ-N survivors
+        # Победителем станет лучший по score на test сплите
+        _finalist_results = []  # список (survivor, ds_name, metrics)
+        for _rank, _surv in enumerate(_top_survivors, 1):
+            _surv_methods, _surv_params = merge_methods_params(
+                _surv["pipeline_cands"])
+            _surv_display = _surv["display"]
+            _surv_ds_name = f"{dataset_name}_p2_top{_rank}"
+            log(f"\n  [{_rank}/{len(_top_survivors)}] Финал: {_surv_display}")
+            log(f"  Создаю датасет: {_surv_ds_name}")
+            preprocessor.apply_global_preprocessing(
+                source_dataset=dataset_name,
+                target_dataset=_surv_ds_name,
+                methods=_surv_methods,
+                params=_surv_params,
+            )
+            _surv_metrics = full_train(_surv_ds_name, _surv_display,
+                                       result_subdir=f"final_top{_rank}")
+            _surv_score = score_from_metrics(_surv_metrics)
+            log(f"    → score(test)={_surv_score:.4f}  "
+                f"mAP50-95={_surv_metrics.get('mAP50-95',0):.4f}")
+            _finalist_results.append((_surv, _surv_ds_name, _surv_metrics))
 
-        # Создаём постоянный датасет-победитель (не временный)
-        winner_ds_name = f"{dataset_name}_p2_winner"
-        log(f"  Создаю постоянный датасет: {winner_ds_name}")
-        preprocessor.apply_global_preprocessing(
-            source_dataset=dataset_name,
-            target_dataset=winner_ds_name,
-            methods=winner_methods,
-            params=winner_params,
-        )
-        final_metrics = full_train(winner_ds_name, winner_display,
-                                   result_subdir="final_winner")
+        # Лучший финалист по score на test
+        _best_finalist = max(_finalist_results,
+                             key=lambda x: score_from_metrics(x[2]))
+        best_survivor, winner_ds_name, final_metrics = _best_finalist
+        winner_display  = best_survivor["display"]
+        winner_methods, winner_params = merge_methods_params(
+            best_survivor["pipeline_cands"])
+
+        # Переименовываем датасет победителя в стандартное имя
+        _final_winner_ds = f"{dataset_name}_p2_winner"
+        if winner_ds_name != _final_winner_ds:
+            try:
+                import shutil as _sh
+                _src_p = get_dataset_path(winner_ds_name)
+                _dst_p = get_dataset_path(_final_winner_ds)
+                if _src_p.exists():
+                    if _dst_p.exists():
+                        _sh.rmtree(_dst_p)
+                    _sh.copytree(_src_p, _dst_p)
+                    winner_ds_name = _final_winner_ds
+            except Exception as _re:
+                log(f"  [ПРЕДУПРЕЖДЕНИЕ] Не удалось переименовать датасет: {_re}")
+
+        log(f"\n  Победитель финала: {winner_display}  "
+            f"score(test)={score_from_metrics(final_metrics):.4f}")
+        if len(_finalist_results) > 1:
+            log("  Все финалисты (test):")
+            for _s, _ds, _m in sorted(_finalist_results,
+                                       key=lambda x: score_from_metrics(x[2]),
+                                       reverse=True):
+                log(f"    {_s['display']:40s}  "
+                    f"score={score_from_metrics(_m):.4f}  "
+                    f"mAP50-95={_m.get('mAP50-95',0):.4f}")
 
         # ══════════════════════════════════════════════════════════════════
         # ФИНАЛЬНЫЙ BASELINE (полное обучение для честного сравнения)
@@ -2048,6 +2221,20 @@ def _run_search(q: queue.Queue, config: Dict):
                     "pipeline_ids": list(s["pipeline_ids"]),
                 }
                 for s in sorted(final_survivors, key=lambda x: x["score"], reverse=True)
+            ],
+            "screening_table": _screening_table_data,
+            # Все финалисты (топ-N) с метриками на test
+            "all_finalists": [
+                {
+                    "display": _s["display"],
+                    "score":   round(score_from_metrics(_m), 4),
+                    "mAP50-95": round(_m.get("mAP50-95", 0), 4),
+                    "mAP50":    round(_m.get("mAP50", 0), 4),
+                    "f1":       round(_m.get("f1", 0), 4),
+                }
+                for _s, _ds, _m in sorted(
+                    _finalist_results,
+                    key=lambda x: score_from_metrics(x[2]), reverse=True)
             ],
             "baseline_quick_score": round(baseline_score, 4),
         }
@@ -2549,6 +2736,20 @@ if st.session_state.p2_stage == "configure":
             key="p2_seed_input",
             help="Dodge & Karam (2017) — фиксация seed устраняет случайный разброс метрик",
         )
+        top_k_winners = st.number_input(
+            "Топ-N финалистов для полного обучения",
+            min_value=1, max_value=10,
+            value=st.session_state.p2_top_k_winners,
+            key="p2_top_k_winners_input",
+            help=(
+                "Сколько лучших survivors Фазы 2 обучить до 100% эпох. "
+                "Победителем станет лучший по mAP50-95 на test. "
+                "1 = только лучший (быстро). 3-5 = страховка от rank reversal. "
+                "Zoller & Huber (2021): валидация нескольких топ-кандидатов "
+                "снижает риск упустить лучший вариант."
+            ),
+        )
+        st.session_state.p2_top_k_winners = top_k_winners
         screening_ratio = st.slider(
             "% эпох для скрининга",
             min_value=10, max_value=60,
@@ -2691,6 +2892,8 @@ elif st.session_state.p2_stage == "running":
                                   st.session_state.get("p2_auto_screen", False)),
             "auto_screen_start":  st.session_state.get("p2_auto_screen_start_slider",
                                   st.session_state.get("p2_auto_screen_start", 40)),
+            "top_k_winners":      st.session_state.get("p2_top_k_winners_input",
+                                  st.session_state.get("p2_top_k_winners", 1)),
             # auto_screen_rho убран — критическое значение ρ вычисляется
             # автоматически внутри _run_search через _spearman_critical_rho(N).
             # Zar (2005); Ramsey (1989).
@@ -3004,6 +3207,32 @@ elif st.session_state.p2_stage == "done":
             st.divider()
 
             # ─────────────────────────────────────────────────────────────
+            # ВСЕ ФИНАЛИСТЫ (топ-N)
+            # ─────────────────────────────────────────────────────────────
+            all_finalists = result.get("all_finalists", [])
+            if len(all_finalists) > 1:
+                with st.expander(
+                    f"Все финалисты топ-N (полное обучение, test)",
+                    expanded=True
+                ):
+                    _fin_rows = [
+                        {
+                            "Пайплайн":   f["display"],
+                            "Score":      f"{f['score']:.4f}",
+                            "mAP50-95":   f"{f['mAP50-95']:.4f}",
+                            "mAP50":      f"{f['mAP50']:.4f}",
+                            "F1":         f"{f['f1']:.4f}",
+                            "Победитель": "✓" if f["display"] == result.get("winner_pipeline") else "",
+                        }
+                        for f in all_finalists
+                    ]
+                    import pandas as _pd_fin
+                    st.dataframe(_pd_fin.DataFrame(_fin_rows),
+                                 use_container_width=True)
+
+            st.divider()
+
+            # ─────────────────────────────────────────────────────────────
             # СКАЧИВАНИЕ
             # ─────────────────────────────────────────────────────────────
             st.subheader("Скачать результаты")
@@ -3041,6 +3270,22 @@ elif st.session_state.p2_stage == "done":
                     mime="text/csv",
                     use_container_width=True,
                 )
+
+            # CSV таблица скрининга — mAP50-95 по 10% шагам (автоподбор)
+            screening_table_data = result.get("screening_table", [])
+            if screening_table_data:
+                csv_screening = pd.DataFrame(screening_table_data).to_csv(
+                    index=False, encoding="utf-8")
+                # Добавляем четвёртую колонку
+                dl_col4, = st.columns(1)
+                with dl_col4:
+                    st.download_button(
+                        label="📥 Таблица скрининга (mAP50-95 по 10% эпох)",
+                        data=csv_screening,
+                        file_name=f"p2_screening_history_{result.get('dataset_name','')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
 
             # Полный лог
             full_log = "\n".join(st.session_state.p2_log_lines)

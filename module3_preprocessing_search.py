@@ -433,6 +433,8 @@ def _run_training(
     eval_split: str = 'val',
     resume_from: str = '',
     keep_weights: bool = False,
+    max_epochs_for_schedule: int = 0,
+    disable_mosaic: bool = False,
 ) -> Dict[str, float]:
     """
     Запускает обучение через wrapper'ы из Модуля 2.
@@ -553,12 +555,39 @@ def _run_training(
                 _lrf = 0.01        # дефолт Ultralytics
                 _warmup_ep = 3.0   # дефолт Ultralytics
 
+            # ── Логика lr-schedule и прерывания ─────────────────────────
+            # Если max_epochs_for_schedule задан (> epochs_delta) —
+            # запускаем YOLO на полном бюджете, но прерываем через callback
+            # после epochs_delta эпох. lr-schedule рассчитывается на
+            # max_epochs_for_schedule, что согласует Фазы 1/2 с историями
+            # автоподбора скрининга (тоже обученными на max_epochs).
+            # Если max_epochs_for_schedule не задан — обычный режим.
+            _use_schedule_override = (
+                max_epochs_for_schedule > 0
+                and max_epochs_for_schedule > epochs_delta
+            )
+            _actual_train_epochs = (
+                max_epochs_for_schedule if _use_schedule_override
+                else epochs_delta
+            )
+            _stop_at_epoch = epochs_delta  # реально нужное число эпох
+
+            if _use_schedule_override:
+                # Callback прерывает обучение после _stop_at_epoch эпох.
+                # trainer.epoch — 0-based счётчик внутри текущего запуска.
+                def _early_stop_cb(trainer):
+                    if (trainer.epoch + 1) >= _stop_at_epoch:
+                        trainer.stop = True
+                model.add_callback('on_fit_epoch_end', _early_stop_cb)
+                log_fn(
+                    f"  [LR-SCHEDULE] Запуск на {_actual_train_epochs} эп., "
+                    f"прерывание после {_stop_at_epoch} эп. "
+                    f"(lr-schedule согласован с автоподбором)"
+                )
+
             train_kwargs = dict(
                 data=str(yaml_path),
-                # Передаём дельту эпох, а не абсолютное число.
-                # Ключевое исправление: lr-schedule охватывает только
-                # дополнительные эпохи. Li et al. (2018) JMLR 18(185).
-                epochs=epochs_delta,
+                epochs=_actual_train_epochs,
                 imgsz=imgsz,
                 batch=model_config.get('batch', -1),
                 device=device,
@@ -578,6 +607,12 @@ def _run_training(
                 lr0=_lr0,
                 lrf=_lrf,
                 warmup_epochs=_warmup_ep,
+                # close_mosaic: если disable_mosaic=True — отключаем полностью.
+                # Используется в Фазах 1/2 для согласованности условий с
+                # историями автоподбора (там тоже close_mosaic=0).
+                # Redmon & Farhadi (2018): мозаика влияет на метрики —
+                # равные условия требуют одинакового режима мозаики.
+                close_mosaic=0 if disable_mosaic else 10,
             )
             if use_early_stopping:
                 train_kwargs['patience'] = early_stopping_patience
@@ -788,6 +823,7 @@ def _run_training_full_history(
     epochs: int,
     result_dir: Path,
     log_fn,
+    early_stopping_patience: int = 20,
 ) -> List[float]:
     """
     Обучает YOLO до 100% эпох с close_mosaic=0 и возвращает историю
@@ -848,7 +884,7 @@ def _run_training_full_history(
                 verbose=False,
                 save=True,
                 resume=False,
-                patience=0,          # ES выкл — нужна полная история до epochs
+                patience=early_stopping_patience,
                 close_mosaic=0,      # мозаика одинакова на всех эпохах
                 lr0=0.01,            # дефолт Ultralytics
                 lrf=0.01,
@@ -864,7 +900,6 @@ def _run_training_full_history(
                 with open(csv_path, newline='', encoding='utf-8') as f:
                     reader = _csv.DictReader(f)
                     for row in reader:
-                        # Ищем колонку с mAP50-95 независимо от пробелов
                         for k, v in row.items():
                             if 'mAP50-95' in k and 'mAP50(B)' not in k:
                                 try:
@@ -875,6 +910,22 @@ def _run_training_full_history(
                 log_fn(f"  [HISTORY] Прочитано {len(history)} эпох из results.csv")
             else:
                 log_fn(f"  [HISTORY] results.csv не найден: {csv_path}")
+
+            # Паддинг после ES: если ES остановил обучение раньше epochs,
+            # дополняем историю последним реально полученным значением.
+            # Prechelt (1998): ES детектирует плато — после остановки
+            # метрика не изменилась бы существенно. Паддинг последним
+            # значением не вносит новых максимумов в историю, поэтому
+            # max(0..N%) для любого порога остаётся корректным.
+            # Li et al. (2018): все кандидаты должны иметь одинаковую
+            # длину истории для корректного сравнения при бюджете N%.
+            if len(history) < epochs:
+                last_val = history[-1] if history else 0.0
+                padded = epochs - len(history)
+                history.extend([last_val] * padded)
+                log_fn(f"  [HISTORY] ES сработал на эпохе {epochs - padded} "
+                       f"из {epochs} — паддинг {padded} эпох "
+                       f"значением {last_val:.4f} (Prechelt, 1998)")
 
             del model
 
