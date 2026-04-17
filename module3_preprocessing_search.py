@@ -433,6 +433,7 @@ def _run_training(
     eval_split: str = 'val',
     resume_from: str = '',
     keep_weights: bool = False,
+    seed: int = 42,
 ) -> Dict[str, float]:
     """
     Запускает обучение через wrapper'ы из Модуля 2.
@@ -578,6 +579,9 @@ def _run_training(
                 lr0=_lr0,
                 lrf=_lrf,
                 warmup_epochs=_warmup_ep,
+                # Воспроизводимость: Dodge & Karam (2017) CVPRW — фиксация seed
+                # устраняет случайный разброс метрик между запусками.
+                seed=seed,
             )
             if use_early_stopping:
                 train_kwargs['patience'] = early_stopping_patience
@@ -790,6 +794,7 @@ def _run_training_final(
     log_fn,
     early_stopping_patience: int = 10,
     eval_split: str = 'test',
+    seed: int = 42,
 ) -> Dict[str, float]:
     """
     Финальное обучение победителя на постоянном датасете.
@@ -835,6 +840,8 @@ def _run_training_final(
                 verbose=False,
                 save=True,
                 patience=early_stopping_patience,
+                # Воспроизводимость: Dodge & Karam (2017) CVPRW.
+                seed=seed,
             )
             train_metrics_dict = results.results_dict
 

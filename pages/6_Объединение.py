@@ -912,6 +912,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     log_fn=log,
                     early_stopping_patience=patience,
                     eval_split="test",
+                    seed=seed,
                 )
             else:
                 # Скрининговое обучение (SHA или warm-start автоподбора).
@@ -930,6 +931,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     eval_split="valid",
                     resume_from=resume,
                     keep_weights=keep_weights,
+                    seed=seed,
                 )
             return metrics
 
