@@ -124,7 +124,7 @@ _STATE_DEFAULTS = {
     # Автоподбор процента скрининга
     "p2_auto_screen":         False,   # включить автоподбор
     "p2_auto_screen_start":   40,      # начальный % (пользователь задаёт)
-    "p2_auto_screen_direction": "top_down",  # направление поиска: top_down / bottom_up
+    "p2_auto_screen_direction": "top_down",  # направление поиска: top_down / bottom_up / full_budget
     "p2_history_csv_content":   "",          # содержимое загруженного CSV истории
     "p2_top_k_winners":       1,       # сколько топ-survivors обучать финально
 }
@@ -1623,100 +1623,101 @@ def _run_search(q: queue.Queue, config: Dict):
                     log(_rline)
                 log(f"{'─'*70}")
 
-                # ── Шаг 3: поиск минимального % ─────────────────────────
-                # Два режима: сверху вниз (top_down) и снизу вверх (bottom_up).
-                #
-                # Общая логика для обоих режимов:
-                #   Основная:     ρ_global = ρ(N%, 100%) ≥ ρ_crit
-                #   Дополнит.:    ρ_local  = ρ(N%, N+10%) ≥ ρ_crit
-                #
-                # Сверху вниз (top_down): начинаем с 90%, идём к 10%.
-                #   Берём наименьший % при котором ОБЕ проверки прошли
-                #   на всём пути спуска. Более консервативен.
-                #   Klein et al. (2017) ICLR: эталон — полный бюджет.
-                #
-                # Снизу вверх (bottom_up): начинаем с 10%, идём к 90%.
-                #   Останавливаемся при ПЕРВОМ %, где обе проверки прошли.
-                #   Быстрее находит минимальный %, но менее строг.
+                # ── Шаг 3: выбор бюджета скрининга ──────────────────
+                # Три режима: top_down, bottom_up, full_budget.
+                # full_budget: поиск % не нужен — сразу берём 100%.
+                # top_down / bottom_up: поиск через ρ_global + ρ_local.
 
                 _sc_100_ref   = _scores_at(1.0)   # эталон — 100% эпох
                 _as_ratio_best = 100
                 _as_found      = False
 
-                def _check_pct(n_pct: int) -> bool:
-                    """Проверяет N% через ρ_global и ρ_local. True = стабилен."""
-                    _sc_n    = _scores_at(n_pct / 100.0)
-                    _sc_n10  = _scores_at((n_pct + 10) / 100.0)
-                    _rg = _spearman_rho(_sc_n, _sc_100_ref)
-                    _rl = _spearman_rho(_sc_n, _sc_n10)
-                    log(f"  ρ_global({n_pct}% vs 100%) = {_rg:.4f}  |  "
-                        f"ρ_local({n_pct}% vs {n_pct+10}%) = {_rl:.4f}  "
-                        f"(ρ_crit={_rho_crit:.4f})")
-                    if _rg >= _rho_crit and _rl >= _rho_crit:
-                        return True
-                    if _rg < _rho_crit:
-                        log(f"  ρ_global={_rg:.4f} < {_rho_crit:.4f} — "
-                            f"нестабилен относительно 100%.")
-                    if _rl < _rho_crit:
-                        log(f"  ρ_local={_rl:.4f} < {_rho_crit:.4f} — "
-                            f"нестабилен локально.")
-                    return False
-
-                if auto_screen_direction == "bottom_up":
-                    # ── Снизу вверх: 10% → 90% ───────────────────────────
-                    log(f"\n  Режим: снизу вверх (10% → 90%)")
-                    for _as_ratio_cur in range(10, 100, 10):
-                        _sc_cur = _scores_at(_as_ratio_cur / 100.0)
-                        log(f"\n  Проверка N={_as_ratio_cur}%:")
-                        for _cand in _as_all_cands:
-                            _cid = _cand["id"]
-                            _sc_n10 = _scores_at((_as_ratio_cur + 10) / 100.0)
-                            log(f"    {_cand['display']:40s}  "
-                                f"{_as_ratio_cur}%={_sc_cur.get(_cid,0):.4f}  "
-                                f"{_as_ratio_cur+10}%={_sc_n10.get(_cid,0):.4f}  "
-                                f"100%={_sc_100_ref.get(_cid,0):.4f}")
-                        if _check_pct(_as_ratio_cur):
-                            log(f"  ✓ N={_as_ratio_cur}% стабилен — "
-                                f"принимаем (первый стабильный снизу).")
-                            _as_ratio_best = _as_ratio_cur
-                            break
-                        else:
-                            log(f"  N={_as_ratio_cur}% нестабилен — "
-                                f"поднимаемся выше.")
-                    else:
-                        # Дошли до 90% без успеха — берём 100%
-                        log(f"\n  Ни один % не прошёл — принимаем 100%.")
-                        _as_ratio_best = 100
+                if auto_screen_direction == "full_budget":
+                    # ── 100% бюджет: поиск не нужен ─────────────────────
+                    # Скрининг всегда на 100% эпох — все кандидаты уже
+                    # обучены до 100% (история есть), scores берутся
+                    # как max(0..100%).
+                    log(f"\n  Режим: 100% бюджет (поиск % не выполняется)")
+                    log(f"  Скрининг будет использовать полный бюджет "
+                        f"{max_epochs} эп. для всех кандидатов.")
+                    _as_ratio_best = 100
+                    _as_found = True
 
                 else:
-                    # ── Сверху вниз: 90% → 10% ───────────────────────────
-                    log(f"\n  Режим: сверху вниз (90% → 10%)")
-                    for _as_ratio_cur in range(90, 0, -10):
-                        _sc_cur = _scores_at(_as_ratio_cur / 100.0)
-                        log(f"\n  Проверка N={_as_ratio_cur}%:")
-                        for _cand in _as_all_cands:
-                            _cid = _cand["id"]
-                            _sc_n10 = _scores_at((_as_ratio_cur + 10) / 100.0)
-                            log(f"    {_cand['display']:40s}  "
-                                f"{_as_ratio_cur}%={_sc_cur.get(_cid,0):.4f}  "
-                                f"{_as_ratio_cur+10}%={_sc_n10.get(_cid,0):.4f}  "
-                                f"100%={_sc_100_ref.get(_cid,0):.4f}")
-                        if _check_pct(_as_ratio_cur):
-                            log(f"  ✓ N={_as_ratio_cur}% стабилен — "
-                                f"продолжаем спуск.")
-                            _as_ratio_best = _as_ratio_cur
+                    def _check_pct(n_pct: int) -> bool:
+                        """Проверяет N% через ρ_global и ρ_local. True = стабилен."""
+                        _sc_n    = _scores_at(n_pct / 100.0)
+                        _sc_n10  = _scores_at((n_pct + 10) / 100.0)
+                        _rg = _spearman_rho(_sc_n, _sc_100_ref)
+                        _rl = _spearman_rho(_sc_n, _sc_n10)
+                        log(f"  ρ_global({n_pct}% vs 100%) = {_rg:.4f}  |  "
+                            f"ρ_local({n_pct}% vs {n_pct+10}%) = {_rl:.4f}  "
+                            f"(ρ_crit={_rho_crit:.4f})")
+                        if _rg >= _rho_crit and _rl >= _rho_crit:
+                            return True
+                        if _rg < _rho_crit:
+                            log(f"  ρ_global={_rg:.4f} < {_rho_crit:.4f} — "
+                                f"нестабилен относительно 100%.")
+                        if _rl < _rho_crit:
+                            log(f"  ρ_local={_rl:.4f} < {_rho_crit:.4f} — "
+                                f"нестабилен локально.")
+                        return False
+
+                    if auto_screen_direction == "bottom_up":
+                        # ── Снизу вверх: 10% → 90% ───────────────────────
+                        log(f"\n  Режим: снизу вверх (10% → 90%)")
+                        for _as_ratio_cur in range(10, 100, 10):
+                            _sc_cur = _scores_at(_as_ratio_cur / 100.0)
+                            log(f"\n  Проверка N={_as_ratio_cur}%:")
+                            for _cand in _as_all_cands:
+                                _cid = _cand["id"]
+                                _sc_n10 = _scores_at((_as_ratio_cur + 10) / 100.0)
+                                log(f"    {_cand['display']:40s}  "
+                                    f"{_as_ratio_cur}%={_sc_cur.get(_cid,0):.4f}  "
+                                    f"{_as_ratio_cur+10}%={_sc_n10.get(_cid,0):.4f}  "
+                                    f"100%={_sc_100_ref.get(_cid,0):.4f}")
+                            if _check_pct(_as_ratio_cur):
+                                log(f"  ✓ N={_as_ratio_cur}% стабилен — "
+                                    f"принимаем (первый стабильный снизу).")
+                                _as_ratio_best = _as_ratio_cur
+                                break
+                            else:
+                                log(f"  N={_as_ratio_cur}% нестабилен — "
+                                    f"поднимаемся выше.")
                         else:
-                            log(f"  N={_as_ratio_cur}% нестабилен — "
-                                f"останавливаемся на {_as_ratio_best}%.")
-                            break
+                            log(f"\n  Ни один % не прошёл — принимаем 100%.")
+                            _as_ratio_best = 100
+
+                    else:
+                        # ── Сверху вниз: 90% → 10% ───────────────────────
+                        log(f"\n  Режим: сверху вниз (90% → 10%)")
+                        for _as_ratio_cur in range(90, 0, -10):
+                            _sc_cur = _scores_at(_as_ratio_cur / 100.0)
+                            log(f"\n  Проверка N={_as_ratio_cur}%:")
+                            for _cand in _as_all_cands:
+                                _cid = _cand["id"]
+                                _sc_n10 = _scores_at((_as_ratio_cur + 10) / 100.0)
+                                log(f"    {_cand['display']:40s}  "
+                                    f"{_as_ratio_cur}%={_sc_cur.get(_cid,0):.4f}  "
+                                    f"{_as_ratio_cur+10}%={_sc_n10.get(_cid,0):.4f}  "
+                                    f"100%={_sc_100_ref.get(_cid,0):.4f}")
+                            if _check_pct(_as_ratio_cur):
+                                log(f"  ✓ N={_as_ratio_cur}% стабилен — "
+                                    f"продолжаем спуск.")
+                                _as_ratio_best = _as_ratio_cur
+                            else:
+                                log(f"  N={_as_ratio_cur}% нестабилен — "
+                                    f"останавливаемся на {_as_ratio_best}%.")
+                                break
 
                 screening_ratio = _as_ratio_best
                 fast_epochs = max(1, int(max_epochs * (_as_ratio_best / 100)))
                 _auto_screen_scores = _scores_at(_as_ratio_best / 100.0)
                 _as_found = True
 
-                log(f"\n  Итог поиска: минимальный стабильный % = "
-                    f"{_as_ratio_best}%  (режим: {auto_screen_direction})")
+                log(f"\n  Итог поиска: бюджет скрининга = "
+                    f"{_as_ratio_best}%  ({fast_epochs} эп.)  "
+                    f"режим: {auto_screen_direction}")
                 # Удаляем временные датасеты
                 for _ds in _as_ds_map.values():
                     _cleanup_ds(_ds)
@@ -2885,15 +2886,19 @@ if st.session_state.p2_stage == "configure":
             )
             st.session_state.p2_auto_screen_start = auto_screen_start
         with _as_col2:
+            _dir_options = ["top_down", "bottom_up", "full_budget"]
+            _dir_cur = st.session_state.get(
+                "p2_auto_screen_direction", "top_down")
+            _dir_idx = _dir_options.index(_dir_cur) if _dir_cur in _dir_options else 0
             auto_screen_direction = st.radio(
-                "Направление поиска",
-                options=["top_down", "bottom_up"],
+                "Режим поиска бюджета",
+                options=_dir_options,
                 format_func=lambda x: {
-                    "top_down":  "Сверху вниз (от 90% к 10%)",
-                    "bottom_up": "Снизу вверх (от 10% к 90%)",
+                    "top_down":    "Сверху вниз (от 90% к 10%)",
+                    "bottom_up":   "Снизу вверх (от 10% к 90%)",
+                    "full_budget": "100% бюджет (без поиска %)",
                 }[x],
-                index=0 if st.session_state.get(
-                    "p2_auto_screen_direction", "top_down") == "top_down" else 1,
+                index=_dir_idx,
                 key="p2_auto_screen_direction_radio",
                 help=(
                     "Сверху вниз: начинает с 90%, спускается вниз — "
@@ -2901,7 +2906,10 @@ if st.session_state.p2_stage == "configure":
                     "на всём пути от 90% до найденного %.\n\n"
                     "Снизу вверх: начинает с 10%, поднимается — "
                     "останавливается при первом стабильном %. "
-                    "Быстрее, но менее консервативен."
+                    "Быстрее, но менее консервативен.\n\n"
+                    "100% бюджет: поиск % не выполняется — скрининг "
+                    "всегда на 100% эпох. Если загружен CSV истории — "
+                    "обучение пропускается. Фаза 1 и 2 также на 100%."
                 ),
             )
             st.session_state.p2_auto_screen_direction = auto_screen_direction
