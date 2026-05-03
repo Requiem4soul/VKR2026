@@ -124,6 +124,9 @@ _STATE_DEFAULTS = {
     # Автоподбор процента скрининга
     "p2_auto_screen":         False,   # включить автоподбор
     "p2_auto_screen_start":   40,      # начальный % (пользователь задаёт)
+    "p2_auto_screen_direction": "top_down",  # направление поиска: top_down / bottom_up / full_budget / warm_start
+    "p2_history_csv_content":   "",          # содержимое загруженного CSV истории
+    "p2_top_k_winners":       1,       # сколько топ-survivors обучать финально
 }
 for _k, _v in _STATE_DEFAULTS.items():
     if _k not in st.session_state:
@@ -926,11 +929,13 @@ def _run_search(q: queue.Queue, config: Dict):
                     epochs=epochs,
                     result_dir=result_dir,
                     log_fn=log,
-                    use_early_stopping=False,
+                    use_early_stopping=use_es,
                     early_stopping_patience=patience,
                     eval_split="valid",
                     resume_from=resume,
                     keep_weights=keep_weights,
+                    max_epochs_for_schedule=max_epochs,
+                    disable_mosaic=True,
                     seed=seed,
                 )
             return metrics
@@ -939,9 +944,21 @@ def _run_search(q: queue.Queue, config: Dict):
 
         def quick_train(ds_name: str, label: str) -> float:
             """
-            Быстрое обучение (30% эпох, ES выкл).
-            Возвращает scalar score для ранжирования SHA.
-            Jamieson & Talwalkar (2016) — % эпох для скрининга задаётся пользователем.
+            Быстрое обучение (screening_ratio% эпох) для Фазы 1 и Фазы 2.
+
+            Классификация: ES выключен — история единая, max(history)
+            корректно отражает пик кандидата.
+
+            Детекция (YOLO): ES включён с patience из UI.
+            Обоснование: каждый вызов model.train() независим, best.pt
+            сохраняет пик кривой автоматически. ES останавливает обучение
+            после patience эпох без улучшения — лишних вычислений нет,
+            score из best.pt не изменяется. При переобучении (наблюдалось
+            на WGISD ~эпоха 40) без ES модель тратит оставшиеся эпохи
+            впустую, score всё равно берётся из best.pt — ES устраняет
+            эти бесполезные итерации.
+            Prechelt (1998): ES как детектор плато корректен для
+            ранжирования при условии что score берётся из best, а не last.
             """
             log(f"  Обучаю [{label}] — {fast_epochs} эп. (быстрый)...")
             try:
@@ -955,7 +972,10 @@ def _run_search(q: queue.Queue, config: Dict):
                     # Уникальный subdir чтобы параллельные запуски не конфликтовали
                     safe_label = label[:20].replace(" ", "_").replace("+", "_")
                     subdir = f"det_quick_{safe_label}_{fast_epochs}ep"
-                    m  = _train_det(ds_name, fast_epochs, use_es=False,
+                    # ES включён: останавливает бесполезные эпохи после плато.
+                    # keep_weights=False: result_dir удаляется после оценки —
+                    # веса не нужны, next warm-start не используется в Фазах 1/2.
+                    m  = _train_det(ds_name, fast_epochs, use_es=True,
                                     result_subdir=subdir, keep_weights=False)
                     sc = score_from_metrics(m)
                     log(f"    score={sc:.4f}  mAP50-95={m.get('mAP50-95',0):.4f}"
@@ -1243,27 +1263,35 @@ def _run_search(q: queue.Queue, config: Dict):
         # стабильны на ранних эпохах (early discarding).
         # Спирмен ρ ≥ 0.9 — стандартный порог сильной корреляции.
         # ══════════════════════════════════════════════════════════════════
-        auto_screen       = config.get("auto_screen", False)
-        auto_screen_start = config.get("auto_screen_start", 40)
+        auto_screen           = config.get("auto_screen", False)
+        auto_screen_start     = config.get("auto_screen_start", 40)
+        auto_screen_direction = config.get("auto_screen_direction", "top_down")
+        # Инициализируем до блока auto_screen чтобы переменная была
+        # гарантированно доступна снаружи блока независимо от того
+        # выполнился ли внутренний else (кандидатов >= 2).
+        _baseline_history: List[float] = []
+        _screening_table_data: List[Dict] = []  # таблица mAP50-95 по 10% шагам
         # auto_screen_rho больше не задаётся пользователем —
         # критическое значение ρ вычисляется автоматически по числу
         # кандидатов N через _spearman_critical_rho(N, alpha=0.01).
         # Zar (2005): критическое значение зависит от N и α.
         # α=0.01 (p < 0.01) — строгий порог для научной работы.
 
-        # Будет заполнен либо автоподбором, либо использует текущий fast_epochs
-        _auto_screen_scores: Optional[Dict[str, float]] = None  # scores при найденном %
+        # Будет заполнен автоподбором: {cand_id: score} при найденном %.
+        # Используется кэшем Фазы 1 — повторное обучение не нужно.
+        _auto_screen_scores: Optional[Dict[str, float]] = None
 
         if auto_screen:
             log("")
             log("=" * 70)
-            log("АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА")
+            log("АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА (история одного прогона)")
             log(f"Начальный %: {auto_screen_start}%")
             log("Порог Спирмена ρ: автоматический (Zar, 2005; α=0.01)")
-            log("Li et al. (2018) Hyperband — warm-start successive halving")
+            log("Алгоритм: один прогон до 100% на кандидата, max(mAP50-95)")
+            log("по первым N% эпох — без повторного обучения для каждого порога.")
+            log("close_mosaic=0: равные условия для всех порогов N%.")
             log("=" * 70)
 
-            # Получаем пул кандидатов (тот же что будет в Фазе 1)
             _as_active_groups = _get_active_candidate_groups(
                 modality_result,
                 use_wiener=config.get("use_wiener", False),
@@ -1276,259 +1304,701 @@ def _run_search(q: queue.Queue, config: Dict):
             if len(_as_all_cands) < 2:
                 log("  [ПРОПУСК] Менее 2 кандидатов — автоподбор невозможен.")
             else:
-                # Критическое значение ρ для данного N кандидатов.
-                # Zar (2005): ρ_crit зависит от N; при N=16, α=0.01 → ρ_crit≈0.665.
-                # Ramsey (1989): табулированные значения подтверждают расчёт.
                 _n_cands = len(_as_all_cands)
                 _rho_crit = _spearman_critical_rho(_n_cands, alpha=0.01)
                 log(f"  Кандидатов: {_n_cands} → ρ_crit = {_rho_crit:.4f} "
                     f"(Zar 2005, α=0.01, N={_n_cands})")
 
-                # Предварительно создаём датасеты кандидатов один раз
-                _as_ds_map: Dict[str, str] = {}  # cand_id → ds_name
-                log(f"  Создаю датасеты для {_n_cands} кандидатов...")
+                from module3_preprocessing_search import (
+                    _run_training_full_history,
+                    _history_score_at,
+                )
+
+                # ── Шаг 1: обучаем каждого кандидата до 100% один раз ──────
+                # close_mosaic=0: равные условия на всех порогах N%.
+                # Без него последние 10 эпох (дефолт Ultralytics) проходят
+                # без мозаики — при сравнении max(0..N%) vs max(0..N+10%)
+                # кандидаты с бо́льшим N получают систематическое преимущество.
+                # Redmon & Farhadi (2018): мозаика меняет распределение входных
+                # данных, её отсутствие влияет на метрики финальных эпох.
+                _as_ds_map: Dict[str, str] = {}
+                _as_histories: Dict[str, List[float]] = {}
+
+                # ── Загрузка истории из CSV (если предоставлен) ──────────
+                # Парсим CSV и заполняем _as_histories и _baseline_history.
+                # Формат: колонки "Метод", "10%", "20%", ..., "100%".
+                # Для каждого кандидата восстанавливаем историю длиной
+                # max_epochs: значение N% повторяется для эпох в диапазоне
+                # ((N-1)*max_epochs//10 .. N*max_epochs//10).
+                # Это корректно т.к. _history_score_at использует max(0..k),
+                # а CSV уже содержит max(0..N%) для каждого шага.
+                _history_csv_content = config.get("history_csv_content", "")
+                _csv_loaded_cands: set = set()  # display-имена загруженных
+                if _history_csv_content:
+                    try:
+                        import csv as _csv_mod
+                        import io as _io
+                        _pct_cols = [f"{_p}%" for _p in range(10, 110, 10)]
+                        _reader = _csv_mod.DictReader(
+                            _io.StringIO(_history_csv_content))
+                        for _csv_row in _reader:
+                            _display = _csv_row.get("Метод", "").strip()
+                            if not _display:
+                                continue
+                            # Читаем значения по 10% шагам
+                            _vals = []
+                            for _pc in _pct_cols:
+                                try:
+                                    _vals.append(float(
+                                        _csv_row.get(_pc, "0").strip()))
+                                except ValueError:
+                                    _vals.append(0.0)
+                            # Восстанавливаем историю длиной max_epochs:
+                            # для каждой эпохи берём значение из
+                            # соответствующего 10%-шага.
+                            _hist_full = []
+                            for _ep in range(1, max_epochs + 1):
+                                _step_idx = min(
+                                    int((_ep - 1) * 10 / max_epochs), 9)
+                                _hist_full.append(_vals[_step_idx])
+                            # Сопоставляем с кандидатами по display-имени
+                            if _display == "— Baseline —":
+                                _baseline_history = _hist_full
+                                log(f"  [CSV] baseline история загружена "
+                                    f"({max_epochs} эпох)")
+                            else:
+                                for _cand in _as_all_cands:
+                                    if _cand["display"] == _display:
+                                        _as_histories[_cand["id"]] = _hist_full
+                                        _csv_loaded_cands.add(_display)
+                                        break
+                        _n_loaded = len(_csv_loaded_cands)
+                        _bl_loaded = bool(_baseline_history)
+                        log(f"  [CSV] Загружено из истории: "
+                            f"{_n_loaded} кандидатов"
+                            f"{' + baseline' if _bl_loaded else ''}")
+                    except Exception as _csv_e:
+                        log(f"  [CSV ОШИБКА] {_csv_e} — "
+                            f"продолжаем с обучением с нуля")
+
+                _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
+
+                # Создаём датасеты для всех кандидатов — нужно для всех режимов
+                # включая warm_start (датасеты нужны для дообучения).
+                log(f"\n  Создаю датасеты для {_n_cands} кандидатов...")
                 for _cand in _as_all_cands:
                     try:
-                        _ds = _make_tmp_ds(_cand["id"], _cand["methods"], _cand["params"])
+                        _ds = _make_tmp_ds(_cand["id"], _cand["methods"],
+                                           _cand["params"])
                         _as_ds_map[_cand["id"]] = _ds
                     except Exception as _e:
-                        log(f"  [ОШИБКА] {_cand['display']}: {_e}")
+                        log(f"  [ОШИБКА датасет] {_cand['display']}: {_e}")
 
-                _as_ratio_a = auto_screen_start
-                _as_found   = False
-                _as_scores_a: Dict[str, float] = {}
-                # Словарь чекпоинтов после прогона A: {cand_id: ckpt_path}
-                _as_ckpts_a: Dict[str, str] = {}
-                # Scores первого прогона (обученного с нуля, без warm-start).
-                # Только эти scores можно безопасно переиспользовать в Фазе 1,
-                # потому что Фаза 1 тоже обучает с нуля на тех же условиях.
-                # Scores дообученных (warm-start) прогонов отличаются от
-                # обучения с нуля из-за разного состояния оптимизатора.
-                _as_first_run_scores: Optional[Dict[str, float]] = None
-                _as_first_run_ratio: int = 0
-                # Счётчик последовательных прогонов с CV < порога.
-                # Flat-scores guard срабатывает при ≥2 подряд.
-                _consecutive_flat: int = 0
+                if auto_screen_direction != "warm_start":
+                    # Для warm_start обучение до 100% не нужно —
+                    # история накапливается инкрементально.
+                    log(f"\n  Обучаю {_n_cands} кандидатов до 100%...")
+                    for _cand in _as_all_cands:
+                        if _cand["id"] not in _as_ds_map:
+                            continue
 
-                while _as_ratio_a <= 100:
-                    _as_ep_a = max(1, int(max_epochs * (_as_ratio_a / 100)))
-                    _as_ratio_b = _as_ratio_a + 10
-                    _as_ep_b = max(1, int(max_epochs * (_as_ratio_b / 100)))
+                        # Пропускаем если история уже загружена из CSV
+                        if _cand["id"] in _as_histories:
+                            log(f"  [{_cand['display']}] — история из CSV, "
+                                f"обучение пропущено")
+                            continue
 
-                    log(f"\n  Прогон A: {_as_ratio_a}% ({_as_ep_a} эп.)")
-                    # Обучаем прогон A только если scores ещё не вычислены.
-                    # При цепочечном переходе (ρ < порога на предыдущей итерации)
-                    # _as_scores_a и _as_ckpts_a уже заполнены из прогона B —
-                    # в этом случае пропускаем обучение и идём сразу к прогону B.
-                    # Li et al. (2018) JMLR 18(185): экономия N_cands обучений
-                    # на каждой итерации кроме первой.
-                    if not _as_scores_a:
-                        for _cand in _as_all_cands:
-                            _ds = _as_ds_map.get(_cand["id"])
-                            if _ds is None:
-                                continue
-                            _sc, _ckpt = quick_train_n(_ds, _cand["display"], _as_ep_a)
-                            _as_scores_a[_cand["id"]] = _sc
-                            _as_ckpts_a[_cand["id"]] = _ckpt
-                            log(f"    {_cand['display']:40s}  score={_sc:.4f}")
-                        # Сохраняем scores первого прогона (с нуля) для кеша Фазы 1
-                        if _as_first_run_scores is None:
-                            _as_first_run_scores = dict(_as_scores_a)
-                            _as_first_run_ratio = _as_ratio_a
-                    else:
-                        # Scores уже есть из предыдущего прогона B — выводим их
-                        for _cand in _as_all_cands:
-                            _sc = _as_scores_a.get(_cand["id"], 0.0)
-                            log(f"    {_cand['display']:40s}  score={_sc:.4f}  [перенесено из пред. прогона B]")
+                        log(f"  Обучаю [{_cand['display']}] до {max_epochs} эп. "
+                            f"(close_mosaic=0)...")
+                        import uuid as _uuid
+                        _hist_subdir = (work_dir /
+                            f"as_hist_{_cand['id'][:20]}_{_uuid.uuid4().hex[:6]}")
+                        try:
+                            if task == "classification":
+                                _cfg_hist = {
+                                    **_model_cfg_base,
+                                    "name": f"{model_type}_ashist",
+                                    "max_epochs": max_epochs,
+                                    "use_torch_compile": config.get(
+                                        "use_torch_compile", False),
+                                }
+                                _trainer_hist = ClassificationTrainer(
+                                    model_configs=[_cfg_hist],
+                                    dataset_names=[_ds],
+                                    max_epochs=max_epochs,
+                                    checkpoint_interval=max_epochs,
+                                    seed=seed,
+                                    enable_early_stopping=False,
+                                    enable_early_selection=False,
+                                )
+                                _trainer_hist.run_training(resume_paths={})
+                                _hkey = f"{model_type}_ashist_{_ds}"
+                                _raw = _trainer_hist.metrics_history.get(_hkey, [])
+                                _as_histories[_cand["id"]] = [
+                                    float(h.get("val_auc",
+                                          h.get("auc", 0.0))) for h in _raw
+                                ]
+                            else:
+                                _hist = _run_training_full_history(
+                                    dataset_path=get_dataset_path(_ds),
+                                    model_config=_model_cfg_base,
+                                    epochs=max_epochs,
+                                    result_dir=_hist_subdir,
+                                    log_fn=log,
+                                    early_stopping_patience=patience,
+                                    seed=seed,
+                                )
+                                _as_histories[_cand["id"]] = _hist
+                        except Exception as _e:
+                            log(f"  [ОШИБКА обучение] {_cand['display']}: {_e}")
+                            log(traceback.format_exc())
+                            _as_histories[_cand["id"]] = []
+                        finally:
+                            try:
+                                import torch as _t
+                                if _t.cuda.is_available():
+                                    _t.cuda.empty_cache()
+                                    _t.cuda.synchronize()
+                            except Exception:
+                                pass
+                            gc.collect()
+                        log(f"    → история: {len(_as_histories.get(_cand['id'], []))} эпох")
 
-                    # ── Flat-scores guard (двойная проверка) ─────────────
-                    # CV < порога на одном прогоне может быть следствием
-                    # малого бюджета эпох (модель ещё не различает кандидатов).
-                    # Но если CV < порога на двух последовательных бюджетах —
-                    # spread не растёт с увеличением эпох, и ранжирование
-                    # действительно нестабильно на данном датасете.
+                    # ── Шаг 2: поиск минимального % по историям ─────────────────
+                    # Score кандидата при бюджете N% = max(history[0..N%*epochs]).
+                    # Li et al. (2018) JMLR 18(185): SHA использует пиковый
+                    # потенциал кандидата на данном бюджете.
                     #
-                    # Audibert et al. (2010) COLT: при ε-close arms
-                    # идентификация требует O(1/ε²) сэмплов. Если ε не
-                    # растёт при увеличении бюджета — ε→0, бюджет → ∞.
-                    # Два подряд flat = подтверждение что gap не растёт.
-                    _is_flat_a = _check_flat_scores(_as_scores_a, log_fn=None)
-                    if _is_flat_a:
-                        _consecutive_flat += 1
-                        if _consecutive_flat >= 2:
-                            _check_flat_scores(_as_scores_a, log_fn=log)
-                            log(f"\n  ДОСРОЧНАЯ ОСТАНОВКА: scores плоские на двух ")
-                            log(f"последовательных бюджетах (CV < 1.5%)")
-                            log(f"     Gap между кандидатами не растёт при увеличении эпох.")
-                            log(f"     Audibert et al. (2010): ранжирование невозможно ")
-                            log(f"при любом бюджете.")
-                            log(f"     Рекомендация: использовать оригинальный датасет.")
-                            log(f"     Используем {_as_ratio_a}% как fallback.")
-                            screening_ratio = _as_ratio_a
-                            fast_epochs = _as_ep_a
-                            _auto_screen_scores = _as_scores_a
-                            _as_found = True
-                            break
-                        else:
-                            import statistics as _st
-                            _vals = list(_as_scores_a.values())
-                            _cv = _st.stdev(_vals) / _st.mean(_vals) if _st.mean(_vals) > 0 else 0
-                            log(f"\n  [INFO] CV={_cv:.4f} ({_cv*100:.2f}%) < 1.5% на {_as_ratio_a}% — ")
-                            log(f"возможно малый бюджет. Продолжаем для подтверждения.")
+                    # Условия принятия N%:
+                    #   p1 = ρ(scores_N%, scores_N+10%) ≥ ρ_crit
+                    #   p2 = ρ(scores_N+10%, scores_N+20%) ≥ ρ_crit
+                    # Обе проверки из одной истории — повторного обучения нет.
+                    # Максимальный стартовый N = 80% (N+20% ≤ 100%).
+                    # При N > 80% без успеха → 100%.
+                    #
+                    # Двойная проверка (p1 и p2):
+                    # Audibert & Bubeck (2010) COLT, Theorem 1: два подтверждения
+                    # дают экспоненциально меньшую вероятность ложного срабатывания.
+
+                    def _scores_at(ratio: float) -> Dict[str, float]:
+                        return {
+                            _cid: _history_score_at(_hist, ratio)
+                            for _cid, _hist in _as_histories.items()
+                        }
+
+                    # ── Baseline: обучение до 100% с историей ───────────────────
+                    # Baseline обучается на тех же условиях что кандидаты:
+                    # до 100% эпох, close_mosaic=0, ES с паддингом.
+                    # Score при найденном % берётся из истории через
+                    # _history_score_at — max(0..N%), равные условия.
+                    # Без этого baseline обучался бы только на fast_epochs
+                    # что создаёт систематическое преимущество.
+                    # Пропускаем если baseline уже загружен из CSV
+                    if _baseline_history:
+                        log(f"  baseline — история из CSV, обучение пропущено")
                     else:
-                        _consecutive_flat = 0  # сброс — spread вырос
+                        log(f"\n  Обучаю baseline до {max_epochs} эп. (история)...")
+                        import uuid as _uuid_bl
+                        _bl_subdir = work_dir / f"as_hist_baseline_{_uuid_bl.uuid4().hex[:6]}"
+                        try:
+                            if task == "classification":
+                                _cfg_bl = {
+                                    **_model_cfg_base,
+                                    "name": f"{model_type}_ashist_bl",
+                                    "max_epochs": max_epochs,
+                                    "use_torch_compile": config.get(
+                                        "use_torch_compile", False),
+                                }
+                                _trainer_bl = ClassificationTrainer(
+                                    model_configs=[_cfg_bl],
+                                    dataset_names=[dataset_name],
+                                    max_epochs=max_epochs,
+                                    checkpoint_interval=max_epochs,
+                                    seed=seed,
+                                    enable_early_stopping=False,
+                                    enable_early_selection=False,
+                                )
+                                _trainer_bl.run_training(resume_paths={})
+                                _bl_key = f"{model_type}_ashist_bl_{dataset_name}"
+                                _bl_raw = _trainer_bl.metrics_history.get(_bl_key, [])
+                                _baseline_history = [
+                                    float(h.get("val_auc", h.get("auc", 0.0)))
+                                    for h in _bl_raw
+                                ]
+                            else:
+                                _baseline_history = _run_training_full_history(
+                                    dataset_path=get_dataset_path(dataset_name),
+                                    model_config=_model_cfg_base,
+                                    epochs=max_epochs,
+                                    result_dir=_bl_subdir,
+                                    log_fn=log,
+                                    early_stopping_patience=patience,
+                                    seed=seed,
+                                )
+                        except Exception as _e:
+                            log(f"  [ОШИБКА baseline история] {_e}")
+                            log(traceback.format_exc())
+                            _baseline_history = []
+                        finally:
+                            try:
+                                import torch as _t
+                                if _t.cuda.is_available():
+                                    _t.cuda.empty_cache()
+                                    _t.cuda.synchronize()
+                            except Exception:
+                                pass
+                            gc.collect()
+                    log(f"    → baseline история: {len(_baseline_history)} эпох")
 
-                    if _as_ratio_b > 100:
-                        # Достигли потолка — используем 100%
-                        log(f"  Достигнут потолок 100% — используем {_as_ratio_a}%")
-                        screening_ratio = _as_ratio_a
-                        fast_epochs = _as_ep_a
-                        _auto_screen_scores = _as_scores_a
-                        _as_found = True
-                        break
+                    # ── Таблица mAP50-95 по каждым 10% для всех кандидатов ──────
+                    # Выводится после сбора всех историй, до начала поиска %.
+                    # Содержит max(0..N%) для N = 10%, 20%, ..., 100% —
+                    # полная картина потенциала каждого кандидата.
+                    # Используется для анализа в научной работе.
+                    _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
+                    log(f"\n{'─'*70}")
+                    log(f"ТАБЛИЦА mAP50-95 max(0..N%) ПО ЭПОХАМ (все кандидаты)")
+                    log(f"{'─'*70}")
+                    # Заголовок
+                    _hdr = f"  {'Метод':40s}"
+                    for _p in _pct_steps:
+                        _hdr += f"  {_p:>4}%"
+                    log(_hdr)
+                    log(f"  {'─'*40}" + "  -----" * len(_pct_steps))
+                    # Строка для каждого кандидата
+                    _screening_table_rows = []
+                    for _cand in _as_all_cands:
+                        _cid = _cand["id"]
+                        _hist = _as_histories.get(_cid, [])
+                        _row = {"Метод": _cand["display"]}
+                        _line = f"  {_cand['display']:40s}"
+                        for _p in _pct_steps:
+                            _v = _history_score_at(_hist, _p / 100.0)
+                            _row[f"{_p}%"] = round(_v, 4)
+                            _line += f"  {_v:.4f}"
+                        _screening_table_rows.append(_row)
+                        log(_line)
+                    # Строка для baseline
+                    _bl_row = {"Метод": "— Baseline —"}
+                    _bl_line = f"  {'— Baseline —':40s}"
+                    for _p in _pct_steps:
+                        _bv = _history_score_at(_baseline_history, _p / 100.0)
+                        _bl_row[f"{_p}%"] = round(_bv, 4)
+                        _bl_line += f"  {_bv:.4f}"
+                    _screening_table_rows.append(_bl_row)
+                    log(_bl_line)
+                    log(f"{'─'*70}")
+                    # Сохраняем для передачи в result dict и CSV
+                    _screening_table_data = _screening_table_rows
 
-                    log(f"\n  Прогон B: {_as_ratio_b}% ({_as_ep_b} эп.) "
-                        f"[warm-start с {_as_ratio_a}%]")
-                    _as_scores_b: Dict[str, float] = {}
-                    # Чекпоинты прогона B — нужны если ρ < порога,
-                    # чтобы следующая итерация могла дообучать с них.
-                    # Li et al. (2018) JMLR 18(185): цепочечное дообучение
-                    # корректно для successive halving — ранжирование сохраняется.
-                    _as_ckpts_b: Dict[str, str] = {}
+                # ── Шаг 2: таблица рангов ────────────────────────────────
+                # Для каждого столбца (10%..100%) независимо ранжируем
+                # кандидатов по mAP50-95 (1 = лучший).
+                # Baseline не участвует в ранжировании — он не кандидат SHA.
+                # Используется для визуального анализа стабильности рангов.
+                log(f"\n{'─'*70}")
+                log(f"ТАБЛИЦА РАНГОВ (1=лучший, по mAP50-95 для каждых 10% эпох)")
+                log(f"{'─'*70}")
+                _hdr_r = f"  {'Метод':40s}"
+                for _p in _pct_steps:
+                    _hdr_r += f"  {_p:>4}%"
+                log(_hdr_r)
+                log(f"  {'─'*40}" + "  -----" * len(_pct_steps))
+
+                # Вычисляем ранги: для каждого % сортируем кандидатов по score
+                _rank_rows = []
+                for _cand in _as_all_cands:
+                    _rank_rows.append({"Метод": _cand["display"]})
+
+                for _p in _pct_steps:
+                    # scores всех кандидатов при данном %
+                    _col_scores = []
+                    for _cand in _as_all_cands:
+                        _hist = _as_histories.get(_cand["id"], [])
+                        _col_scores.append(_history_score_at(_hist, _p / 100.0))
+                    # Ранги: сортируем по убыванию, присваиваем 1..N
+                    _sorted_idx = sorted(range(len(_col_scores)),
+                                         key=lambda i: _col_scores[i],
+                                         reverse=True)
+                    _ranks = [0] * len(_col_scores)
+                    for _rank_pos, _orig_idx in enumerate(_sorted_idx, 1):
+                        _ranks[_orig_idx] = _rank_pos
+                    for _i, _cand in enumerate(_as_all_cands):
+                        _rank_rows[_i][f"{_p}%"] = _ranks[_i]
+
+                # Выводим таблицу рангов
+                for _i, _cand in enumerate(_as_all_cands):
+                    _rline = f"  {_cand['display']:40s}"
+                    for _p in _pct_steps:
+                        _rline += f"  {_rank_rows[_i][f'{_p}%']:>5}"
+                    log(_rline)
+                log(f"{'─'*70}")
+
+                # ── Шаг 3: выбор бюджета скрининга ──────────────────
+                # Четыре режима: top_down, bottom_up, full_budget, warm_start.
+
+                _sc_100_ref   = _scores_at(1.0) if auto_screen_direction != "warm_start" else {}
+                _as_ratio_best = 100
+                _as_found      = False
+
+                if auto_screen_direction == "full_budget":
+                    # ── 100% бюджет ──────────────────────────────────────
+                    log(f"\n  Режим: 100% бюджет (поиск % не выполняется)")
+                    _as_ratio_best = 100
+                    _as_found = True
+
+                elif auto_screen_direction == "warm_start":
+                    # ── Warm-start: инкрементальное дообучение ───────────
+                    # Алгоритм: Li et al. (2018) JMLR 18(185) warm-start SHA.
+                    # Кандидаты обучаются с нуля до r_A%, затем дообучаются
+                    # warm-start через _run_training до r_B% и r_C%.
+                    # Score = max(score_prev, score_new) — защита от деградации.
+                    # Две локальные проверки: ρ(A,B) и ρ(B,C) ≥ ρ_crit.
+                    # Если обе прошли → фиксируем r_A%.
+                    # Если нет → r_A=r_B, ckpts сдвигаются, дообучаем r_D.
+                    # При r_A=90% → бюджет 100%.
+                    #
+                    # Таблица строится по накопленным scores для каждых 10%.
+                    # Значения после найденного бюджета заполняются последним
+                    # известным (паддинг). Prechelt (1998): ES детектирует плато.
+
+                    log(f"\n  Режим: warm-start (снизу вверх с дообучением)")
+                    log(f"  Начальный бюджет: {auto_screen_start}%")
+                    log(f"  Li et al. (2018) JMLR 18(185): warm-start SHA")
+
+                    from module3_preprocessing_search import (
+                        _run_training,
+                        _run_training_warmstart,
+                    )
+
+                    _ws_ratio_a = max(10, min(auto_screen_start, 80))
+                    # scores_dict: {cand_id: best_score_so_far}
+                    _ws_scores: Dict[str, float] = {}
+                    # ckpts: {cand_id: path_to_last_pt}
+                    _ws_ckpts:  Dict[str, str]   = {}
+                    # accumulated_scores: {pct: {cand_id: score}} для таблицы
+                    _ws_acc: Dict[int, Dict[str, float]] = {}
+
+                    # ── Шаг 1: обучаем с нуля до r_A% ───────────────────
+                    _ws_ep_a = max(1, int(max_epochs * (_ws_ratio_a / 100)))
+                    log(f"\n  Шаг 1: обучение с нуля до {_ws_ratio_a}% ({_ws_ep_a} эп.)")
                     for _cand in _as_all_cands:
                         _ds = _as_ds_map.get(_cand["id"])
                         if _ds is None:
                             continue
-                        # Warm-start: дообучаем с чекпоинта прогона A
-                        _resume = _as_ckpts_a.get(_cand["id"], "")
-                        # score_floor — лучший score прогона A для этого кандидата
-                        # гарантирует что resume не даст результат хуже прогона A
-                        _floor = _as_scores_a.get(_cand["id"], 0.0)
-                        # Передаём дельту эпох (ep_b - ep_a), а не абсолютное
-                        # число. Ultralytics при warm-start сбрасывает счётчик
-                        # эпох с нуля — train_results[-1] после прогона B
-                        # хранит число эпох текущего запуска, а не суммарное.
-                        # Передавая дельту явно, мы обходим эту проблему:
-                        # функция обучает ровно _as_ep_b - _as_ep_a эпох.
-                        # Li et al. (2018) JMLR 18(185): warm-start SHA
-                        # использует бюджет дополнительных эпох.
-                        _as_ep_delta = _as_ep_b - _as_ep_a
-                        _sc, _ckpt_b = quick_train_n(_ds, _cand["display"], _as_ep_delta,
-                                                     resume_from=_resume,
-                                                     score_floor=_floor)
-                        _as_scores_b[_cand["id"]] = _sc
-                        _as_ckpts_b[_cand["id"]] = _ckpt_b
-                        log(f"    {_cand['display']:40s}  score={_sc:.4f}"
-                            f"{'  [resume]' if _resume else ''}")
+                        import uuid as _uuid_ws
+                        _ws_subdir = (work_dir /
+                            f"ws_{_cand['id'][:15]}_{_ws_ratio_a}pct_"
+                            f"{_uuid_ws.uuid4().hex[:6]}")
+                        try:
+                            _m = _run_training(
+                                dataset_path=get_dataset_path(_ds),
+                                model_config=_model_cfg_base,
+                                epochs=_ws_ep_a,
+                                result_dir=_ws_subdir,
+                                log_fn=log,
+                                use_early_stopping=True,
+                                early_stopping_patience=patience,
+                                eval_split="valid",
+                                keep_weights=True,
+                                max_epochs_for_schedule=max_epochs,
+                                disable_mosaic=True,
+                                seed=seed,
+                            )
+                            _sc = float(_m.get("mAP50-95", 0.0))
+                            _ws_scores[_cand["id"]] = _sc
+                            # last.pt для warm-start
+                            _last = os.path.join(str(_ws_subdir),
+                                                 "run", "weights", "last.pt")
+                            _ws_ckpts[_cand["id"]] = (
+                                _last if os.path.exists(_last) else "")
+                            log(f"    {_cand['display']:40s}  "
+                                f"score={_sc:.4f}")
+                        except Exception as _e:
+                            log(f"    [ОШИБКА] {_cand['display']}: {_e}")
+                            _ws_scores[_cand["id"]] = 0.0
+                            _ws_ckpts[_cand["id"]] = ""
+                        finally:
+                            try:
+                                import torch as _t
+                                if _t.cuda.is_available():
+                                    _t.cuda.empty_cache()
+                            except Exception:
+                                pass
+                            gc.collect()
+                    _ws_acc[_ws_ratio_a] = dict(_ws_scores)
 
-                    _rho = _spearman_rho(_as_scores_a, _as_scores_b)
-                    log(f"\n  Спирмен ρ({_as_ratio_a}% vs {_as_ratio_b}%) = {_rho:.4f}"
-                        f"  (ρ_crit={_rho_crit:.4f}, α=0.01, N={_n_cands})")
+                    # ── Основной цикл warm-start ──────────────────────────
+                    # На каждом шаге дообучаем одну новую дельту и проверяем
+                    # две локальные корреляции.
+                    # scores_A = _ws_scores (текущие)
+                    # scores_B = дообучение до r_B%
+                    # scores_C = дообучение до r_C%
+                    # После сдвига: scores_A=scores_B, scores_B=scores_C,
+                    # ckpts_B=ckpts_C, дообучаем только r_C→r_D.
 
-                    if _rho >= _rho_crit:
-                        # ── Двойная проверка (two-sample confirmation) ─────
-                        # Одна пара ρ ≥ ρ_crit может быть случайной.
-                        # Две последовательных пары (A↔B, B↔C) подтверждают
-                        # стабильность ранжирования: вероятность случайного
-                        # совпадения двух ρ ≥ ρ_crit при N=16 < 0.01² = 0.0001.
-                        #
-                        # Jamieson & Talwalkar (2016) AISTATS, Section 4:
-                        # стабильность ранжирования подтверждается на нескольких
-                        # точках бюджета, а не на одной.
-                        #
-                        # Audibert & Bubeck (2010) COLT, Theorem 1: при gap Δ
-                        # между кандидатами, вероятность ошибки ранжирования
-                        # убывает экспоненциально с бюджетом — два подтверждения
-                        # дают экспоненциально меньшую вероятность ложного срабатывания.
-                        #
-                        # Стоимость: +1 прогон на N кандидатов (дообучение дельты).
-                        # Экономия: избегаем ложного принятия малого % и
-                        # последующего получения невалидных результатов SHA.
-                        log(f"  ✓ Первая проверка пройдена (ρ={_rho:.4f} ≥ {_rho_crit:.4f})")
-
-                        _as_ratio_c = _as_ratio_b + 10
-                        if _as_ratio_c > 100:
-                            # Нет места для подтверждающего прогона C — принимаем
-                            # без подтверждения (мы уже на 90%+, дальше некуда).
-                            log(f"  Подтверждающий прогон невозможен ({_as_ratio_b}%+10% > 100%) — "
-                                f"принимаем {_as_ratio_a}% как достаточный.")
-                            screening_ratio = _as_ratio_a
-                            fast_epochs = _as_ep_a
-                            _auto_screen_scores = _as_scores_a
-                            _as_found = True
-                            break
-
-                        _as_ep_c = max(1, int(max_epochs * (_as_ratio_c / 100)))
-                        _as_ep_delta_bc = _as_ep_c - _as_ep_b
-                        log(f"\n  Подтверждающий прогон C: {_as_ratio_c}% ({_as_ep_c} эп.) "
-                            f"[warm-start с {_as_ratio_b}%]")
-
-                        _as_scores_c: Dict[str, float] = {}
-                        _as_ckpts_c: Dict[str, str] = {}
+                    def _ws_finetune(ratio_from: int, ratio_to: int,
+                                     ckpts_from: Dict[str, str],
+                                     scores_floor: Dict[str, float]
+                                     ) -> tuple:
+                        """Дообучает всех кандидатов warm-start от ratio_from до ratio_to.
+                        Возвращает (new_scores, new_ckpts).
+                        new_scores = max(scores_floor, score_new) — защита от деградации.
+                        """
+                        _ep_delta = max(1, int(max_epochs * (ratio_to / 100))
+                                        - int(max_epochs * (ratio_from / 100)))
+                        log(f"\n  Дообучение warm-start: {ratio_from}% → {ratio_to}%"
+                            f" (дельта {_ep_delta} эп.)")
+                        _new_scores: Dict[str, float] = {}
+                        _new_ckpts:  Dict[str, str]   = {}
                         for _cand in _as_all_cands:
                             _ds = _as_ds_map.get(_cand["id"])
                             if _ds is None:
                                 continue
-                            _resume_c = _as_ckpts_b.get(_cand["id"], "")
-                            _floor_c = _as_scores_b.get(_cand["id"], 0.0)
-                            _sc_c, _ckpt_c = quick_train_n(
-                                _ds, _cand["display"], _as_ep_delta_bc,
-                                resume_from=_resume_c, score_floor=_floor_c)
-                            _as_scores_c[_cand["id"]] = _sc_c
-                            _as_ckpts_c[_cand["id"]] = _ckpt_c
-                            log(f"    {_cand['display']:40s}  score={_sc_c:.4f}  [confirm]")
+                            _resume = ckpts_from.get(_cand["id"], "")
+                            import uuid as _uuid_ws2
+                            _ws_sub = (work_dir /
+                                f"ws_{_cand['id'][:15]}_{ratio_to}pct_"
+                                f"{_uuid_ws2.uuid4().hex[:6]}")
+                            try:
+                                _m = _run_training_warmstart(
+                                    dataset_path=get_dataset_path(_ds),
+                                    model_config=_model_cfg_base,
+                                    epochs_delta=_ep_delta,
+                                    result_dir=_ws_sub,
+                                    log_fn=log,
+                                    resume_from=_resume,
+                                    use_early_stopping=True,
+                                    early_stopping_patience=patience,
+                                    eval_split="valid",
+                                    disable_mosaic=True,
+                                    seed=seed,
+                                )
+                                _sc_new = float(_m.get("mAP50-95", 0.0))
+                                # score_floor: защита от деградации
+                                _sc = max(_sc_new,
+                                          scores_floor.get(_cand["id"], 0.0))
+                                _new_scores[_cand["id"]] = _sc
+                                _last = os.path.join(str(_ws_sub),
+                                                     "run", "weights", "last.pt")
+                                _new_ckpts[_cand["id"]] = (
+                                    _last if os.path.exists(_last) else _resume)
+                                log(f"    {_cand['display']:40s}  "
+                                    f"score={_sc:.4f}")
+                            except Exception as _e:
+                                log(f"    [ОШИБКА] {_cand['display']}: {_e}")
+                                _new_scores[_cand["id"]] = scores_floor.get(
+                                    _cand["id"], 0.0)
+                                _new_ckpts[_cand["id"]] = ckpts_from.get(
+                                    _cand["id"], "")
+                            finally:
+                                try:
+                                    import torch as _t
+                                    if _t.cuda.is_available():
+                                        _t.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                                gc.collect()
+                        return _new_scores, _new_ckpts
 
-                        _rho2 = _spearman_rho(_as_scores_b, _as_scores_c)
-                        log(f"\n  Подтверждение: ρ({_as_ratio_b}% vs {_as_ratio_c}%) = {_rho2:.4f}"
-                            f"  (ρ_crit={_rho_crit:.4f})")
+                    # Начинаем с r_A, вычисляем B и C сразу
+                    _ws_scores_a = dict(_ws_scores)
+                    _ws_ckpts_a  = dict(_ws_ckpts)
+                    _ws_ratio_b  = _ws_ratio_a + 10
+                    _ws_ratio_c  = _ws_ratio_a + 20
 
-                        if _rho2 >= _rho_crit:
-                            log(f"  Двойная проверка пройдена — "
-                                f"ρ₁={_rho:.4f}, ρ₂={_rho2:.4f} ≥ {_rho_crit:.4f}. "
-                                f"Используем {_as_ratio_a}% скрининга.")
-                            screening_ratio = _as_ratio_a
-                            fast_epochs = _as_ep_a
-                            _auto_screen_scores = _as_scores_a
+                    _ws_scores_b, _ws_ckpts_b = _ws_finetune(
+                        _ws_ratio_a, _ws_ratio_b,
+                        _ws_ckpts_a, _ws_scores_a)
+                    _ws_acc[_ws_ratio_b] = dict(_ws_scores_b)
+
+                    _ws_scores_c, _ws_ckpts_c = _ws_finetune(
+                        _ws_ratio_b, _ws_ratio_c,
+                        _ws_ckpts_b, _ws_scores_b)
+                    _ws_acc[_ws_ratio_c] = dict(_ws_scores_c)
+
+                    while True:
+                        _rho_p1 = _spearman_rho(_ws_scores_a, _ws_scores_b)
+                        _rho_p2 = _spearman_rho(_ws_scores_b, _ws_scores_c)
+                        log(f"\n  Проверка N={_ws_ratio_a}%:")
+                        for _cand in _as_all_cands:
+                            _cid = _cand["id"]
+                            log(f"    {_cand['display']:40s}  "
+                                f"{_ws_ratio_a}%={_ws_scores_a.get(_cid,0):.4f}  "
+                                f"{_ws_ratio_b}%={_ws_scores_b.get(_cid,0):.4f}  "
+                                f"{_ws_ratio_c}%={_ws_scores_c.get(_cid,0):.4f}")
+                        log(f"  ρ(p1: {_ws_ratio_a}% vs {_ws_ratio_b}%) = "
+                            f"{_rho_p1:.4f}  |  "
+                            f"ρ(p2: {_ws_ratio_b}% vs {_ws_ratio_c}%) = "
+                            f"{_rho_p2:.4f}  (ρ_crit={_rho_crit:.4f})")
+
+                        if _rho_p1 >= _rho_crit and _rho_p2 >= _rho_crit:
+                            log(f"  ✓ Обе проверки пройдены — "
+                                f"фиксируем бюджет {_ws_ratio_a}%.")
+                            _as_ratio_best = _ws_ratio_a
                             _as_found = True
                             break
-                        else:
-                            log(f"   Подтверждение не пройдено "
-                                f"(ρ₂={_rho2:.4f} < {_rho_crit:.4f}). "
-                                f"Первая проверка была ложноположительной.")
-                            log(f"  Сдвигаемся: прогон C → новый A ({_as_ratio_c}%)")
-                            # Прогон C становится новым A, цикл продолжается.
-                            # Li et al. (2018): цепочечный warm-start корректен.
-                            _as_scores_a = _as_scores_c
-                            _as_ckpts_a  = _as_ckpts_c
-                            _as_ratio_a  = _as_ratio_c
-                    else:
-                        log(f"  ρ={_rho:.4f} < ρ_crit={_rho_crit:.4f} — "
-                            f"увеличиваем до {_as_ratio_b}%")
-                        # Следующая итерация: прогон B становится новым прогоном A.
-                        # Scores и чекпоинты прогона B переносятся напрямую —
-                        # нет необходимости обучать A заново с нуля.
-                        #
-                        # Научное обоснование цепочечного дообучения:
-                        # Li et al. (2018) "Hyperband", JMLR 18(185), 1-52:
-                        # каждый следующий бюджет строится поверх предыдущего;
-                        # все кандидаты проходят одинаковую траекторию обучения,
-                        # поэтому ранжирование остаётся корректным.
-                        #
-                        # Цепочка: 30%→40%→50%→... вместо повторного обучения с нуля
-                        # на каждом новом A экономит (N_iter - 1) × N_cands прогонов.
-                        _as_scores_a = _as_scores_b          # scores прогона B → новый A
-                        _as_ckpts_a  = _as_ckpts_b            # ckpts прогона B → новый A
-                        _as_ratio_a  = _as_ratio_b            # сдвигаем %
 
-                # Удаляем временные датасеты созданные для автоподбора
+                        # Не прошли — сдвигаемся
+                        log(f"  Проверка не пройдена — сдвигаемся на "
+                            f"{_ws_ratio_b}%.")
+                        _ws_ratio_a = _ws_ratio_b
+                        _ws_ratio_b = _ws_ratio_c
+                        _ws_ratio_c = _ws_ratio_a + 20
+                        _ws_scores_a = _ws_scores_b
+                        _ws_ckpts_a  = _ws_ckpts_b
+                        _ws_scores_b = _ws_scores_c
+                        _ws_ckpts_b  = _ws_ckpts_c
+
+                        if _ws_ratio_a >= 90:
+                            log(f"  Достигнут предел 90% — бюджет 100%.")
+                            _as_ratio_best = 100
+                            _as_found = True
+                            break
+
+                        # Дообучаем только одну новую дельту (r_B → r_C)
+                        _ws_scores_c, _ws_ckpts_c = _ws_finetune(
+                            _ws_ratio_b, _ws_ratio_c,
+                            _ws_ckpts_b, _ws_scores_b)
+                        _ws_acc[_ws_ratio_c] = dict(_ws_scores_c)
+
+                    # ── Строим таблицу для warm_start ─────────────────────
+                    # Значения накоплены в _ws_acc для вычисленных бюджетов.
+                    # Остальные 10%-шаги заполняем паддингом последнего
+                    # известного значения. Prechelt (1998): плато после ES.
+                    log(f"\n{'─'*70}")
+                    log(f"ТАБЛИЦА mAP50-95 (warm-start, накопленные значения)")
+                    log(f"{'─'*70}")
+                    _ws_pct_steps = list(range(10, 110, 10))
+                    _hdr_ws = f"  {'Метод':40s}"
+                    for _p in _ws_pct_steps:
+                        _hdr_ws += f"  {_p:>4}%"
+                    log(_hdr_ws)
+                    log(f"  {'─'*40}" + "  -----" * len(_ws_pct_steps))
+
+                    _ws_table_rows = []
+                    for _cand in _as_all_cands:
+                        _cid = _cand["id"]
+                        _row = {"Метод": _cand["display"]}
+                        _line = f"  {_cand['display']:40s}"
+                        _last_known = 0.0
+                        for _p in _ws_pct_steps:
+                            if _p in _ws_acc and _cid in _ws_acc[_p]:
+                                _v = _ws_acc[_p][_cid]
+                                _last_known = _v
+                            else:
+                                _v = _last_known  # паддинг
+                            _row[f"{_p}%"] = round(_v, 4)
+                            _line += f"  {_v:.4f}"
+                        _ws_table_rows.append(_row)
+                        log(_line)
+
+                    # Baseline строка (если есть история)
+                    if _baseline_history:
+                        from module3_preprocessing_search import _history_score_at
+                        _bl_row_ws = {"Метод": "— Baseline —"}
+                        _bl_line_ws = f"  {'— Baseline —':40s}"
+                        for _p in _ws_pct_steps:
+                            _bv = _history_score_at(
+                                _baseline_history, _p / 100.0)
+                            _bl_row_ws[f"{_p}%"] = round(_bv, 4)
+                            _bl_line_ws += f"  {_bv:.4f}"
+                        _ws_table_rows.append(_bl_row_ws)
+                        log(_bl_line_ws)
+                    log(f"{'─'*70}")
+
+                    # Сохраняем для result dict
+                    _screening_table_data = _ws_table_rows
+
+                    # scores для кэша Фазы 1
+                    _ws_final_scores = (
+                        _ws_scores_a if _as_ratio_best < 100
+                        else _ws_scores_c)
+
+                else:
+                    def _check_pct(n_pct: int) -> bool:
+                        """Проверяет N% через ρ_global и ρ_local. True = стабилен."""
+                        _sc_n    = _scores_at(n_pct / 100.0)
+                        _sc_n10  = _scores_at((n_pct + 10) / 100.0)
+                        _rg = _spearman_rho(_sc_n, _sc_100_ref)
+                        _rl = _spearman_rho(_sc_n, _sc_n10)
+                        log(f"  ρ_global({n_pct}% vs 100%) = {_rg:.4f}  |  "
+                            f"ρ_local({n_pct}% vs {n_pct+10}%) = {_rl:.4f}  "
+                            f"(ρ_crit={_rho_crit:.4f})")
+                        if _rg >= _rho_crit and _rl >= _rho_crit:
+                            return True
+                        if _rg < _rho_crit:
+                            log(f"  ρ_global={_rg:.4f} < {_rho_crit:.4f} — "
+                                f"нестабилен относительно 100%.")
+                        if _rl < _rho_crit:
+                            log(f"  ρ_local={_rl:.4f} < {_rho_crit:.4f} — "
+                                f"нестабилен локально.")
+                        return False
+
+                    if auto_screen_direction == "bottom_up":
+                        log(f"\n  Режим: снизу вверх (10% → 90%)")
+                        for _as_ratio_cur in range(10, 100, 10):
+                            _sc_cur = _scores_at(_as_ratio_cur / 100.0)
+                            log(f"\n  Проверка N={_as_ratio_cur}%:")
+                            for _cand in _as_all_cands:
+                                _cid = _cand["id"]
+                                _sc_n10 = _scores_at((_as_ratio_cur + 10) / 100.0)
+                                log(f"    {_cand['display']:40s}  "
+                                    f"{_as_ratio_cur}%={_sc_cur.get(_cid,0):.4f}  "
+                                    f"{_as_ratio_cur+10}%={_sc_n10.get(_cid,0):.4f}  "
+                                    f"100%={_sc_100_ref.get(_cid,0):.4f}")
+                            if _check_pct(_as_ratio_cur):
+                                log(f"  ✓ N={_as_ratio_cur}% стабилен — "
+                                    f"принимаем (первый стабильный снизу).")
+                                _as_ratio_best = _as_ratio_cur
+                                break
+                            else:
+                                log(f"  N={_as_ratio_cur}% нестабилен — "
+                                    f"поднимаемся выше.")
+                        else:
+                            log(f"\n  Ни один % не прошёл — принимаем 100%.")
+                            _as_ratio_best = 100
+                    else:
+                        log(f"\n  Режим: сверху вниз (90% → 10%)")
+                        for _as_ratio_cur in range(90, 0, -10):
+                            _sc_cur = _scores_at(_as_ratio_cur / 100.0)
+                            log(f"\n  Проверка N={_as_ratio_cur}%:")
+                            for _cand in _as_all_cands:
+                                _cid = _cand["id"]
+                                _sc_n10 = _scores_at((_as_ratio_cur + 10) / 100.0)
+                                log(f"    {_cand['display']:40s}  "
+                                    f"{_as_ratio_cur}%={_sc_cur.get(_cid,0):.4f}  "
+                                    f"{_as_ratio_cur+10}%={_sc_n10.get(_cid,0):.4f}  "
+                                    f"100%={_sc_100_ref.get(_cid,0):.4f}")
+                            if _check_pct(_as_ratio_cur):
+                                log(f"  ✓ N={_as_ratio_cur}% стабилен — "
+                                    f"продолжаем спуск.")
+                                _as_ratio_best = _as_ratio_cur
+                            else:
+                                log(f"  N={_as_ratio_cur}% нестабилен — "
+                                    f"останавливаемся на {_as_ratio_best}%.")
+                                break
+
+                screening_ratio = _as_ratio_best
+                fast_epochs = max(1, int(max_epochs * (_as_ratio_best / 100)))
+                # Для warm_start scores берутся из накопленных, для остальных — из историй
+                if auto_screen_direction == "warm_start":
+                    _auto_screen_scores = _ws_final_scores
+                else:
+                    _auto_screen_scores = _scores_at(_as_ratio_best / 100.0)
+                _as_found = True
+
+                log(f"\n  Итог поиска: бюджет скрининга = "
+                    f"{_as_ratio_best}%  ({fast_epochs} эп.)  "
+                    f"режим: {auto_screen_direction}")
+                # Удаляем временные датасеты
                 for _ds in _as_ds_map.values():
                     _cleanup_ds(_ds)
 
-                if _as_found:
-                    log(f"\n  Итог автоподбора: screening_ratio={screening_ratio}%"
-                        f"  ({fast_epochs} эп.)")
-                    log(f"  Li et al. (2018) Hyperband — "
-                        f"однораундовый отсев (s=0 bracket) с подобранным бюджетом")
+                log(f"\n  Итог автоподбора: screening_ratio={screening_ratio}%"
+                    f"  ({fast_epochs} эп.)")
+                log(f"  Li et al. (2018) Hyperband — однораундовый отсев "
+                    f"(s=0 bracket) с подобранным бюджетом")
 
         # ══════════════════════════════════════════════════════════════════
         # BASELINE: быстрое обучение оригинала
@@ -1540,8 +2010,17 @@ def _run_search(q: queue.Queue, config: Dict):
         log("=" * 70)
         log(f"BASELINE: оригинальный датасет ({screening_ratio}% эпох)")
         log("=" * 70)
-        baseline_score = quick_train(dataset_name, "baseline")
-        log(f"  Baseline score = {baseline_score:.4f}")
+        # Если автоподбор включён — baseline уже обучен до 100% с историей.
+        # Берём max(0..screening_ratio%) — равные условия с кандидатами.
+        # Если автоподбор выключен — обучаем baseline обычным способом.
+        if auto_screen and _baseline_history:
+            baseline_score = _history_score_at(
+                _baseline_history, screening_ratio / 100.0)
+            log(f"  Baseline score = {baseline_score:.4f}  "
+                f"[из истории автоподбора, max(0..{screening_ratio}%)]")
+        else:
+            baseline_score = quick_train(dataset_name, "baseline")
+            log(f"  Baseline score = {baseline_score:.4f}")
 
         # ══════════════════════════════════════════════════════════════════
         # ФАЗА 1: Group-wise SHA-скрининг
@@ -1599,31 +2078,20 @@ def _run_search(q: queue.Queue, config: Dict):
         _scored_per_group: Dict[str, List[Dict]] = {}
 
         # ── Кеш scores из автоподбора скрининга ───────────────────────
-        # Если автоподбор был включён и первый прогон (с нуля) совпадает
-        # по числу эпох с итоговым fast_epochs — переиспользуем scores.
+        # При новом алгоритме автоподбора каждый кандидат обучается один
+        # раз до 100%, а scores при любом % извлекаются из истории.
+        # _auto_screen_scores содержит scores при итоговом screening_ratio%
+        # — кэш работает для любого найденного %.
         #
-        # Научное обоснование повторного использования:
-        # seed фиксирован (Dodge & Karam, 2017 CVPRW), датасеты
-        # идентичны, число эпох совпадает — результат детерминирован.
-        # Переиспользуются ТОЛЬКО scores первого прогона (обученного
-        # с нуля), не дообученных warm-start прогонов — те отличаются
-        # состоянием оптимизатора и не эквивалентны обучению с нуля.
-        #
-        # Когда кеш работает:
-        #   auto_screen_start=30%, итог=30% → первый прогон на 30%
-        #   совпадает с Фазой 1 на 30%. Экономия: N_cands обучений.
-        #
-        # Когда кеш НЕ работает (обучаем заново):
-        #   auto_screen_start=30%, итог=50% → первый прогон был на 30%,
-        #   а Фаза 1 нужна на 50%. Scores несопоставимы.
+        # Dodge & Karam (2017) CVPRW: seed фиксирован → результат
+        # детерминирован. Scores из истории эквивалентны обучению с нуля
+        # на том же числе эпох при том же seed.
         _as_reusable: Dict[str, float] = {}
-        if (_auto_screen_scores
-                and _as_first_run_scores
-                and _as_first_run_ratio == screening_ratio):
-            _as_reusable = _as_first_run_scores
+        if _auto_screen_scores:
+            _as_reusable = _auto_screen_scores
         if _as_reusable:
             log(f"\n  [КЕШИРОВАНИЕ] Переиспользую {len(_as_reusable)} scores "
-                f"из автоподбора скрининга ({screening_ratio}% эпох, обучены с нуля)")
+                f"из автоподбора скрининга ({screening_ratio}% эпох)")
             log(f"  Dodge & Karam (2017): seed фиксирован → результат детерминирован")
 
         for group_id, group_info in active_groups.items():
@@ -1961,35 +2429,79 @@ def _run_search(q: queue.Queue, config: Dict):
         # ══════════════════════════════════════════════════════════════════
         log("")
         log("=" * 70)
-        log("ФИНАЛЬНОЕ ОБУЧЕНИЕ ПОБЕДИТЕЛЯ")
+        log("ФИНАЛЬНОЕ ОБУЧЕНИЕ ПОБЕДИТЕЛЕЙ (топ-N)")
         log("=" * 70)
 
-        # Выбираем лучшего среди финальных survivors
-        best_survivor = max(final_survivors, key=lambda x: x["score"])
-        best_pipeline_cands = best_survivor["pipeline_cands"]
+        # Сколько топ-survivors обучать финально
+        top_k = config.get("top_k_winners", 1)
+        # Сортируем survivors по score (лучший первый)
+        _sorted_survivors = sorted(final_survivors,
+                                   key=lambda x: x["score"], reverse=True)
+        # Берём min(top_k, len(survivors))
+        _top_survivors = _sorted_survivors[:min(top_k, len(_sorted_survivors))]
 
-        # Если победитель — одиночный метод из Фазы 1 (len==1) и его score
-        # не превышает baseline, честно сообщаем пользователю, но всё равно
-        # обучаем и сравниваем полным обучением.
-        log(f"  Лучший survivor: {best_survivor['display']}  score({screening_ratio}%)={best_survivor['score']:.4f}")
+        log(f"  Финальных survivors: {len(final_survivors)}, "
+            f"будем обучать топ-{len(_top_survivors)}")
         log(f"  Baseline score ({screening_ratio}%): {baseline_score:.4f}")
+        for _s in _top_survivors:
+            log(f"    • {_s['display']:40s}  score({screening_ratio}%)={_s['score']:.4f}")
 
-        # pipeline_cands — список одиночных survivor-dict из Фазы 1
-        winner_methods, winner_params = merge_methods_params(best_pipeline_cands)
-        winner_display = best_survivor["display"]
-        log(f"  Победитель для полного обучения: {winner_display}")
+        # Обучаем каждого из топ-N survivors
+        # Победителем станет лучший по score на test сплите
+        _finalist_results = []  # список (survivor, ds_name, metrics)
+        for _rank, _surv in enumerate(_top_survivors, 1):
+            _surv_methods, _surv_params = merge_methods_params(
+                _surv["pipeline_cands"])
+            _surv_display = _surv["display"]
+            _surv_ds_name = f"{dataset_name}_p2_top{_rank}"
+            log(f"\n  [{_rank}/{len(_top_survivors)}] Финал: {_surv_display}")
+            log(f"  Создаю датасет: {_surv_ds_name}")
+            preprocessor.apply_global_preprocessing(
+                source_dataset=dataset_name,
+                target_dataset=_surv_ds_name,
+                methods=_surv_methods,
+                params=_surv_params,
+            )
+            _surv_metrics = full_train(_surv_ds_name, _surv_display,
+                                       result_subdir=f"final_top{_rank}")
+            _surv_score = score_from_metrics(_surv_metrics)
+            log(f"    → score(test)={_surv_score:.4f}  "
+                f"mAP50-95={_surv_metrics.get('mAP50-95',0):.4f}")
+            _finalist_results.append((_surv, _surv_ds_name, _surv_metrics))
 
-        # Создаём постоянный датасет-победитель (не временный)
-        winner_ds_name = f"{dataset_name}_p2_winner"
-        log(f"  Создаю постоянный датасет: {winner_ds_name}")
-        preprocessor.apply_global_preprocessing(
-            source_dataset=dataset_name,
-            target_dataset=winner_ds_name,
-            methods=winner_methods,
-            params=winner_params,
-        )
-        final_metrics = full_train(winner_ds_name, winner_display,
-                                   result_subdir="final_winner")
+        # Лучший финалист по score на test
+        _best_finalist = max(_finalist_results,
+                             key=lambda x: score_from_metrics(x[2]))
+        best_survivor, winner_ds_name, final_metrics = _best_finalist
+        winner_display  = best_survivor["display"]
+        winner_methods, winner_params = merge_methods_params(
+            best_survivor["pipeline_cands"])
+
+        # Переименовываем датасет победителя в стандартное имя
+        _final_winner_ds = f"{dataset_name}_p2_winner"
+        if winner_ds_name != _final_winner_ds:
+            try:
+                import shutil as _sh
+                _src_p = get_dataset_path(winner_ds_name)
+                _dst_p = get_dataset_path(_final_winner_ds)
+                if _src_p.exists():
+                    if _dst_p.exists():
+                        _sh.rmtree(_dst_p)
+                    _sh.copytree(_src_p, _dst_p)
+                    winner_ds_name = _final_winner_ds
+            except Exception as _re:
+                log(f"  [ПРЕДУПРЕЖДЕНИЕ] Не удалось переименовать датасет: {_re}")
+
+        log(f"\n  Победитель финала: {winner_display}  "
+            f"score(test)={score_from_metrics(final_metrics):.4f}")
+        if len(_finalist_results) > 1:
+            log("  Все финалисты (test):")
+            for _s, _ds, _m in sorted(_finalist_results,
+                                       key=lambda x: score_from_metrics(x[2]),
+                                       reverse=True):
+                log(f"    {_s['display']:40s}  "
+                    f"score={score_from_metrics(_m):.4f}  "
+                    f"mAP50-95={_m.get('mAP50-95',0):.4f}")
 
         # ══════════════════════════════════════════════════════════════════
         # ФИНАЛЬНЫЙ BASELINE (полное обучение для честного сравнения)
@@ -2074,6 +2586,20 @@ def _run_search(q: queue.Queue, config: Dict):
                     "pipeline_ids": list(s["pipeline_ids"]),
                 }
                 for s in sorted(final_survivors, key=lambda x: x["score"], reverse=True)
+            ],
+            "screening_table": _screening_table_data,
+            # Все финалисты (топ-N) с метриками на test
+            "all_finalists": [
+                {
+                    "display": _s["display"],
+                    "score":   round(score_from_metrics(_m), 4),
+                    "mAP50-95": round(_m.get("mAP50-95", 0), 4),
+                    "mAP50":    round(_m.get("mAP50", 0), 4),
+                    "f1":       round(_m.get("f1", 0), 4),
+                }
+                for _s, _ds, _m in sorted(
+                    _finalist_results,
+                    key=lambda x: score_from_metrics(x[2]), reverse=True)
             ],
             "baseline_quick_score": round(baseline_score, 4),
         }
@@ -2575,6 +3101,20 @@ if st.session_state.p2_stage == "configure":
             key="p2_seed_input",
             help="Dodge & Karam (2017) — фиксация seed устраняет случайный разброс метрик",
         )
+        top_k_winners = st.number_input(
+            "Топ-N финалистов для полного обучения",
+            min_value=1, max_value=10,
+            value=st.session_state.p2_top_k_winners,
+            key="p2_top_k_winners_input",
+            help=(
+                "Сколько лучших survivors Фазы 2 обучить до 100% эпох. "
+                "Победителем станет лучший по mAP50-95 на test. "
+                "1 = только лучший (быстро). 3-5 = страховка от rank reversal. "
+                "Zoller & Huber (2021): валидация нескольких топ-кандидатов "
+                "снижает риск упустить лучший вариант."
+            ),
+        )
+        st.session_state.p2_top_k_winners = top_k_winners
         screening_ratio = st.slider(
             "% эпох для скрининга",
             min_value=10, max_value=60,
@@ -2604,6 +3144,7 @@ if st.session_state.p2_stage == "configure":
         ),
     )
     st.session_state.p2_auto_screen = auto_screen
+    uploaded_history_csv = None  # инициализация до блока if auto_screen
 
     if auto_screen:
         _as_col1, _as_col2 = st.columns(2)
@@ -2618,16 +3159,82 @@ if st.session_state.p2_stage == "configure":
             )
             st.session_state.p2_auto_screen_start = auto_screen_start
         with _as_col2:
+            _dir_options = ["top_down", "bottom_up", "full_budget", "warm_start"]
+            _dir_cur = st.session_state.get(
+                "p2_auto_screen_direction", "top_down")
+            _dir_idx = _dir_options.index(_dir_cur) if _dir_cur in _dir_options else 0
+            auto_screen_direction = st.radio(
+                "Режим поиска бюджета",
+                options=_dir_options,
+                format_func=lambda x: {
+                    "top_down":    "Сверху вниз (от 90% к 10%)",
+                    "bottom_up":   "Снизу вверх (от 10% к 90%)",
+                    "full_budget": "100% бюджет (без поиска %)",
+                    "warm_start":  "Warm-start (снизу вверх, дообучение)",
+                }[x],
+                index=_dir_idx,
+                key="p2_auto_screen_direction_radio",
+                help=(
+                    "Сверху вниз: начинает с 90%, спускается вниз — "
+                    "берёт наименьший % при котором ранги стабильны "
+                    "на всём пути от 90% до найденного %.\n\n"
+                    "Снизу вверх: начинает с 10%, поднимается — "
+                    "останавливается при первом стабильном %. "
+                    "Быстрее, но менее консервативен.\n\n"
+                    "100% бюджет: поиск % не выполняется — скрининг "
+                    "всегда на 100% эпох.\n\n"
+                    "Warm-start: инкрементальное дообучение снизу вверх. "
+                    "Кандидаты обучаются с нуля до r_A%, затем дообучаются "
+                    "warm-start до r_B% и r_C%. Две локальные проверки "
+                    "ρ(A,B) и ρ(B,C). Экономит вычисления — не нужно "
+                    "обучать до 100%. Li et al. (2018) JMLR 18(185)."
+                ),
+            )
+            st.session_state.p2_auto_screen_direction = auto_screen_direction
             st.info(
                 "**Порог ρ: автоматический**\n\n"
-                "Критическое значение Спирмена ρ рассчитывается по числу "
-                "кандидатов N и уровню значимости α=0.01 "
-                "(Zar, 2005; Ramsey, 1989).\n\n"
-                "Если scores кандидатов одинаковы (CV < 1.5%) на двух "
-                "последовательных бюджетах — подбор прекращается: "
-                "ранжирование нестабильно при любом бюджете "
-                "(Audibert et al., 2010 COLT)."
+                "Основная проверка: ρ(N%, 100%) — глобальная стабильность "
+                "относительно полного бюджета (Klein et al., 2017 ICLR).\n\n"
+                "Дополнительная: ρ(N%, N+10%) — локальная стабильность. "
+                "Обе ≥ ρ_crit для принятия N% (Zar, 2005; α=0.01)."
             )
+
+    # ── Загрузка истории скрининга из CSV ────────────────────────────────
+    # Позволяет переиспользовать результаты предыдущего прогона автоподбора
+    # вместо повторного обучения всех кандидатов до 100% эпох.
+    # Формат CSV: колонки "Метод", "10%", "20%", ..., "100%"
+    # (файл p2_screening_history_*.csv из предыдущего запуска).
+    # Требование: тот же seed, датасет, модель и max_epochs.
+    if auto_screen:
+        st.markdown("**Переиспользовать историю из предыдущего прогона (опционально)**")
+        uploaded_history_csv = st.file_uploader(
+            "Загрузить p2_screening_history_*.csv",
+            type=["csv"],
+            key="p2_history_csv_uploader",
+            help=(
+                "Загрузите CSV с историей скрининга из предыдущего запуска "
+                "чтобы пропустить повторное обучение кандидатов до 100% эпох. "
+                "Обязательно: тот же seed, датасет, модель, max_epochs."
+            ),
+        )
+        if uploaded_history_csv is not None:
+            # Сохраняем содержимое в session_state пока файл доступен
+            st.session_state.p2_history_csv_content = (
+                uploaded_history_csv.read().decode("utf-8"))
+            st.success(
+                f"✓ CSV загружен: {uploaded_history_csv.name}  "
+                f"— обучение кандидатов будет пропущено."
+            )
+            st.warning(
+                "Убедитесь что seed, датасет, модель и max_epochs совпадают "
+                "с параметрами прогона из которого взят CSV."
+            )
+        else:
+            # Сбрасываем если файл убран
+            if "p2_history_csv_content" not in st.session_state:
+                st.session_state.p2_history_csv_content = ""
+    else:
+        uploaded_history_csv = None
 
     st.session_state.p2_epochs = epochs
     st.session_state.p2_patience = patience
@@ -2717,6 +3324,15 @@ elif st.session_state.p2_stage == "running":
                                   st.session_state.get("p2_auto_screen", False)),
             "auto_screen_start":  st.session_state.get("p2_auto_screen_start_slider",
                                   st.session_state.get("p2_auto_screen_start", 40)),
+            "auto_screen_direction": st.session_state.get("p2_auto_screen_direction_radio",
+                                  st.session_state.get("p2_auto_screen_direction", "top_down")),
+            # CSV с историей скрининга: читаем через session_state.
+            # uploaded_history_csv может быть недоступен в этом блоке,
+            # поэтому используем session_state где файл был сохранён.
+            "history_csv_content": st.session_state.get(
+                "p2_history_csv_content", ""),
+            "top_k_winners":      st.session_state.get("p2_top_k_winners_input",
+                                  st.session_state.get("p2_top_k_winners", 1)),
             # auto_screen_rho убран — критическое значение ρ вычисляется
             # автоматически внутри _run_search через _spearman_critical_rho(N).
             # Zar (2005); Ramsey (1989).
@@ -3030,6 +3646,32 @@ elif st.session_state.p2_stage == "done":
             st.divider()
 
             # ─────────────────────────────────────────────────────────────
+            # ВСЕ ФИНАЛИСТЫ (топ-N)
+            # ─────────────────────────────────────────────────────────────
+            all_finalists = result.get("all_finalists", [])
+            if len(all_finalists) > 1:
+                with st.expander(
+                    f"Все финалисты топ-N (полное обучение, test)",
+                    expanded=True
+                ):
+                    _fin_rows = [
+                        {
+                            "Пайплайн":   f["display"],
+                            "Score":      f"{f['score']:.4f}",
+                            "mAP50-95":   f"{f['mAP50-95']:.4f}",
+                            "mAP50":      f"{f['mAP50']:.4f}",
+                            "F1":         f"{f['f1']:.4f}",
+                            "Победитель": "✓" if f["display"] == result.get("winner_pipeline") else "",
+                        }
+                        for f in all_finalists
+                    ]
+                    import pandas as _pd_fin
+                    st.dataframe(_pd_fin.DataFrame(_fin_rows),
+                                 use_container_width=True)
+
+            st.divider()
+
+            # ─────────────────────────────────────────────────────────────
             # СКАЧИВАНИЕ
             # ─────────────────────────────────────────────────────────────
             st.subheader("Скачать результаты")
@@ -3067,6 +3709,22 @@ elif st.session_state.p2_stage == "done":
                     mime="text/csv",
                     use_container_width=True,
                 )
+
+            # CSV таблица скрининга — mAP50-95 по 10% шагам (автоподбор)
+            screening_table_data = result.get("screening_table", [])
+            if screening_table_data:
+                csv_screening = pd.DataFrame(screening_table_data).to_csv(
+                    index=False, encoding="utf-8")
+                # Добавляем четвёртую колонку
+                dl_col4, = st.columns(1)
+                with dl_col4:
+                    st.download_button(
+                        label="📥 Таблица скрининга (mAP50-95 по 10% эпох)",
+                        data=csv_screening,
+                        file_name=f"p2_screening_history_{result.get('dataset_name','')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
 
             # Полный лог
             full_log = "\n".join(st.session_state.p2_log_lines)

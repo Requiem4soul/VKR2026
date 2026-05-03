@@ -433,7 +433,9 @@ def _run_training(
     eval_split: str = 'val',
     resume_from: str = '',
     keep_weights: bool = False,
-    seed: int = 42,
+    max_epochs_for_schedule: int = 0,
+    disable_mosaic: bool = False,
+    seed: int = 0,
 ) -> Dict[str, float]:
     """
     Запускает обучение через wrapper'ы из Модуля 2.
@@ -554,12 +556,39 @@ def _run_training(
                 _lrf = 0.01        # дефолт Ultralytics
                 _warmup_ep = 3.0   # дефолт Ultralytics
 
+            # ── Логика lr-schedule и прерывания ─────────────────────────
+            # Если max_epochs_for_schedule задан (> epochs_delta) —
+            # запускаем YOLO на полном бюджете, но прерываем через callback
+            # после epochs_delta эпох. lr-schedule рассчитывается на
+            # max_epochs_for_schedule, что согласует Фазы 1/2 с историями
+            # автоподбора скрининга (тоже обученными на max_epochs).
+            # Если max_epochs_for_schedule не задан — обычный режим.
+            _use_schedule_override = (
+                max_epochs_for_schedule > 0
+                and max_epochs_for_schedule > epochs_delta
+            )
+            _actual_train_epochs = (
+                max_epochs_for_schedule if _use_schedule_override
+                else epochs_delta
+            )
+            _stop_at_epoch = epochs_delta  # реально нужное число эпох
+
+            if _use_schedule_override:
+                # Callback прерывает обучение после _stop_at_epoch эпох.
+                # trainer.epoch — 0-based счётчик внутри текущего запуска.
+                def _early_stop_cb(trainer):
+                    if (trainer.epoch + 1) >= _stop_at_epoch:
+                        trainer.stop = True
+                model.add_callback('on_fit_epoch_end', _early_stop_cb)
+                log_fn(
+                    f"  [LR-SCHEDULE] Запуск на {_actual_train_epochs} эп., "
+                    f"прерывание после {_stop_at_epoch} эп. "
+                    f"(lr-schedule согласован с автоподбором)"
+                )
+
             train_kwargs = dict(
                 data=str(yaml_path),
-                # Передаём дельту эпох, а не абсолютное число.
-                # Ключевое исправление: lr-schedule охватывает только
-                # дополнительные эпохи. Li et al. (2018) JMLR 18(185).
-                epochs=epochs_delta,
+                epochs=_actual_train_epochs,
                 imgsz=imgsz,
                 batch=model_config.get('batch', -1),
                 device=device,
@@ -579,8 +608,15 @@ def _run_training(
                 lr0=_lr0,
                 lrf=_lrf,
                 warmup_epochs=_warmup_ep,
-                # Воспроизводимость: Dodge & Karam (2017) CVPRW — фиксация seed
-                # устраняет случайный разброс метрик между запусками.
+                # close_mosaic: если disable_mosaic=True — отключаем полностью.
+                # Используется в Фазах 1/2 для согласованности условий с
+                # историями автоподбора (там тоже close_mosaic=0).
+                # Redmon & Farhadi (2018): мозаика влияет на метрики —
+                # равные условия требуют одинакового режима мозаики.
+                close_mosaic=0 if disable_mosaic else 10,
+                # seed: фиксирует случайность внутри Ultralytics
+                # (инициализация весов, порядок батчей, аугментации).
+                # Dodge & Karam (2017): seed фиксирован → воспроизводимость.
                 seed=seed,
             )
             if use_early_stopping:
@@ -783,6 +819,344 @@ def _run_training(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ОБУЧЕНИЕ ДО 100% С ИСТОРИЕЙ МЕТРИК (для автоподбора % скрининга)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_training_warmstart(
+    dataset_path: Path,
+    model_config: Dict[str, Any],
+    epochs_delta: int,
+    result_dir: Path,
+    log_fn,
+    resume_from: str,
+    use_early_stopping: bool = True,
+    early_stopping_patience: int = 20,
+    eval_split: str = 'val',
+    disable_mosaic: bool = True,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """
+    Дообучение YOLO warm-start с дельта-эпохами.
+
+    Передаём epochs=epochs_delta (дельта, не абсолютное число).
+    Загружаем веса из resume_from как инициализацию (resume=False),
+    lr0 снижен до 0.001 (fine-tune режим).
+
+    Использование дельты вместо total_epochs:
+    - Ultralytics с resume=True имеет баг: иногда обучает неверное
+      число эпох (не remaining = total - done, а total снова с нуля).
+    - Дельта-эпохи + resume=False гарантирует ровно epochs_delta
+      дополнительных эпох независимо от состояния checkpoint.
+    - lr0=0.001 (сниженный) компенсирует отсутствие resume lr-schedule.
+
+    Li et al. (2018) JMLR 18(185): warm-start ранжирование стабильно
+    при дообучении с пониженным lr независимо от формы schedule.
+    Egele et al. (2024) Neurocomputing 562: ранжирование Спирмена
+    устойчиво к вариациям lr-schedule при дообучении.
+    """
+    result_dir.mkdir(parents=True, exist_ok=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_type = model_config.get('type', 'yolo')
+    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
+
+    try:
+        if model_type == 'yolo':
+            from ultralytics import YOLO
+            import yaml as _yaml
+
+            model_size = model_config.get('size', 'n')
+            imgsz     = model_config.get('imgsz', 640)
+
+            # Ищем data.yaml
+            yaml_path = dataset_path / 'data.yaml'
+            if not yaml_path.exists():
+                for _p in dataset_path.rglob('data.yaml'):
+                    yaml_path = _p
+                    break
+
+            # Загружаем модель из checkpoint для resume
+            if resume_from and Path(resume_from).exists():
+                model = YOLO(resume_from)
+                log_fn(f"  [WARMSTART] Загружен checkpoint: {resume_from}")
+            else:
+                model = YOLO(f'yolov8{model_size}.pt')
+                log_fn(f"  [WARMSTART] checkpoint не найден — обучение с нуля")
+
+            train_kwargs = dict(
+                data=str(yaml_path),
+                epochs=epochs_delta,
+                imgsz=imgsz,
+                batch=model_config.get('batch', -1),
+                device=device,
+                project=str(result_dir),
+                name='run',
+                exist_ok=True,
+                workers=0,
+                cache=False,
+                verbose=False,
+                save=True,
+                # resume=False: передаём дельту эпох явно.
+                # resume=True в Ultralytics имеет баг — иногда обучает
+                # неверное число эпох. Дельта + resume=False гарантирует
+                # ровно epochs_delta дополнительных эпох.
+                resume=False,
+                # lr0 снижен для fine-tune: веса загружены из checkpoint,
+                # высокий lr0 дестабилизирует уже обученные веса.
+                lr0=0.001,
+                lrf=0.01,
+                warmup_epochs=0.0,
+                close_mosaic=0 if disable_mosaic else 10,
+                seed=seed,
+            )
+
+            if use_early_stopping:
+                train_kwargs['patience'] = early_stopping_patience
+            else:
+                train_kwargs['patience'] = 0
+
+            results = model.train(**train_kwargs)
+
+            # Оценка на нужном сплите из best.pt
+            best_pt = result_dir / 'run' / 'weights' / 'best.pt'
+            eval_model = YOLO(
+                str(best_pt) if best_pt.exists() else f'yolov8{model_size}.pt')
+            _yolo_split = 'val' if eval_split in ('val', 'valid') else eval_split
+            val_res = eval_model.val(
+                data=str(yaml_path),
+                split=_yolo_split,
+                device=device,
+                verbose=False,
+            )
+            box = val_res.results_dict
+            metrics['mAP50-95'] = float(box.get('metrics/mAP50-95(B)', 0.0))
+            metrics['mAP50']    = float(box.get('metrics/mAP50(B)',    0.0))
+            # F1 из best.pt train metrics
+            train_dict = results.results_dict
+            metrics['f1'] = float(train_dict.get('metrics/F1(B)', 0.0))
+
+            log_fn(f"    [WARMSTART] mAP50-95={metrics['mAP50-95']:.4f}  "
+                   f"mAP50={metrics['mAP50']:.4f}  [split={eval_split}]")
+
+        else:
+            log_fn(f"  [WARMSTART] модель {model_type} не поддерживает warm-start")
+
+    except Exception as e:
+        log_fn(f"  [WARMSTART ОШИБКА] {e}")
+        import traceback as _tb
+        log_fn(_tb.format_exc())
+    finally:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    return metrics
+
+
+def _run_training_full_history(
+    dataset_path: Path,
+    model_config: Dict[str, Any],
+    epochs: int,
+    result_dir: Path,
+    log_fn,
+    early_stopping_patience: int = 20,
+    seed: int = 0,
+) -> List[float]:
+    """
+    Обучает YOLO до 100% эпох с close_mosaic=0 и возвращает историю
+    mAP50-95 по каждой эпохе в виде списка [ep1, ep2, ..., ep_N].
+
+    Используется автоподбором процента скрининга в 6_Объединение.py:
+    вместо нескольких отдельных прогонов (warm-start A→B→C) запускается
+    один прогон до конца, а пороговые значения N% / N+10% / N+20%
+    извлекаются из истории как max(0..k) — без повторного обучения.
+
+    close_mosaic=0: отключает мозаику на последних 10 эпохах (дефолт
+    Ultralytics). Без этого кандидаты при разных порогах N% получают
+    разное число эпох без мозаики, что создаёт систематическое смещение
+    при сравнении max(0..N%) vs max(0..N+10%).
+    Redmon & Farhadi (2018): мозаика меняет распределение входных данных —
+    её отсутствие на части прогона влияет на финальные метрики.
+
+    История читается из results.csv который Ultralytics всегда пишет
+    в result_dir/run/results.csv — по одной строке на эпоху.
+
+    Returns:
+        List[float]: история mAP50-95 по эпохам (индекс 0 = эпоха 1).
+                     Пустой список если обучение не удалось.
+    """
+    result_dir.mkdir(parents=True, exist_ok=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_type = model_config.get('type', 'yolo')
+    history: List[float] = []
+
+    try:
+        if model_type == 'yolo':
+            from ultralytics import YOLO
+            model_size = model_config.get('size', 'n')
+            model = YOLO(f'yolov8{model_size}.pt')
+
+            yaml_path = dataset_path / 'data.yaml'
+
+            if model_config.get('imgsz'):
+                imgsz = int(model_config['imgsz'])
+            else:
+                try:
+                    from Train.Universal_train.universal_model_trainer import get_image_size_from_dataset
+                    imgsz = get_image_size_from_dataset(dataset_path)
+                except Exception:
+                    imgsz = 640
+
+            model.train(
+                data=str(yaml_path),
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=model_config.get('batch', -1),
+                device=device,
+                project=str(result_dir),
+                name='run',
+                exist_ok=True,
+                workers=0,
+                cache=False,
+                verbose=False,
+                save=True,
+                resume=False,
+                patience=early_stopping_patience,
+                close_mosaic=0,      # мозаика одинакова на всех эпохах
+                lr0=0.01,            # дефолт Ultralytics
+                lrf=0.01,
+                warmup_epochs=3.0,
+                seed=seed,
+            )
+
+            # Читаем историю mAP50-95 из results.csv
+            # Ultralytics пишет CSV с заголовком; колонка называется
+            # '                  metrics/mAP50-95(B)' (с пробелами — strip нужен)
+            csv_path = result_dir / 'run' / 'results.csv'
+            if csv_path.exists():
+                import csv as _csv
+                with open(csv_path, newline='', encoding='utf-8') as f:
+                    reader = _csv.DictReader(f)
+                    for row in reader:
+                        for k, v in row.items():
+                            if 'mAP50-95' in k and 'mAP50(B)' not in k:
+                                try:
+                                    history.append(float(v.strip()))
+                                except ValueError:
+                                    history.append(0.0)
+                                break
+                log_fn(f"  [HISTORY] Прочитано {len(history)} эпох из results.csv")
+            else:
+                log_fn(f"  [HISTORY] results.csv не найден: {csv_path}")
+
+            # Паддинг после ES: если ES остановил обучение раньше epochs,
+            # дополняем историю последним реально полученным значением.
+            # Prechelt (1998): ES детектирует плато — после остановки
+            # метрика не изменилась бы существенно. Паддинг последним
+            # значением не вносит новых максимумов в историю, поэтому
+            # max(0..N%) для любого порога остаётся корректным.
+            # Li et al. (2018): все кандидаты должны иметь одинаковую
+            # длину истории для корректного сравнения при бюджете N%.
+            if len(history) < epochs:
+                last_val = history[-1] if history else 0.0
+                padded = epochs - len(history)
+                history.extend([last_val] * padded)
+                log_fn(f"  [HISTORY] ES сработал на эпохе {epochs - padded} "
+                       f"из {epochs} — паддинг {padded} эпох "
+                       f"значением {last_val:.4f} (Prechelt, 1998)")
+
+            del model
+
+        else:
+            # Faster R-CNN / RetinaNet: история собирается вручную по эпохам
+            from Train.Universal_train.universal_model_trainer import (
+                FasterRCNNWrapper, RetinaNetWrapper,
+                YOLODatasetInfo, YOLOToFasterRCNNDataset,
+                calculate_optimal_batch_size, get_available_vram_gb,
+            )
+            from torch.utils.data import DataLoader
+
+            vram = get_available_vram_gb()
+            batch_size = calculate_optimal_batch_size(model_type, vram)
+
+            if model_type == 'faster_rcnn':
+                wrapper = FasterRCNNWrapper(pretrained=True)
+            else:
+                wrapper = RetinaNetWrapper(pretrained=True)
+
+            num_classes = YOLODatasetInfo.get_num_classes(dataset_path)
+            wrapper.initialize(num_classes=num_classes)
+            wrapper.model.to(device)
+
+            _base_lr = 0.005
+            optimizer = torch.optim.SGD(
+                wrapper.model.parameters(),
+                lr=_base_lr, momentum=0.9, weight_decay=0.0005,
+            )
+
+            def collate_fn(batch):
+                return tuple(zip(*batch))
+
+            train_ds = YOLOToFasterRCNNDataset(dataset_path, split='train')
+            val_ds   = YOLOToFasterRCNNDataset(dataset_path, split='val')
+            train_loader = DataLoader(train_ds, batch_size=batch_size,
+                                      shuffle=True, collate_fn=collate_fn, num_workers=0)
+            val_loader   = DataLoader(val_ds, batch_size=batch_size,
+                                      shuffle=False, collate_fn=collate_fn, num_workers=0)
+
+            for epoch in range(epochs):
+                wrapper.train_epoch(train_loader, device, optimizer, epoch)
+                val_metrics = wrapper.validate(val_loader, device)
+                history.append(float(val_metrics.get('mAP50-95', 0.0)))
+
+            log_fn(f"  [HISTORY] Собрано {len(history)} эпох (Faster R-CNN/RetinaNet)")
+
+    except Exception as e:
+        log_fn(f"  [HISTORY ERROR] {e}")
+        log_fn(traceback.format_exc())
+
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        # result_dir НЕ удаляем — best.pt может понадобиться для финального
+        # обучения если этот кандидат окажется победителем Фазы 2.
+
+    return history
+
+
+def _history_score_at(history: List[float], ratio: float) -> float:
+    """
+    Возвращает max(mAP50-95) по первым ratio*len(history) эпохам.
+
+    Используется автоподбором скрининга для извлечения score кандидата
+    при бюджете ratio% из уже готовой истории одного прогона.
+
+    Args:
+        history: список mAP50-95 по эпохам (из _run_training_full_history)
+        ratio:   доля эпох, например 0.5 для 50%
+
+    Returns:
+        float: max mAP50-95 за первые ratio*N эпох. 0.0 если история пуста.
+
+    Научное обоснование использования max:
+    Li et al. (2018) JMLR 18(185): SHA сохраняет лучшего кандидата —
+    score кандидата определяется его пиковым потенциалом на данном бюджете,
+    а не финальным состоянием (которое может быть хуже из-за шума).
+    Использование max(0..k) корректно потому что best.pt в обычном
+    _run_training тоже отражает пик, а не финал.
+    """
+    if not history:
+        return 0.0
+    n = len(history)
+    k = max(1, int(round(n * ratio)))
+    k = min(k, n)
+    return max(history[:k])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ФИНАЛЬНОЕ ОБУЧЕНИЕ (не удаляет веса, eval на test)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -794,7 +1168,7 @@ def _run_training_final(
     log_fn,
     early_stopping_patience: int = 10,
     eval_split: str = 'test',
-    seed: int = 42,
+    seed: int = 0,
 ) -> Dict[str, float]:
     """
     Финальное обучение победителя на постоянном датасете.
@@ -840,7 +1214,6 @@ def _run_training_final(
                 verbose=False,
                 save=True,
                 patience=early_stopping_patience,
-                # Воспроизводимость: Dodge & Karam (2017) CVPRW.
                 seed=seed,
             )
             train_metrics_dict = results.results_dict
