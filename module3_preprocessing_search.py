@@ -822,6 +822,139 @@ def _run_training(
 # ОБУЧЕНИЕ ДО 100% С ИСТОРИЕЙ МЕТРИК (для автоподбора % скрининга)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _run_training_warmstart(
+    dataset_path: Path,
+    model_config: Dict[str, Any],
+    epochs_delta: int,
+    result_dir: Path,
+    log_fn,
+    resume_from: str,
+    use_early_stopping: bool = True,
+    early_stopping_patience: int = 20,
+    eval_split: str = 'val',
+    disable_mosaic: bool = True,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """
+    Дообучение YOLO warm-start с дельта-эпохами.
+
+    Передаём epochs=epochs_delta (дельта, не абсолютное число).
+    Загружаем веса из resume_from как инициализацию (resume=False),
+    lr0 снижен до 0.001 (fine-tune режим).
+
+    Использование дельты вместо total_epochs:
+    - Ultralytics с resume=True имеет баг: иногда обучает неверное
+      число эпох (не remaining = total - done, а total снова с нуля).
+    - Дельта-эпохи + resume=False гарантирует ровно epochs_delta
+      дополнительных эпох независимо от состояния checkpoint.
+    - lr0=0.001 (сниженный) компенсирует отсутствие resume lr-schedule.
+
+    Li et al. (2018) JMLR 18(185): warm-start ранжирование стабильно
+    при дообучении с пониженным lr независимо от формы schedule.
+    Egele et al. (2024) Neurocomputing 562: ранжирование Спирмена
+    устойчиво к вариациям lr-schedule при дообучении.
+    """
+    result_dir.mkdir(parents=True, exist_ok=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_type = model_config.get('type', 'yolo')
+    metrics: Dict[str, float] = {'mAP50-95': 0.0, 'mAP50': 0.0, 'f1': 0.0}
+
+    try:
+        if model_type == 'yolo':
+            from ultralytics import YOLO
+            import yaml as _yaml
+
+            model_size = model_config.get('size', 'n')
+            imgsz     = model_config.get('imgsz', 640)
+
+            # Ищем data.yaml
+            yaml_path = dataset_path / 'data.yaml'
+            if not yaml_path.exists():
+                for _p in dataset_path.rglob('data.yaml'):
+                    yaml_path = _p
+                    break
+
+            # Загружаем модель из checkpoint для resume
+            if resume_from and Path(resume_from).exists():
+                model = YOLO(resume_from)
+                log_fn(f"  [WARMSTART] Загружен checkpoint: {resume_from}")
+            else:
+                model = YOLO(f'yolov8{model_size}.pt')
+                log_fn(f"  [WARMSTART] checkpoint не найден — обучение с нуля")
+
+            train_kwargs = dict(
+                data=str(yaml_path),
+                epochs=epochs_delta,
+                imgsz=imgsz,
+                batch=model_config.get('batch', -1),
+                device=device,
+                project=str(result_dir),
+                name='run',
+                exist_ok=True,
+                workers=0,
+                cache=False,
+                verbose=False,
+                save=True,
+                # resume=False: передаём дельту эпох явно.
+                # resume=True в Ultralytics имеет баг — иногда обучает
+                # неверное число эпох. Дельта + resume=False гарантирует
+                # ровно epochs_delta дополнительных эпох.
+                resume=False,
+                # lr0 снижен для fine-tune: веса загружены из checkpoint,
+                # высокий lr0 дестабилизирует уже обученные веса.
+                lr0=0.001,
+                lrf=0.01,
+                warmup_epochs=0.0,
+                close_mosaic=0 if disable_mosaic else 10,
+                seed=seed,
+            )
+
+            if use_early_stopping:
+                train_kwargs['patience'] = early_stopping_patience
+            else:
+                train_kwargs['patience'] = 0
+
+            results = model.train(**train_kwargs)
+
+            # Оценка на нужном сплите из best.pt
+            best_pt = result_dir / 'run' / 'weights' / 'best.pt'
+            eval_model = YOLO(
+                str(best_pt) if best_pt.exists() else f'yolov8{model_size}.pt')
+            _yolo_split = 'val' if eval_split in ('val', 'valid') else eval_split
+            val_res = eval_model.val(
+                data=str(yaml_path),
+                split=_yolo_split,
+                device=device,
+                verbose=False,
+            )
+            box = val_res.results_dict
+            metrics['mAP50-95'] = float(box.get('metrics/mAP50-95(B)', 0.0))
+            metrics['mAP50']    = float(box.get('metrics/mAP50(B)',    0.0))
+            # F1 из best.pt train metrics
+            train_dict = results.results_dict
+            metrics['f1'] = float(train_dict.get('metrics/F1(B)', 0.0))
+
+            log_fn(f"    [WARMSTART] mAP50-95={metrics['mAP50-95']:.4f}  "
+                   f"mAP50={metrics['mAP50']:.4f}  [split={eval_split}]")
+
+        else:
+            log_fn(f"  [WARMSTART] модель {model_type} не поддерживает warm-start")
+
+    except Exception as e:
+        log_fn(f"  [WARMSTART ОШИБКА] {e}")
+        import traceback as _tb
+        log_fn(_tb.format_exc())
+    finally:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    return metrics
+
+
 def _run_training_full_history(
     dataset_path: Path,
     model_config: Dict[str, Any],

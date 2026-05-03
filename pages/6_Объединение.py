@@ -124,7 +124,7 @@ _STATE_DEFAULTS = {
     # Автоподбор процента скрининга
     "p2_auto_screen":         False,   # включить автоподбор
     "p2_auto_screen_start":   40,      # начальный % (пользователь задаёт)
-    "p2_auto_screen_direction": "top_down",  # направление поиска: top_down / bottom_up / full_budget
+    "p2_auto_screen_direction": "top_down",  # направление поиска: top_down / bottom_up / full_budget / warm_start
     "p2_history_csv_content":   "",          # содержимое загруженного CSV истории
     "p2_top_k_winners":       1,       # сколько топ-survivors обучать финально
 }
@@ -1381,7 +1381,11 @@ def _run_search(q: queue.Queue, config: Dict):
                         log(f"  [CSV ОШИБКА] {_csv_e} — "
                             f"продолжаем с обучением с нуля")
 
-                log(f"\n  Создаю датасеты и обучаю {_n_cands} кандидатов до 100%...")
+                _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
+
+                # Создаём датасеты для всех кандидатов — нужно для всех режимов
+                # включая warm_start (датасеты нужны для дообучения).
+                log(f"\n  Создаю датасеты для {_n_cands} кандидатов...")
                 for _cand in _as_all_cands:
                     try:
                         _ds = _make_tmp_ds(_cand["id"], _cand["methods"],
@@ -1389,196 +1393,203 @@ def _run_search(q: queue.Queue, config: Dict):
                         _as_ds_map[_cand["id"]] = _ds
                     except Exception as _e:
                         log(f"  [ОШИБКА датасет] {_cand['display']}: {_e}")
-                        continue
 
-                    # Пропускаем если история уже загружена из CSV
-                    if _cand["id"] in _as_histories:
-                        log(f"  [{_cand['display']}] — история из CSV, "
-                            f"обучение пропущено")
-                        continue
+                if auto_screen_direction != "warm_start":
+                    # Для warm_start обучение до 100% не нужно —
+                    # история накапливается инкрементально.
+                    log(f"\n  Обучаю {_n_cands} кандидатов до 100%...")
+                    for _cand in _as_all_cands:
+                        if _cand["id"] not in _as_ds_map:
+                            continue
 
-                    log(f"  Обучаю [{_cand['display']}] до {max_epochs} эп. "
-                        f"(close_mosaic=0)...")
-                    import uuid as _uuid
-                    _hist_subdir = (work_dir /
-                        f"as_hist_{_cand['id'][:20]}_{_uuid.uuid4().hex[:6]}")
-                    try:
-                        if task == "classification":
-                            _cfg_hist = {
-                                **_model_cfg_base,
-                                "name": f"{model_type}_ashist",
-                                "max_epochs": max_epochs,
-                                "use_torch_compile": config.get(
-                                    "use_torch_compile", False),
-                            }
-                            _trainer_hist = ClassificationTrainer(
-                                model_configs=[_cfg_hist],
-                                dataset_names=[_ds],
-                                max_epochs=max_epochs,
-                                checkpoint_interval=max_epochs,
-                                seed=seed,
-                                enable_early_stopping=False,
-                                enable_early_selection=False,
-                            )
-                            _trainer_hist.run_training(resume_paths={})
-                            _hkey = f"{model_type}_ashist_{_ds}"
-                            _raw = _trainer_hist.metrics_history.get(_hkey, [])
-                            _as_histories[_cand["id"]] = [
-                                float(h.get("val_auc",
-                                      h.get("auc", 0.0))) for h in _raw
-                            ]
-                        else:
-                            _hist = _run_training_full_history(
-                                dataset_path=get_dataset_path(_ds),
-                                model_config=_model_cfg_base,
-                                epochs=max_epochs,
-                                result_dir=_hist_subdir,
-                                log_fn=log,
-                                early_stopping_patience=patience,
-                                seed=seed,
-                            )
-                            _as_histories[_cand["id"]] = _hist
-                    except Exception as _e:
-                        log(f"  [ОШИБКА обучение] {_cand['display']}: {_e}")
-                        log(traceback.format_exc())
-                        _as_histories[_cand["id"]] = []
-                    finally:
+                        # Пропускаем если история уже загружена из CSV
+                        if _cand["id"] in _as_histories:
+                            log(f"  [{_cand['display']}] — история из CSV, "
+                                f"обучение пропущено")
+                            continue
+
+                        log(f"  Обучаю [{_cand['display']}] до {max_epochs} эп. "
+                            f"(close_mosaic=0)...")
+                        import uuid as _uuid
+                        _hist_subdir = (work_dir /
+                            f"as_hist_{_cand['id'][:20]}_{_uuid.uuid4().hex[:6]}")
                         try:
-                            import torch as _t
-                            if _t.cuda.is_available():
-                                _t.cuda.empty_cache()
-                                _t.cuda.synchronize()
-                        except Exception:
-                            pass
-                        gc.collect()
-                    log(f"    → история: {len(_as_histories.get(_cand['id'], []))} эпох")
+                            if task == "classification":
+                                _cfg_hist = {
+                                    **_model_cfg_base,
+                                    "name": f"{model_type}_ashist",
+                                    "max_epochs": max_epochs,
+                                    "use_torch_compile": config.get(
+                                        "use_torch_compile", False),
+                                }
+                                _trainer_hist = ClassificationTrainer(
+                                    model_configs=[_cfg_hist],
+                                    dataset_names=[_ds],
+                                    max_epochs=max_epochs,
+                                    checkpoint_interval=max_epochs,
+                                    seed=seed,
+                                    enable_early_stopping=False,
+                                    enable_early_selection=False,
+                                )
+                                _trainer_hist.run_training(resume_paths={})
+                                _hkey = f"{model_type}_ashist_{_ds}"
+                                _raw = _trainer_hist.metrics_history.get(_hkey, [])
+                                _as_histories[_cand["id"]] = [
+                                    float(h.get("val_auc",
+                                          h.get("auc", 0.0))) for h in _raw
+                                ]
+                            else:
+                                _hist = _run_training_full_history(
+                                    dataset_path=get_dataset_path(_ds),
+                                    model_config=_model_cfg_base,
+                                    epochs=max_epochs,
+                                    result_dir=_hist_subdir,
+                                    log_fn=log,
+                                    early_stopping_patience=patience,
+                                    seed=seed,
+                                )
+                                _as_histories[_cand["id"]] = _hist
+                        except Exception as _e:
+                            log(f"  [ОШИБКА обучение] {_cand['display']}: {_e}")
+                            log(traceback.format_exc())
+                            _as_histories[_cand["id"]] = []
+                        finally:
+                            try:
+                                import torch as _t
+                                if _t.cuda.is_available():
+                                    _t.cuda.empty_cache()
+                                    _t.cuda.synchronize()
+                            except Exception:
+                                pass
+                            gc.collect()
+                        log(f"    → история: {len(_as_histories.get(_cand['id'], []))} эпох")
 
-                # ── Шаг 2: поиск минимального % по историям ─────────────────
-                # Score кандидата при бюджете N% = max(history[0..N%*epochs]).
-                # Li et al. (2018) JMLR 18(185): SHA использует пиковый
-                # потенциал кандидата на данном бюджете.
-                #
-                # Условия принятия N%:
-                #   p1 = ρ(scores_N%, scores_N+10%) ≥ ρ_crit
-                #   p2 = ρ(scores_N+10%, scores_N+20%) ≥ ρ_crit
-                # Обе проверки из одной истории — повторного обучения нет.
-                # Максимальный стартовый N = 80% (N+20% ≤ 100%).
-                # При N > 80% без успеха → 100%.
-                #
-                # Двойная проверка (p1 и p2):
-                # Audibert & Bubeck (2010) COLT, Theorem 1: два подтверждения
-                # дают экспоненциально меньшую вероятность ложного срабатывания.
+                    # ── Шаг 2: поиск минимального % по историям ─────────────────
+                    # Score кандидата при бюджете N% = max(history[0..N%*epochs]).
+                    # Li et al. (2018) JMLR 18(185): SHA использует пиковый
+                    # потенциал кандидата на данном бюджете.
+                    #
+                    # Условия принятия N%:
+                    #   p1 = ρ(scores_N%, scores_N+10%) ≥ ρ_crit
+                    #   p2 = ρ(scores_N+10%, scores_N+20%) ≥ ρ_crit
+                    # Обе проверки из одной истории — повторного обучения нет.
+                    # Максимальный стартовый N = 80% (N+20% ≤ 100%).
+                    # При N > 80% без успеха → 100%.
+                    #
+                    # Двойная проверка (p1 и p2):
+                    # Audibert & Bubeck (2010) COLT, Theorem 1: два подтверждения
+                    # дают экспоненциально меньшую вероятность ложного срабатывания.
 
-                def _scores_at(ratio: float) -> Dict[str, float]:
-                    return {
-                        _cid: _history_score_at(_hist, ratio)
-                        for _cid, _hist in _as_histories.items()
-                    }
+                    def _scores_at(ratio: float) -> Dict[str, float]:
+                        return {
+                            _cid: _history_score_at(_hist, ratio)
+                            for _cid, _hist in _as_histories.items()
+                        }
 
-                # ── Baseline: обучение до 100% с историей ───────────────────
-                # Baseline обучается на тех же условиях что кандидаты:
-                # до 100% эпох, close_mosaic=0, ES с паддингом.
-                # Score при найденном % берётся из истории через
-                # _history_score_at — max(0..N%), равные условия.
-                # Без этого baseline обучался бы только на fast_epochs
-                # что создаёт систематическое преимущество.
-                # Пропускаем если baseline уже загружен из CSV
-                if _baseline_history:
-                    log(f"  baseline — история из CSV, обучение пропущено")
-                else:
-                    log(f"\n  Обучаю baseline до {max_epochs} эп. (история)...")
-                    import uuid as _uuid_bl
-                    _bl_subdir = work_dir / f"as_hist_baseline_{_uuid_bl.uuid4().hex[:6]}"
-                    try:
-                        if task == "classification":
-                            _cfg_bl = {
-                                **_model_cfg_base,
-                                "name": f"{model_type}_ashist_bl",
-                                "max_epochs": max_epochs,
-                                "use_torch_compile": config.get(
-                                    "use_torch_compile", False),
-                            }
-                            _trainer_bl = ClassificationTrainer(
-                                model_configs=[_cfg_bl],
-                                dataset_names=[dataset_name],
-                                max_epochs=max_epochs,
-                                checkpoint_interval=max_epochs,
-                                seed=seed,
-                                enable_early_stopping=False,
-                                enable_early_selection=False,
-                            )
-                            _trainer_bl.run_training(resume_paths={})
-                            _bl_key = f"{model_type}_ashist_bl_{dataset_name}"
-                            _bl_raw = _trainer_bl.metrics_history.get(_bl_key, [])
-                            _baseline_history = [
-                                float(h.get("val_auc", h.get("auc", 0.0)))
-                                for h in _bl_raw
-                            ]
-                        else:
-                            _baseline_history = _run_training_full_history(
-                                dataset_path=get_dataset_path(dataset_name),
-                                model_config=_model_cfg_base,
-                                epochs=max_epochs,
-                                result_dir=_bl_subdir,
-                                log_fn=log,
-                                early_stopping_patience=patience,
-                                seed=seed,
-                            )
-                    except Exception as _e:
-                        log(f"  [ОШИБКА baseline история] {_e}")
-                        log(traceback.format_exc())
-                        _baseline_history = []
-                    finally:
+                    # ── Baseline: обучение до 100% с историей ───────────────────
+                    # Baseline обучается на тех же условиях что кандидаты:
+                    # до 100% эпох, close_mosaic=0, ES с паддингом.
+                    # Score при найденном % берётся из истории через
+                    # _history_score_at — max(0..N%), равные условия.
+                    # Без этого baseline обучался бы только на fast_epochs
+                    # что создаёт систематическое преимущество.
+                    # Пропускаем если baseline уже загружен из CSV
+                    if _baseline_history:
+                        log(f"  baseline — история из CSV, обучение пропущено")
+                    else:
+                        log(f"\n  Обучаю baseline до {max_epochs} эп. (история)...")
+                        import uuid as _uuid_bl
+                        _bl_subdir = work_dir / f"as_hist_baseline_{_uuid_bl.uuid4().hex[:6]}"
                         try:
-                            import torch as _t
-                            if _t.cuda.is_available():
-                                _t.cuda.empty_cache()
-                                _t.cuda.synchronize()
-                        except Exception:
-                            pass
-                        gc.collect()
-                log(f"    → baseline история: {len(_baseline_history)} эпох")
+                            if task == "classification":
+                                _cfg_bl = {
+                                    **_model_cfg_base,
+                                    "name": f"{model_type}_ashist_bl",
+                                    "max_epochs": max_epochs,
+                                    "use_torch_compile": config.get(
+                                        "use_torch_compile", False),
+                                }
+                                _trainer_bl = ClassificationTrainer(
+                                    model_configs=[_cfg_bl],
+                                    dataset_names=[dataset_name],
+                                    max_epochs=max_epochs,
+                                    checkpoint_interval=max_epochs,
+                                    seed=seed,
+                                    enable_early_stopping=False,
+                                    enable_early_selection=False,
+                                )
+                                _trainer_bl.run_training(resume_paths={})
+                                _bl_key = f"{model_type}_ashist_bl_{dataset_name}"
+                                _bl_raw = _trainer_bl.metrics_history.get(_bl_key, [])
+                                _baseline_history = [
+                                    float(h.get("val_auc", h.get("auc", 0.0)))
+                                    for h in _bl_raw
+                                ]
+                            else:
+                                _baseline_history = _run_training_full_history(
+                                    dataset_path=get_dataset_path(dataset_name),
+                                    model_config=_model_cfg_base,
+                                    epochs=max_epochs,
+                                    result_dir=_bl_subdir,
+                                    log_fn=log,
+                                    early_stopping_patience=patience,
+                                    seed=seed,
+                                )
+                        except Exception as _e:
+                            log(f"  [ОШИБКА baseline история] {_e}")
+                            log(traceback.format_exc())
+                            _baseline_history = []
+                        finally:
+                            try:
+                                import torch as _t
+                                if _t.cuda.is_available():
+                                    _t.cuda.empty_cache()
+                                    _t.cuda.synchronize()
+                            except Exception:
+                                pass
+                            gc.collect()
+                    log(f"    → baseline история: {len(_baseline_history)} эпох")
 
-                # ── Таблица mAP50-95 по каждым 10% для всех кандидатов ──────
-                # Выводится после сбора всех историй, до начала поиска %.
-                # Содержит max(0..N%) для N = 10%, 20%, ..., 100% —
-                # полная картина потенциала каждого кандидата.
-                # Используется для анализа в научной работе.
-                _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
-                log(f"\n{'─'*70}")
-                log(f"ТАБЛИЦА mAP50-95 max(0..N%) ПО ЭПОХАМ (все кандидаты)")
-                log(f"{'─'*70}")
-                # Заголовок
-                _hdr = f"  {'Метод':40s}"
-                for _p in _pct_steps:
-                    _hdr += f"  {_p:>4}%"
-                log(_hdr)
-                log(f"  {'─'*40}" + "  -----" * len(_pct_steps))
-                # Строка для каждого кандидата
-                _screening_table_rows = []
-                for _cand in _as_all_cands:
-                    _cid = _cand["id"]
-                    _hist = _as_histories.get(_cid, [])
-                    _row = {"Метод": _cand["display"]}
-                    _line = f"  {_cand['display']:40s}"
+                    # ── Таблица mAP50-95 по каждым 10% для всех кандидатов ──────
+                    # Выводится после сбора всех историй, до начала поиска %.
+                    # Содержит max(0..N%) для N = 10%, 20%, ..., 100% —
+                    # полная картина потенциала каждого кандидата.
+                    # Используется для анализа в научной работе.
+                    _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
+                    log(f"\n{'─'*70}")
+                    log(f"ТАБЛИЦА mAP50-95 max(0..N%) ПО ЭПОХАМ (все кандидаты)")
+                    log(f"{'─'*70}")
+                    # Заголовок
+                    _hdr = f"  {'Метод':40s}"
                     for _p in _pct_steps:
-                        _v = _history_score_at(_hist, _p / 100.0)
-                        _row[f"{_p}%"] = round(_v, 4)
-                        _line += f"  {_v:.4f}"
-                    _screening_table_rows.append(_row)
-                    log(_line)
-                # Строка для baseline
-                _bl_row = {"Метод": "— Baseline —"}
-                _bl_line = f"  {'— Baseline —':40s}"
-                for _p in _pct_steps:
-                    _bv = _history_score_at(_baseline_history, _p / 100.0)
-                    _bl_row[f"{_p}%"] = round(_bv, 4)
-                    _bl_line += f"  {_bv:.4f}"
-                _screening_table_rows.append(_bl_row)
-                log(_bl_line)
-                log(f"{'─'*70}")
-                # Сохраняем для передачи в result dict и CSV
-                _screening_table_data = _screening_table_rows
+                        _hdr += f"  {_p:>4}%"
+                    log(_hdr)
+                    log(f"  {'─'*40}" + "  -----" * len(_pct_steps))
+                    # Строка для каждого кандидата
+                    _screening_table_rows = []
+                    for _cand in _as_all_cands:
+                        _cid = _cand["id"]
+                        _hist = _as_histories.get(_cid, [])
+                        _row = {"Метод": _cand["display"]}
+                        _line = f"  {_cand['display']:40s}"
+                        for _p in _pct_steps:
+                            _v = _history_score_at(_hist, _p / 100.0)
+                            _row[f"{_p}%"] = round(_v, 4)
+                            _line += f"  {_v:.4f}"
+                        _screening_table_rows.append(_row)
+                        log(_line)
+                    # Строка для baseline
+                    _bl_row = {"Метод": "— Baseline —"}
+                    _bl_line = f"  {'— Baseline —':40s}"
+                    for _p in _pct_steps:
+                        _bv = _history_score_at(_baseline_history, _p / 100.0)
+                        _bl_row[f"{_p}%"] = round(_bv, 4)
+                        _bl_line += f"  {_bv:.4f}"
+                    _screening_table_rows.append(_bl_row)
+                    log(_bl_line)
+                    log(f"{'─'*70}")
+                    # Сохраняем для передачи в result dict и CSV
+                    _screening_table_data = _screening_table_rows
 
                 # ── Шаг 2: таблица рангов ────────────────────────────────
                 # Для каждого столбца (10%..100%) независимо ранжируем
@@ -1624,24 +1635,285 @@ def _run_search(q: queue.Queue, config: Dict):
                 log(f"{'─'*70}")
 
                 # ── Шаг 3: выбор бюджета скрининга ──────────────────
-                # Три режима: top_down, bottom_up, full_budget.
-                # full_budget: поиск % не нужен — сразу берём 100%.
-                # top_down / bottom_up: поиск через ρ_global + ρ_local.
+                # Четыре режима: top_down, bottom_up, full_budget, warm_start.
 
-                _sc_100_ref   = _scores_at(1.0)   # эталон — 100% эпох
+                _sc_100_ref   = _scores_at(1.0) if auto_screen_direction != "warm_start" else {}
                 _as_ratio_best = 100
                 _as_found      = False
 
                 if auto_screen_direction == "full_budget":
-                    # ── 100% бюджет: поиск не нужен ─────────────────────
-                    # Скрининг всегда на 100% эпох — все кандидаты уже
-                    # обучены до 100% (история есть), scores берутся
-                    # как max(0..100%).
+                    # ── 100% бюджет ──────────────────────────────────────
                     log(f"\n  Режим: 100% бюджет (поиск % не выполняется)")
-                    log(f"  Скрининг будет использовать полный бюджет "
-                        f"{max_epochs} эп. для всех кандидатов.")
                     _as_ratio_best = 100
                     _as_found = True
+
+                elif auto_screen_direction == "warm_start":
+                    # ── Warm-start: инкрементальное дообучение ───────────
+                    # Алгоритм: Li et al. (2018) JMLR 18(185) warm-start SHA.
+                    # Кандидаты обучаются с нуля до r_A%, затем дообучаются
+                    # warm-start через _run_training до r_B% и r_C%.
+                    # Score = max(score_prev, score_new) — защита от деградации.
+                    # Две локальные проверки: ρ(A,B) и ρ(B,C) ≥ ρ_crit.
+                    # Если обе прошли → фиксируем r_A%.
+                    # Если нет → r_A=r_B, ckpts сдвигаются, дообучаем r_D.
+                    # При r_A=90% → бюджет 100%.
+                    #
+                    # Таблица строится по накопленным scores для каждых 10%.
+                    # Значения после найденного бюджета заполняются последним
+                    # известным (паддинг). Prechelt (1998): ES детектирует плато.
+
+                    log(f"\n  Режим: warm-start (снизу вверх с дообучением)")
+                    log(f"  Начальный бюджет: {auto_screen_start}%")
+                    log(f"  Li et al. (2018) JMLR 18(185): warm-start SHA")
+
+                    from module3_preprocessing_search import (
+                        _run_training,
+                        _run_training_warmstart,
+                    )
+
+                    _ws_ratio_a = max(10, min(auto_screen_start, 80))
+                    # scores_dict: {cand_id: best_score_so_far}
+                    _ws_scores: Dict[str, float] = {}
+                    # ckpts: {cand_id: path_to_last_pt}
+                    _ws_ckpts:  Dict[str, str]   = {}
+                    # accumulated_scores: {pct: {cand_id: score}} для таблицы
+                    _ws_acc: Dict[int, Dict[str, float]] = {}
+
+                    # ── Шаг 1: обучаем с нуля до r_A% ───────────────────
+                    _ws_ep_a = max(1, int(max_epochs * (_ws_ratio_a / 100)))
+                    log(f"\n  Шаг 1: обучение с нуля до {_ws_ratio_a}% ({_ws_ep_a} эп.)")
+                    for _cand in _as_all_cands:
+                        _ds = _as_ds_map.get(_cand["id"])
+                        if _ds is None:
+                            continue
+                        import uuid as _uuid_ws
+                        _ws_subdir = (work_dir /
+                            f"ws_{_cand['id'][:15]}_{_ws_ratio_a}pct_"
+                            f"{_uuid_ws.uuid4().hex[:6]}")
+                        try:
+                            _m = _run_training(
+                                dataset_path=get_dataset_path(_ds),
+                                model_config=_model_cfg_base,
+                                epochs=_ws_ep_a,
+                                result_dir=_ws_subdir,
+                                log_fn=log,
+                                use_early_stopping=True,
+                                early_stopping_patience=patience,
+                                eval_split="valid",
+                                keep_weights=True,
+                                max_epochs_for_schedule=max_epochs,
+                                disable_mosaic=True,
+                                seed=seed,
+                            )
+                            _sc = float(_m.get("mAP50-95", 0.0))
+                            _ws_scores[_cand["id"]] = _sc
+                            # last.pt для warm-start
+                            _last = os.path.join(str(_ws_subdir),
+                                                 "run", "weights", "last.pt")
+                            _ws_ckpts[_cand["id"]] = (
+                                _last if os.path.exists(_last) else "")
+                            log(f"    {_cand['display']:40s}  "
+                                f"score={_sc:.4f}")
+                        except Exception as _e:
+                            log(f"    [ОШИБКА] {_cand['display']}: {_e}")
+                            _ws_scores[_cand["id"]] = 0.0
+                            _ws_ckpts[_cand["id"]] = ""
+                        finally:
+                            try:
+                                import torch as _t
+                                if _t.cuda.is_available():
+                                    _t.cuda.empty_cache()
+                            except Exception:
+                                pass
+                            gc.collect()
+                    _ws_acc[_ws_ratio_a] = dict(_ws_scores)
+
+                    # ── Основной цикл warm-start ──────────────────────────
+                    # На каждом шаге дообучаем одну новую дельту и проверяем
+                    # две локальные корреляции.
+                    # scores_A = _ws_scores (текущие)
+                    # scores_B = дообучение до r_B%
+                    # scores_C = дообучение до r_C%
+                    # После сдвига: scores_A=scores_B, scores_B=scores_C,
+                    # ckpts_B=ckpts_C, дообучаем только r_C→r_D.
+
+                    def _ws_finetune(ratio_from: int, ratio_to: int,
+                                     ckpts_from: Dict[str, str],
+                                     scores_floor: Dict[str, float]
+                                     ) -> tuple:
+                        """Дообучает всех кандидатов warm-start от ratio_from до ratio_to.
+                        Возвращает (new_scores, new_ckpts).
+                        new_scores = max(scores_floor, score_new) — защита от деградации.
+                        """
+                        _ep_delta = max(1, int(max_epochs * (ratio_to / 100))
+                                        - int(max_epochs * (ratio_from / 100)))
+                        log(f"\n  Дообучение warm-start: {ratio_from}% → {ratio_to}%"
+                            f" (дельта {_ep_delta} эп.)")
+                        _new_scores: Dict[str, float] = {}
+                        _new_ckpts:  Dict[str, str]   = {}
+                        for _cand in _as_all_cands:
+                            _ds = _as_ds_map.get(_cand["id"])
+                            if _ds is None:
+                                continue
+                            _resume = ckpts_from.get(_cand["id"], "")
+                            import uuid as _uuid_ws2
+                            _ws_sub = (work_dir /
+                                f"ws_{_cand['id'][:15]}_{ratio_to}pct_"
+                                f"{_uuid_ws2.uuid4().hex[:6]}")
+                            try:
+                                _m = _run_training_warmstart(
+                                    dataset_path=get_dataset_path(_ds),
+                                    model_config=_model_cfg_base,
+                                    epochs_delta=_ep_delta,
+                                    result_dir=_ws_sub,
+                                    log_fn=log,
+                                    resume_from=_resume,
+                                    use_early_stopping=True,
+                                    early_stopping_patience=patience,
+                                    eval_split="valid",
+                                    disable_mosaic=True,
+                                    seed=seed,
+                                )
+                                _sc_new = float(_m.get("mAP50-95", 0.0))
+                                # score_floor: защита от деградации
+                                _sc = max(_sc_new,
+                                          scores_floor.get(_cand["id"], 0.0))
+                                _new_scores[_cand["id"]] = _sc
+                                _last = os.path.join(str(_ws_sub),
+                                                     "run", "weights", "last.pt")
+                                _new_ckpts[_cand["id"]] = (
+                                    _last if os.path.exists(_last) else _resume)
+                                log(f"    {_cand['display']:40s}  "
+                                    f"score={_sc:.4f}")
+                            except Exception as _e:
+                                log(f"    [ОШИБКА] {_cand['display']}: {_e}")
+                                _new_scores[_cand["id"]] = scores_floor.get(
+                                    _cand["id"], 0.0)
+                                _new_ckpts[_cand["id"]] = ckpts_from.get(
+                                    _cand["id"], "")
+                            finally:
+                                try:
+                                    import torch as _t
+                                    if _t.cuda.is_available():
+                                        _t.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                                gc.collect()
+                        return _new_scores, _new_ckpts
+
+                    # Начинаем с r_A, вычисляем B и C сразу
+                    _ws_scores_a = dict(_ws_scores)
+                    _ws_ckpts_a  = dict(_ws_ckpts)
+                    _ws_ratio_b  = _ws_ratio_a + 10
+                    _ws_ratio_c  = _ws_ratio_a + 20
+
+                    _ws_scores_b, _ws_ckpts_b = _ws_finetune(
+                        _ws_ratio_a, _ws_ratio_b,
+                        _ws_ckpts_a, _ws_scores_a)
+                    _ws_acc[_ws_ratio_b] = dict(_ws_scores_b)
+
+                    _ws_scores_c, _ws_ckpts_c = _ws_finetune(
+                        _ws_ratio_b, _ws_ratio_c,
+                        _ws_ckpts_b, _ws_scores_b)
+                    _ws_acc[_ws_ratio_c] = dict(_ws_scores_c)
+
+                    while True:
+                        _rho_p1 = _spearman_rho(_ws_scores_a, _ws_scores_b)
+                        _rho_p2 = _spearman_rho(_ws_scores_b, _ws_scores_c)
+                        log(f"\n  Проверка N={_ws_ratio_a}%:")
+                        for _cand in _as_all_cands:
+                            _cid = _cand["id"]
+                            log(f"    {_cand['display']:40s}  "
+                                f"{_ws_ratio_a}%={_ws_scores_a.get(_cid,0):.4f}  "
+                                f"{_ws_ratio_b}%={_ws_scores_b.get(_cid,0):.4f}  "
+                                f"{_ws_ratio_c}%={_ws_scores_c.get(_cid,0):.4f}")
+                        log(f"  ρ(p1: {_ws_ratio_a}% vs {_ws_ratio_b}%) = "
+                            f"{_rho_p1:.4f}  |  "
+                            f"ρ(p2: {_ws_ratio_b}% vs {_ws_ratio_c}%) = "
+                            f"{_rho_p2:.4f}  (ρ_crit={_rho_crit:.4f})")
+
+                        if _rho_p1 >= _rho_crit and _rho_p2 >= _rho_crit:
+                            log(f"  ✓ Обе проверки пройдены — "
+                                f"фиксируем бюджет {_ws_ratio_a}%.")
+                            _as_ratio_best = _ws_ratio_a
+                            _as_found = True
+                            break
+
+                        # Не прошли — сдвигаемся
+                        log(f"  Проверка не пройдена — сдвигаемся на "
+                            f"{_ws_ratio_b}%.")
+                        _ws_ratio_a = _ws_ratio_b
+                        _ws_ratio_b = _ws_ratio_c
+                        _ws_ratio_c = _ws_ratio_a + 20
+                        _ws_scores_a = _ws_scores_b
+                        _ws_ckpts_a  = _ws_ckpts_b
+                        _ws_scores_b = _ws_scores_c
+                        _ws_ckpts_b  = _ws_ckpts_c
+
+                        if _ws_ratio_a >= 90:
+                            log(f"  Достигнут предел 90% — бюджет 100%.")
+                            _as_ratio_best = 100
+                            _as_found = True
+                            break
+
+                        # Дообучаем только одну новую дельту (r_B → r_C)
+                        _ws_scores_c, _ws_ckpts_c = _ws_finetune(
+                            _ws_ratio_b, _ws_ratio_c,
+                            _ws_ckpts_b, _ws_scores_b)
+                        _ws_acc[_ws_ratio_c] = dict(_ws_scores_c)
+
+                    # ── Строим таблицу для warm_start ─────────────────────
+                    # Значения накоплены в _ws_acc для вычисленных бюджетов.
+                    # Остальные 10%-шаги заполняем паддингом последнего
+                    # известного значения. Prechelt (1998): плато после ES.
+                    log(f"\n{'─'*70}")
+                    log(f"ТАБЛИЦА mAP50-95 (warm-start, накопленные значения)")
+                    log(f"{'─'*70}")
+                    _ws_pct_steps = list(range(10, 110, 10))
+                    _hdr_ws = f"  {'Метод':40s}"
+                    for _p in _ws_pct_steps:
+                        _hdr_ws += f"  {_p:>4}%"
+                    log(_hdr_ws)
+                    log(f"  {'─'*40}" + "  -----" * len(_ws_pct_steps))
+
+                    _ws_table_rows = []
+                    for _cand in _as_all_cands:
+                        _cid = _cand["id"]
+                        _row = {"Метод": _cand["display"]}
+                        _line = f"  {_cand['display']:40s}"
+                        _last_known = 0.0
+                        for _p in _ws_pct_steps:
+                            if _p in _ws_acc and _cid in _ws_acc[_p]:
+                                _v = _ws_acc[_p][_cid]
+                                _last_known = _v
+                            else:
+                                _v = _last_known  # паддинг
+                            _row[f"{_p}%"] = round(_v, 4)
+                            _line += f"  {_v:.4f}"
+                        _ws_table_rows.append(_row)
+                        log(_line)
+
+                    # Baseline строка (если есть история)
+                    if _baseline_history:
+                        from module3_preprocessing_search import _history_score_at
+                        _bl_row_ws = {"Метод": "— Baseline —"}
+                        _bl_line_ws = f"  {'— Baseline —':40s}"
+                        for _p in _ws_pct_steps:
+                            _bv = _history_score_at(
+                                _baseline_history, _p / 100.0)
+                            _bl_row_ws[f"{_p}%"] = round(_bv, 4)
+                            _bl_line_ws += f"  {_bv:.4f}"
+                        _ws_table_rows.append(_bl_row_ws)
+                        log(_bl_line_ws)
+                    log(f"{'─'*70}")
+
+                    # Сохраняем для result dict
+                    _screening_table_data = _ws_table_rows
+
+                    # scores для кэша Фазы 1
+                    _ws_final_scores = (
+                        _ws_scores_a if _as_ratio_best < 100
+                        else _ws_scores_c)
 
                 else:
                     def _check_pct(n_pct: int) -> bool:
@@ -1664,7 +1936,6 @@ def _run_search(q: queue.Queue, config: Dict):
                         return False
 
                     if auto_screen_direction == "bottom_up":
-                        # ── Снизу вверх: 10% → 90% ───────────────────────
                         log(f"\n  Режим: снизу вверх (10% → 90%)")
                         for _as_ratio_cur in range(10, 100, 10):
                             _sc_cur = _scores_at(_as_ratio_cur / 100.0)
@@ -1687,9 +1958,7 @@ def _run_search(q: queue.Queue, config: Dict):
                         else:
                             log(f"\n  Ни один % не прошёл — принимаем 100%.")
                             _as_ratio_best = 100
-
                     else:
-                        # ── Сверху вниз: 90% → 10% ───────────────────────
                         log(f"\n  Режим: сверху вниз (90% → 10%)")
                         for _as_ratio_cur in range(90, 0, -10):
                             _sc_cur = _scores_at(_as_ratio_cur / 100.0)
@@ -1712,7 +1981,11 @@ def _run_search(q: queue.Queue, config: Dict):
 
                 screening_ratio = _as_ratio_best
                 fast_epochs = max(1, int(max_epochs * (_as_ratio_best / 100)))
-                _auto_screen_scores = _scores_at(_as_ratio_best / 100.0)
+                # Для warm_start scores берутся из накопленных, для остальных — из историй
+                if auto_screen_direction == "warm_start":
+                    _auto_screen_scores = _ws_final_scores
+                else:
+                    _auto_screen_scores = _scores_at(_as_ratio_best / 100.0)
                 _as_found = True
 
                 log(f"\n  Итог поиска: бюджет скрининга = "
@@ -2886,7 +3159,7 @@ if st.session_state.p2_stage == "configure":
             )
             st.session_state.p2_auto_screen_start = auto_screen_start
         with _as_col2:
-            _dir_options = ["top_down", "bottom_up", "full_budget"]
+            _dir_options = ["top_down", "bottom_up", "full_budget", "warm_start"]
             _dir_cur = st.session_state.get(
                 "p2_auto_screen_direction", "top_down")
             _dir_idx = _dir_options.index(_dir_cur) if _dir_cur in _dir_options else 0
@@ -2897,6 +3170,7 @@ if st.session_state.p2_stage == "configure":
                     "top_down":    "Сверху вниз (от 90% к 10%)",
                     "bottom_up":   "Снизу вверх (от 10% к 90%)",
                     "full_budget": "100% бюджет (без поиска %)",
+                    "warm_start":  "Warm-start (снизу вверх, дообучение)",
                 }[x],
                 index=_dir_idx,
                 key="p2_auto_screen_direction_radio",
@@ -2908,8 +3182,12 @@ if st.session_state.p2_stage == "configure":
                     "останавливается при первом стабильном %. "
                     "Быстрее, но менее консервативен.\n\n"
                     "100% бюджет: поиск % не выполняется — скрининг "
-                    "всегда на 100% эпох. Если загружен CSV истории — "
-                    "обучение пропускается. Фаза 1 и 2 также на 100%."
+                    "всегда на 100% эпох.\n\n"
+                    "Warm-start: инкрементальное дообучение снизу вверх. "
+                    "Кандидаты обучаются с нуля до r_A%, затем дообучаются "
+                    "warm-start до r_B% и r_C%. Две локальные проверки "
+                    "ρ(A,B) и ρ(B,C). Экономит вычисления — не нужно "
+                    "обучать до 100%. Li et al. (2018) JMLR 18(185)."
                 ),
             )
             st.session_state.p2_auto_screen_direction = auto_screen_direction
