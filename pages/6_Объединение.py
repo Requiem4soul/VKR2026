@@ -1313,6 +1313,9 @@ def _run_search(q: queue.Queue, config: Dict):
                     _run_training_full_history,
                     _history_score_at,
                 )
+                # Метка основной метрики для логов и таблиц — определяем здесь
+                # чтобы переменная была доступна во всех ветках (включая warm_start).
+                _score_metric_label = "AUC" if task == "classification" else "mAP50-95"
 
                 # ── Шаг 1: обучаем каждого кандидата до 100% один раз ──────
                 # close_mosaic=0: равные условия на всех порогах N%.
@@ -1408,6 +1411,12 @@ def _run_search(q: queue.Queue, config: Dict):
                                 f"обучение пропущено")
                             continue
 
+                        # ВАЖНО: берём датасет конкретного кандидата из _as_ds_map,
+                        # а не переменную _ds из внешнего scope (после цикла создания
+                        # она равна последнему датасету и без этой строки все кандидаты
+                        # обучались бы на одном датасете).
+                        _ds = _as_ds_map[_cand["id"]]
+
                         log(f"  Обучаю [{_cand['display']}] до {max_epochs} эп. "
                             f"(close_mosaic=0)...")
                         import uuid as _uuid
@@ -1434,10 +1443,16 @@ def _run_search(q: queue.Queue, config: Dict):
                                 _trainer_hist.run_training(resume_paths={})
                                 _hkey = f"{model_type}_ashist_{_ds}"
                                 _raw = _trainer_hist.metrics_history.get(_hkey, [])
+                                # Фильтруем _from_checkpoint (запись warm-start) и
+                                # дубль best-метрик, который run_training дописывает
+                                # поверх per-epoch записей _train_one.
+                                # Срез [:max_epochs] = ровно N значений, по одному
+                                # на эпоху — как у детекции (_run_training_full_history).
                                 _as_histories[_cand["id"]] = [
-                                    float(h.get("val_auc",
-                                          h.get("auc", 0.0))) for h in _raw
-                                ]
+                                    float(h.get("val_auc", h.get("auc", 0.0)))
+                                    for h in _raw
+                                    if not h.get("_from_checkpoint")
+                                ][:max_epochs]
                             else:
                                 _hist = _run_training_full_history(
                                     dataset_path=get_dataset_path(_ds),
@@ -1524,7 +1539,8 @@ def _run_search(q: queue.Queue, config: Dict):
                                 _baseline_history = [
                                     float(h.get("val_auc", h.get("auc", 0.0)))
                                     for h in _bl_raw
-                                ]
+                                    if not h.get("_from_checkpoint")
+                                ][:max_epochs]
                             else:
                                 _baseline_history = _run_training_full_history(
                                     dataset_path=get_dataset_path(dataset_name),
@@ -1557,7 +1573,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     # Используется для анализа в научной работе.
                     _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
                     log(f"\n{'─'*70}")
-                    log(f"ТАБЛИЦА mAP50-95 max(0..N%) ПО ЭПОХАМ (все кандидаты)")
+                    log(f"ТАБЛИЦА {_score_metric_label} max(0..N%) ПО ЭПОХАМ (все кандидаты)")
                     log(f"{'─'*70}")
                     # Заголовок
                     _hdr = f"  {'Метод':40s}"
@@ -1597,7 +1613,7 @@ def _run_search(q: queue.Queue, config: Dict):
                 # Baseline не участвует в ранжировании — он не кандидат SHA.
                 # Используется для визуального анализа стабильности рангов.
                 log(f"\n{'─'*70}")
-                log(f"ТАБЛИЦА РАНГОВ (1=лучший, по mAP50-95 для каждых 10% эпох)")
+                log(f"ТАБЛИЦА РАНГОВ (1=лучший, по {_score_metric_label} для каждых 10% эпох)")
                 log(f"{'─'*70}")
                 _hdr_r = f"  {'Метод':40s}"
                 for _p in _pct_steps:
@@ -1686,34 +1702,53 @@ def _run_search(q: queue.Queue, config: Dict):
                         _ds = _as_ds_map.get(_cand["id"])
                         if _ds is None:
                             continue
-                        import uuid as _uuid_ws
-                        _ws_subdir = (work_dir /
-                            f"ws_{_cand['id'][:15]}_{_ws_ratio_a}pct_"
-                            f"{_uuid_ws.uuid4().hex[:6]}")
                         try:
-                            _m = _run_training(
-                                dataset_path=get_dataset_path(_ds),
-                                model_config=_model_cfg_base,
-                                epochs=_ws_ep_a,
-                                result_dir=_ws_subdir,
-                                log_fn=log,
-                                use_early_stopping=True,
-                                early_stopping_patience=patience,
-                                eval_split="valid",
-                                keep_weights=True,
-                                max_epochs_for_schedule=max_epochs,
-                                disable_mosaic=True,
-                                seed=seed,
-                            )
-                            _sc = float(_m.get("mAP50-95", 0.0))
-                            _ws_scores[_cand["id"]] = _sc
-                            # last.pt для warm-start
-                            _last = os.path.join(str(_ws_subdir),
-                                                 "run", "weights", "last.pt")
-                            _ws_ckpts[_cand["id"]] = (
-                                _last if os.path.exists(_last) else "")
-                            log(f"    {_cand['display']:40s}  "
-                                f"score={_sc:.4f}")
+                            if task == "classification":
+                                # Классификация: _train_cls без resume.
+                                # max_epochs=_ws_ep_a → обучение с нуля до r_A%.
+                                # _ckpt_path из результата — чекпоинт для след.
+                                # warm-start прогона.
+                                _m = _train_cls(
+                                    _ds, _ws_ep_a, use_es=False,
+                                    name_suffix=(
+                                        f"ws_{_cand['id'][:10]}_r{_ws_ratio_a}"),
+                                )
+                                _ckpt = _m.pop("_ckpt_path", "")
+                                _sc = score_from_metrics(_m)
+                                _ws_scores[_cand["id"]] = _sc
+                                _ws_ckpts[_cand["id"]] = _ckpt
+                                log(f"    {_cand['display']:40s}  "
+                                    f"score={_sc:.4f}  "
+                                    f"auc={_m.get('val_auc', 0):.4f}")
+                            else:
+                                # Детекция: _run_training (YOLO).
+                                import uuid as _uuid_ws
+                                _ws_subdir = (work_dir /
+                                    f"ws_{_cand['id'][:15]}_{_ws_ratio_a}pct_"
+                                    f"{_uuid_ws.uuid4().hex[:6]}")
+                                _m = _run_training(
+                                    dataset_path=get_dataset_path(_ds),
+                                    model_config=_model_cfg_base,
+                                    epochs=_ws_ep_a,
+                                    result_dir=_ws_subdir,
+                                    log_fn=log,
+                                    use_early_stopping=True,
+                                    early_stopping_patience=patience,
+                                    eval_split="valid",
+                                    keep_weights=True,
+                                    max_epochs_for_schedule=max_epochs,
+                                    disable_mosaic=True,
+                                    seed=seed,
+                                )
+                                _sc = float(_m.get("mAP50-95", 0.0))
+                                _ws_scores[_cand["id"]] = _sc
+                                # last.pt для warm-start
+                                _last = os.path.join(str(_ws_subdir),
+                                                     "run", "weights", "last.pt")
+                                _ws_ckpts[_cand["id"]] = (
+                                    _last if os.path.exists(_last) else "")
+                                log(f"    {_cand['display']:40s}  "
+                                    f"score={_sc:.4f}")
                         except Exception as _e:
                             log(f"    [ОШИБКА] {_cand['display']}: {_e}")
                             _ws_scores[_cand["id"]] = 0.0
@@ -1756,35 +1791,65 @@ def _run_search(q: queue.Queue, config: Dict):
                             if _ds is None:
                                 continue
                             _resume = ckpts_from.get(_cand["id"], "")
-                            import uuid as _uuid_ws2
-                            _ws_sub = (work_dir /
-                                f"ws_{_cand['id'][:15]}_{ratio_to}pct_"
-                                f"{_uuid_ws2.uuid4().hex[:6]}")
                             try:
-                                _m = _run_training_warmstart(
-                                    dataset_path=get_dataset_path(_ds),
-                                    model_config=_model_cfg_base,
-                                    epochs_delta=_ep_delta,
-                                    result_dir=_ws_sub,
-                                    log_fn=log,
-                                    resume_from=_resume,
-                                    use_early_stopping=True,
-                                    early_stopping_patience=patience,
-                                    eval_split="valid",
-                                    disable_mosaic=True,
-                                    seed=seed,
-                                )
-                                _sc_new = float(_m.get("mAP50-95", 0.0))
-                                # score_floor: защита от деградации
-                                _sc = max(_sc_new,
-                                          scores_floor.get(_cand["id"], 0.0))
-                                _new_scores[_cand["id"]] = _sc
-                                _last = os.path.join(str(_ws_sub),
-                                                     "run", "weights", "last.pt")
-                                _new_ckpts[_cand["id"]] = (
-                                    _last if os.path.exists(_last) else _resume)
-                                log(f"    {_cand['display']:40s}  "
-                                    f"score={_sc:.4f}")
+                                if task == "classification":
+                                    # Классификация: ClassificationTrainer тренирует
+                                    # range(resume_epoch+1, max_epochs+1), поэтому
+                                    # нужно передавать ОБЩЕЕ число эпох (ratio_to%),
+                                    # а не дельту. При resume_epoch = ep(ratio_from%)
+                                    # и max_epochs = ep(ratio_to%) цикл пройдёт
+                                    # ровно _ep_delta итераций.
+                                    _ep_total_to = max(
+                                        1, int(max_epochs * (ratio_to / 100)))
+                                    _m = _train_cls(
+                                        _ds, _ep_total_to, use_es=False,
+                                        name_suffix=(
+                                            f"ws_{_cand['id'][:10]}_r{ratio_to}"),
+                                        resume_from_path=_resume if _resume else None,
+                                        return_last=bool(_resume),
+                                    )
+                                    _ckpt_new = _m.pop("_ckpt_path", "")
+                                    _sc_new = score_from_metrics(_m)
+                                    # score_floor: защита от деградации
+                                    _sc = max(_sc_new,
+                                              scores_floor.get(_cand["id"], 0.0))
+                                    _new_scores[_cand["id"]] = _sc
+                                    _new_ckpts[_cand["id"]] = (
+                                        _ckpt_new if _ckpt_new else _resume)
+                                    log(f"    {_cand['display']:40s}  "
+                                        f"score={_sc:.4f}  "
+                                        f"auc={_m.get('val_auc', 0):.4f}")
+                                else:
+                                    # Детекция: _run_training_warmstart (YOLO),
+                                    # принимает дельта-эпохи.
+                                    import uuid as _uuid_ws2
+                                    _ws_sub = (work_dir /
+                                        f"ws_{_cand['id'][:15]}_{ratio_to}pct_"
+                                        f"{_uuid_ws2.uuid4().hex[:6]}")
+                                    _m = _run_training_warmstart(
+                                        dataset_path=get_dataset_path(_ds),
+                                        model_config=_model_cfg_base,
+                                        epochs_delta=_ep_delta,
+                                        result_dir=_ws_sub,
+                                        log_fn=log,
+                                        resume_from=_resume,
+                                        use_early_stopping=True,
+                                        early_stopping_patience=patience,
+                                        eval_split="valid",
+                                        disable_mosaic=True,
+                                        seed=seed,
+                                    )
+                                    _sc_new = float(_m.get("mAP50-95", 0.0))
+                                    # score_floor: защита от деградации
+                                    _sc = max(_sc_new,
+                                              scores_floor.get(_cand["id"], 0.0))
+                                    _new_scores[_cand["id"]] = _sc
+                                    _last = os.path.join(str(_ws_sub),
+                                                         "run", "weights", "last.pt")
+                                    _new_ckpts[_cand["id"]] = (
+                                        _last if os.path.exists(_last) else _resume)
+                                    log(f"    {_cand['display']:40s}  "
+                                        f"score={_sc:.4f}")
                             except Exception as _e:
                                 log(f"    [ОШИБКА] {_cand['display']}: {_e}")
                                 _new_scores[_cand["id"]] = scores_floor.get(
@@ -1867,7 +1932,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     # Остальные 10%-шаги заполняем паддингом последнего
                     # известного значения. Prechelt (1998): плато после ES.
                     log(f"\n{'─'*70}")
-                    log(f"ТАБЛИЦА mAP50-95 (warm-start, накопленные значения)")
+                    log(f"ТАБЛИЦА {_score_metric_label} (warm-start, накопленные значения)")
                     log(f"{'─'*70}")
                     _ws_pct_steps = list(range(10, 110, 10))
                     _hdr_ws = f"  {'Метод':40s}"
@@ -2465,8 +2530,12 @@ def _run_search(q: queue.Queue, config: Dict):
             _surv_metrics = full_train(_surv_ds_name, _surv_display,
                                        result_subdir=f"final_top{_rank}")
             _surv_score = score_from_metrics(_surv_metrics)
-            log(f"    → score(test)={_surv_score:.4f}  "
-                f"mAP50-95={_surv_metrics.get('mAP50-95',0):.4f}")
+            if task == "classification":
+                log(f"    → score(val_auc)={_surv_score:.4f}  "
+                    f"acc={_surv_metrics.get('val_acc',0):.4f}")
+            else:
+                log(f"    → score(test)={_surv_score:.4f}  "
+                    f"mAP50-95={_surv_metrics.get('mAP50-95',0):.4f}")
             _finalist_results.append((_surv, _surv_ds_name, _surv_metrics))
 
         # Лучший финалист по score на test
@@ -2591,11 +2660,15 @@ def _run_search(q: queue.Queue, config: Dict):
             # Все финалисты (топ-N) с метриками на test
             "all_finalists": [
                 {
-                    "display": _s["display"],
-                    "score":   round(score_from_metrics(_m), 4),
-                    "mAP50-95": round(_m.get("mAP50-95", 0), 4),
-                    "mAP50":    round(_m.get("mAP50", 0), 4),
-                    "f1":       round(_m.get("f1", 0), 4),
+                    "display":   _s["display"],
+                    "score":     round(score_from_metrics(_m), 4),
+                    "mAP50-95":  round(_m.get("mAP50-95", 0), 4),
+                    "mAP50":     round(_m.get("mAP50", 0), 4),
+                    "f1":        round(_m.get("f1", 0), 4),
+                    # Метрики классификации (0.0 для детекции)
+                    "val_auc":   round(_m.get("val_auc", 0), 4),
+                    "val_acc":   round(_m.get("val_acc", 0), 4),
+                    "val_f1":    round(_m.get("val_f1", 0), 4),
                 }
                 for _s, _ds, _m in sorted(
                     _finalist_results,
@@ -3654,17 +3727,29 @@ elif st.session_state.p2_stage == "done":
                     f"Все финалисты топ-N (полное обучение, test)",
                     expanded=True
                 ):
-                    _fin_rows = [
-                        {
-                            "Пайплайн":   f["display"],
-                            "Score":      f"{f['score']:.4f}",
-                            "mAP50-95":   f"{f['mAP50-95']:.4f}",
-                            "mAP50":      f"{f['mAP50']:.4f}",
-                            "F1":         f"{f['f1']:.4f}",
-                            "Победитель": "✓" if f["display"] == result.get("winner_pipeline") else "",
-                        }
-                        for f in all_finalists
-                    ]
+                    if _task == "classification":
+                        _fin_rows = [
+                            {
+                                "Пайплайн":    f["display"],
+                                "Score (AUC)": f"{f['score']:.4f}",
+                                "ACC":         f"{f.get('val_acc', 0):.4f}",
+                                "F1":          f"{f.get('val_f1', 0):.4f}",
+                                "Победитель":  "✓" if f["display"] == result.get("winner_pipeline") else "",
+                            }
+                            for f in all_finalists
+                        ]
+                    else:
+                        _fin_rows = [
+                            {
+                                "Пайплайн":   f["display"],
+                                "Score":      f"{f['score']:.4f}",
+                                "mAP50-95":   f"{f['mAP50-95']:.4f}",
+                                "mAP50":      f"{f['mAP50']:.4f}",
+                                "F1":         f"{f['f1']:.4f}",
+                                "Победитель": "✓" if f["display"] == result.get("winner_pipeline") else "",
+                            }
+                            for f in all_finalists
+                        ]
                     import pandas as _pd_fin
                     st.dataframe(_pd_fin.DataFrame(_fin_rows),
                                  use_container_width=True)
@@ -3710,16 +3795,19 @@ elif st.session_state.p2_stage == "done":
                     use_container_width=True,
                 )
 
-            # CSV таблица скрининга — mAP50-95 по 10% шагам (автоподбор)
+            # CSV таблица скрининга — Score по 10% шагам (автоподбор)
             screening_table_data = result.get("screening_table", [])
             if screening_table_data:
+                _screening_metric_label = (
+                    "AUC" if result.get("task") == "classification"
+                    else "mAP50-95")
                 csv_screening = pd.DataFrame(screening_table_data).to_csv(
                     index=False, encoding="utf-8")
                 # Добавляем четвёртую колонку
                 dl_col4, = st.columns(1)
                 with dl_col4:
                     st.download_button(
-                        label="📥 Таблица скрининга (mAP50-95 по 10% эпох)",
+                        label=f"📥 Таблица скрининга ({_screening_metric_label} по 10% эпох)",
                         data=csv_screening,
                         file_name=f"p2_screening_history_{result.get('dataset_name','')}.csv",
                         mime="text/csv",
