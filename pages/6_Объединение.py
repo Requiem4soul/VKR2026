@@ -800,7 +800,8 @@ def _run_search(q: queue.Queue, config: Dict):
         def _train_cls(ds_name: str, epochs: int, use_es: bool,
                        name_suffix: str,
                        resume_from_path: Optional[str] = None,
-                       return_last: bool = False) -> Dict:
+                       return_last: bool = False,
+                       return_history: bool = False):
             """
             Обучает ClassificationTrainer. Возвращает лучшие метрики.
             Очистка памяти гарантирована в finally ClassificationTrainer._train_one.
@@ -864,6 +865,16 @@ def _run_search(q: queue.Queue, config: Dict):
 
             # Возвращаем также путь к чекпоинту для возможного warm-start
             result["_ckpt_path"] = trainer.last_checkpoint_paths.get(_key, "")
+
+            if return_history:
+                # Полная per-epoch история AUC (без записей warm-start и дубля
+                # run_training) — используется для построения графика обучения.
+                _auc_hist = [
+                    float(h.get("val_auc", h.get("auc", 0.0)))
+                    for h in history
+                    if not h.get("_from_checkpoint")
+                ][:epochs]
+                return result, _auc_hist
             return result
 
         # ── Обучение для детекции ──────────────────────────────────────────
@@ -1090,26 +1101,62 @@ def _run_search(q: queue.Queue, config: Dict):
                 gc.collect()
 
         def full_train(ds_name: str, label: str,
-                       result_subdir: str = "final") -> Dict:
+                       result_subdir: str = "final",
+                       collect_history: bool = False):
             """
             Полное обучение (100% эпох, ES вкл).
             Для детекции сохраняет веса в work_dir/result_subdir.
+
+            collect_history=True: вместе с метриками возвращает список
+            значений AUC/mAP50-95 по эпохам для построения графика.
+            Классификация: берётся из ClassificationTrainer.metrics_history.
+            Детекция: читается из results.csv в YOLO-директории.
             """
             log(f"  Финальное обучение [{label}] — {max_epochs} эп. + ES(patience={patience})...")
             try:
                 if task == "classification":
-                    m = _train_cls(ds_name, max_epochs, use_es=True,
-                                   name_suffix="final")
+                    if collect_history:
+                        m, _hist = _train_cls(ds_name, max_epochs, use_es=True,
+                                              name_suffix="final",
+                                              return_history=True)
+                    else:
+                        m = _train_cls(ds_name, max_epochs, use_es=True,
+                                       name_suffix="final")
+                        _hist = []
                 else:
                     # final=True: финальное обучение победителя.
                     # Вызывает _run_training_final (ES, eval на test).
                     m = _train_det(ds_name, max_epochs, use_es=True,
                                    result_subdir=result_subdir, keep_weights=True,
                                    final=True)
+                    _hist = []
+                    if collect_history:
+                        # Читаем per-epoch mAP50-95 из results.csv YOLO.
+                        # YOLO всегда пишет этот файл — дополнительного обучения
+                        # не требуется.
+                        _csv_path = work_dir / result_subdir / "run" / "results.csv"
+                        try:
+                            import pandas as _pd_hist
+                            if _csv_path.exists():
+                                _df = _pd_hist.read_csv(_csv_path)
+                                _map_col = next(
+                                    (c for c in _df.columns
+                                     if "mAP50-95" in c or "mAP_50-95" in c),
+                                    None)
+                                if _map_col:
+                                    _hist = [float(v) for v in
+                                             _df[_map_col].dropna().tolist()]
+                        except Exception as _he:
+                            log(f"    [ПРЕДУПРЕЖДЕНИЕ] Не удалось прочитать "
+                                f"историю детекции: {_he}")
+                if collect_history:
+                    return m, _hist
                 return m
             except Exception as e:
                 log(f"    [ОШИБКА full_train] {e}")
                 log(traceback.format_exc())
+                if collect_history:
+                    return {}, []
                 return {}
             finally:
                 try:
@@ -2514,6 +2561,7 @@ def _run_search(q: queue.Queue, config: Dict):
         # Обучаем каждого из топ-N survivors
         # Победителем станет лучший по score на test сплите
         _finalist_results = []  # список (survivor, ds_name, metrics)
+        _finalist_histories: Dict[str, List[float]] = {}  # display → per-epoch history
         for _rank, _surv in enumerate(_top_survivors, 1):
             _surv_methods, _surv_params = merge_methods_params(
                 _surv["pipeline_cands"])
@@ -2527,8 +2575,14 @@ def _run_search(q: queue.Queue, config: Dict):
                 methods=_surv_methods,
                 params=_surv_params,
             )
-            _surv_metrics = full_train(_surv_ds_name, _surv_display,
-                                       result_subdir=f"final_top{_rank}")
+            _surv_result = full_train(_surv_ds_name, _surv_display,
+                                      result_subdir=f"final_top{_rank}",
+                                      collect_history=True)
+            if isinstance(_surv_result, tuple):
+                _surv_metrics, _surv_hist = _surv_result
+            else:
+                _surv_metrics, _surv_hist = _surv_result, []
+            _finalist_histories[_surv_display] = _surv_hist
             _surv_score = score_from_metrics(_surv_metrics)
             if task == "classification":
                 log(f"    → score(val_auc)={_surv_score:.4f}  "
@@ -2580,8 +2634,13 @@ def _run_search(q: queue.Queue, config: Dict):
         log("ФИНАЛЬНЫЙ BASELINE (полное обучение для сравнения)")
         log("=" * 70)
 
-        baseline_final_metrics = full_train(dataset_name, "baseline",
-                                            result_subdir="final_baseline")
+        _baseline_result = full_train(dataset_name, "baseline",
+                                       result_subdir="final_baseline",
+                                       collect_history=True)
+        if isinstance(_baseline_result, tuple):
+            baseline_final_metrics, _baseline_history = _baseline_result
+        else:
+            baseline_final_metrics, _baseline_history = _baseline_result, []
 
         # ══════════════════════════════════════════════════════════════════
         # ИТОГ И СРАВНЕНИЕ
@@ -2675,6 +2734,17 @@ def _run_search(q: queue.Queue, config: Dict):
                     key=lambda x: score_from_metrics(x[2]), reverse=True)
             ],
             "baseline_quick_score": round(baseline_score, 4),
+            "screening_ratio":      screening_ratio,
+            # Данные для графика кривых обучения финального прогона.
+            # winner_history / baseline_history — per-epoch AUC (classification)
+            # или mAP50-95 (detection) из full_train.
+            # Используется в UI для построения графика даже без auto_screen.
+            "chart_data": {
+                "winner_display":    winner_display,
+                "winner_history":    _finalist_histories.get(winner_display, []),
+                "baseline_history":  _baseline_history,
+                "max_epochs":        max_epochs,
+            },
         }
 
         result_json = work_dir / "p2_result.json"
@@ -3753,6 +3823,153 @@ elif st.session_state.p2_stage == "done":
                     import pandas as _pd_fin
                     st.dataframe(_pd_fin.DataFrame(_fin_rows),
                                  use_container_width=True)
+
+            st.divider()
+
+            # ─────────────────────────────────────────────────────────────
+            # ГРАФИК КРИВЫХ ОБУЧЕНИЯ
+            # ─────────────────────────────────────────────────────────────
+            _chart_data = result.get("chart_data", {})
+            _winner_hist     = _chart_data.get("winner_history", [])
+            _baseline_hist   = _chart_data.get("baseline_history", [])
+            _winner_disp     = _chart_data.get("winner_display", "Победитель")
+            _chart_max_ep    = _chart_data.get("max_epochs", 1) or 1
+            _metric_label    = "AUC" if _task == "classification" else "mAP50-95"
+
+            if _winner_hist or _baseline_hist:
+                st.subheader("Кривые обучения финального прогона")
+
+                # Процент скрининга для пунктирной вертикальной линии
+                _task_sr = int(result.get(
+                    "screening_ratio",
+                    st.session_state.get("p2_screening_ratio", 30)))
+
+                # Профессиональная академическая палитра
+                # (colorblind-friendly, приглушённые тона)
+                _PALETTE = [
+                    "#2563EB",  # синий  — победитель
+                    "#16A34A",  # зелёный
+                    "#D97706",  # янтарный
+                    "#7C3AED",  # фиолетовый
+                    "#DB2777",  # розовый
+                ]
+
+                def _curve_pts(hist: list, n_epochs: int) -> list:
+                    """max(0..N%) для N=0,10,20,...,100. 0% всегда 0."""
+                    pts = [0.0]  # 0% — до обучения
+                    for _p in range(10, 110, 10):
+                        _k = max(1, int(round(n_epochs * (_p / 100))))
+                        _k = min(_k, len(hist)) if hist else 0
+                        pts.append(round(max(hist[:_k]), 4) if _k > 0 else 0.0)
+                    return pts
+
+                _x_pct = list(range(0, 110, 10))  # 0, 10, 20, ..., 100
+
+                try:
+                    import plotly.graph_objects as _go
+                except ImportError:
+                    st.info(
+                        "📦 Для отображения графика установите plotly: "
+                        "`uv add plotly` или `uv pip install plotly`"
+                    )
+                    _go = None
+
+                if _go is not None:
+                    _fig = _go.Figure()
+
+                    # Baseline — серый пунктир
+                    if _baseline_hist:
+                        _bl_pts = _curve_pts(_baseline_hist, _chart_max_ep)
+                        _bl_label = (
+                            f"Baseline"
+                            f"  (эп. {len(_baseline_hist)}/{_chart_max_ep})")
+                        _fig.add_trace(_go.Scatter(
+                            x=_x_pct, y=_bl_pts,
+                            name=_bl_label,
+                            mode="lines+markers",
+                            line=dict(color="#6B7280", width=2, dash="dash"),
+                            marker=dict(size=5, color="#6B7280"),
+                            hovertemplate=(
+                                "<b>Baseline</b><br>"
+                                f"Бюджет: %{{x}}%<br>{_metric_label}: %{{y:.4f}}"
+                                "<extra></extra>"
+                            ),
+                        ))
+
+                    # Победитель — жирная синяя линия
+                    if _winner_hist:
+                        _win_pts = _curve_pts(_winner_hist, _chart_max_ep)
+                        _win_label = (
+                            f"★ {_winner_disp}"
+                            f"  (эп. {len(_winner_hist)}/{_chart_max_ep})")
+                        _fig.add_trace(_go.Scatter(
+                            x=_x_pct, y=_win_pts,
+                            name=_win_label,
+                            mode="lines+markers",
+                            line=dict(color=_PALETTE[0], width=3),
+                            marker=dict(size=6, color=_PALETTE[0]),
+                            hovertemplate=(
+                                f"<b>{_winner_disp}</b><br>"
+                                f"Бюджет: %{{x}}%<br>{_metric_label}: %{{y:.4f}}"
+                                "<extra></extra>"
+                            ),
+                        ))
+
+                    # Вертикальная линия на скрининговом бюджете
+                    _fig.add_vline(
+                        x=_task_sr,
+                        line_dash="dot",
+                        line_color="#9CA3AF",
+                        line_width=1.5,
+                        annotation_text=f"скрининг ({_task_sr}%)",
+                        annotation_position="top right",
+                        annotation_font=dict(size=11, color="#6B7280"),
+                    )
+
+                    # Оформление: академический стиль, сетка 0.1
+                    _fig.update_layout(
+                        template="plotly_white",
+                        height=420,
+                        margin=dict(l=60, r=30, t=40, b=60),
+                        xaxis=dict(
+                            title="Бюджет обучения, % от максимума эпох",
+                            tickvals=_x_pct,
+                            ticktext=[f"{p}%" for p in _x_pct],
+                            gridcolor="#E5E7EB",
+                            showgrid=True,
+                            zeroline=False,
+                        ),
+                        yaxis=dict(
+                            title=f"{_metric_label} max(0..N%)",
+                            dtick=0.1,
+                            gridcolor="#E5E7EB",
+                            showgrid=True,
+                            zeroline=False,
+                        ),
+                        legend=dict(
+                            orientation="h",
+                            yanchor="bottom",
+                            y=1.02,
+                            xanchor="left",
+                            x=0,
+                            bgcolor="rgba(255,255,255,0.8)",
+                            bordercolor="#E5E7EB",
+                            borderwidth=1,
+                        ),
+                        plot_bgcolor="white",
+                        paper_bgcolor="white",
+                        font=dict(
+                            family="Inter, Arial, sans-serif",
+                            size=13, color="#111827"),
+                        hoverlabel=dict(
+                            bgcolor="white",
+                            bordercolor="#D1D5DB",
+                            font_size=13,
+                        ),
+                    )
+
+                    st.plotly_chart(_fig, use_container_width=True)
+                # Конец блока графика
 
             st.divider()
 
