@@ -13,12 +13,12 @@ from ui.state import (
 )
 from ui.sidebar import render_sidebar
 
-st.set_page_config(page_title="Настройки — VKR2026", page_icon="⚙️", layout="wide")
+st.set_page_config(page_title="Настройки — VKR2026", page_icon="", layout="wide")
 init_session_state()
 render_sidebar()
 
 st.title("Настройки")
-st.markdown("Укажи путь к папке с датасетами. Это нужно сделать **только один раз** — путь сохранится в `.env` файл.")
+st.markdown("Укажи путь к папке с датасетами. Это нужно сделать **только один раз**. Путь сохранится в `.env` файл.")
 st.divider()
 
 current_path = get_datasets_path()
@@ -36,10 +36,13 @@ else:
     st.info("Путь ещё не задан.")
 
 st.divider()
-st.subheader("Задать / изменить путь к датасетам")
+st.subheader("Задать или изменить путь к датасетам")
 st.markdown(
-    "Укажи **полный путь** до папки, внутри которой лежат подпапки с датасетами. "
-    "Например: `N:\\VKR_Datasets` или `/home/user/datasets`"
+    "Укажите **полный путь** к папке, внутри которой лежат датасеты. "
+    "Например: `C:\\Datasets` или `/home/user/datasets`. \n"
+    "Для классификации необходима обычная структура датасета ImageFolder. \n"
+    "Для задач детекции необходима структура датасета Ultralytics YOLO, \n"
+    "даже если вы будете использовать детектор не от YOLO. \n"
 )
 
 default_val = str(current_path) if current_path else ""
@@ -49,7 +52,7 @@ new_path_str = st.text_input(
     placeholder="Например: N:\\VKR_Datasets",
 )
 
-col1, col2 = st.columns([1, 3])
+col1, col2 = st.columns([2, 2])
 with col1:
     save_clicked = st.button("Сохранить", type="primary", use_container_width=True)
 with col2:
@@ -77,28 +80,3 @@ if save_clicked:
                 for d in sorted(datasets):
                     st.markdown(f"  - `{d}`")
             st.rerun()
-
-st.divider()
-with st.expander("Подсказки по структуре датасетов"):
-    st.markdown("""
-Каждый датасет должен быть папкой внутри указанной директории и содержать структуру YOLO:
-
-```
-VKR_Datasets/
-├── MyDataset/
-│   ├── train/
-│   │   ├── images/
-│   │   └── labels/
-│   ├── valid/
-│   │   ├── images/
-│   │   └── labels/
-│   ├── test/
-│   │   ├── images/
-│   │   └── labels/
-│   └── data.yaml
-└── AnotherDataset/
-    └── ...
-```
-
-Файл `data.yaml` обязателен для обучения моделей.
-    """)

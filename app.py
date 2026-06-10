@@ -1,6 +1,6 @@
 """
 VKR2026 — Streamlit интерфейс
-Главная страница: навигация и проверка конфигурации
+Главная страница: навигация и статус системы
 """
 
 import streamlit as st
@@ -8,7 +8,7 @@ from ui.state import init_session_state, get_datasets_path, is_path_configured
 from ui.sidebar import render_sidebar
 
 st.set_page_config(
-    page_title="VKR2026 — Детекция объектов",
+    page_title="Информация",
     page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
@@ -17,7 +17,7 @@ st.set_page_config(
 init_session_state()
 render_sidebar()
 
-st.title("Подбор методов предобработки для повышения точности нейронных моделкй")
+st.title("Подбор методов предобработки для повышения точности нейронных моделей")
 st.markdown("**Дипломная работа (ВКР) 2026**")
 st.divider()
 
@@ -29,58 +29,52 @@ if not is_path_configured():
     )
     st.stop()
 
-st.subheader("Выберите режим работы")
-st.markdown("Все три модуля можно использовать независимо друг от друга.")
-
-col1, col2, col3 = st.columns(3, gap="large")
+col1, col2 = st.columns(2, gap="large")
 
 with col1:
-    st.markdown("### Подбор предобработки")
+    st.markdown("### Подбор пайплайна предобработки")
     st.markdown(
-        "Автоматический анализ датасета, определение типа изображений "
-        "и подбор оптимальных методов предобработки."
+        "Автоматический поиск оптимальной комбинации методов предобработки "
+        "для повышения точности нейронной модели."
     )
-    st.markdown("**Что произойдёт:**")
+    st.markdown("**Как выполняется:**")
     st.markdown(
-        "- Анализ шума, контраста, яркости, резкости\n"
-        "- Определение типа датасета (SAR, медицинский, натуральный...)\n"
-        "- Подбор стратегии (глобальная или адаптивная)\n"
-        "- Создание предобработанных датасетов"
+        "1. Необходимо выбрать тип изображений\n"
+        "2. При применении методов автоподбора бюджета определяется минимальный достаточный бюджет\n"
+        "3. Происходит первоначальный отбор признаков\n"
+        "4. Производится построение различных комбинаций, их оценка и отсев\n"
+        "5. Полученный набор и оригинальный датасет обучаются и сравниваются на полном бюджете"
     )
-    if st.button("Начать подбор предобработки", type="primary", use_container_width=True):
-        st.switch_page("pages/2_Предобработка.py")
+    if st.button(
+        "Перейти к подбору комбинаций методов",
+        type="primary",
+        use_container_width=True,
+        key="btn_pipeline",
+    ):
+        st.switch_page("pages/2_Подбор_предобработки.py")
 
 with col2:
-    st.markdown("### Обучение моделей")
+    st.markdown("### Настройка")
     st.markdown(
-        "Обучение нескольких моделей детекции (YOLOv8, Faster R-CNN, RetinaNet) "
-        "на выбранных датасетах. Поддерживает Early Stopping."
+        "Первоначальная настройка приложения: "
+        "необходимо указать путь к папке с датасетами."
     )
-    st.markdown("**Что произойдёт:**")
+    st.markdown("**Важно!**")
     st.markdown(
-        "- Выбор датасетов и моделей для обучения\n"
-        "- Настройка гиперпараметров (с умными значениями по умолчанию)\n"
-        "- Обучение с отображением прогресса в реальном времени\n"
-        "- Сравнение финальных метрик моделей"
+        "Свободное пространство на диске, в котором находится данная папка, \n"
+        "должно быть достаточным не только для хранения оригинальных датасетов, \n"
+        "но и для дополнительных датасетов, которые будут создаваться по ходу выполнения \n"
+        "подбора предобработки. Строго рекомендуется наличие на диске как минимум 100ГБ \n"
+        "свободного пространства"
     )
-    if st.button("Перейти к обучению", type="primary", use_container_width=True):
-        st.switch_page("pages/3_Обучение.py")
-
-with col3:
-    st.markdown("### Автоподбор пайплайна")
-    st.markdown(
-        "**Модуль 3:** автоматический поиск оптимального пайплайна предобработки "
-        "алгоритмом **SFS+SHA**."
-    )
-    st.markdown("**Что произойдёт:**")
-    st.markdown(
-        "- Формирование пула из 13 кандидатов\n"
-        "- Быстрое обучение (30% эпох) для отсева\n"
-        "- Successive Halving: top-⌈N/η⌉ на каждом шаге\n"
-        "- Финальное обучение победителя (100% эпох)"
-    )
-    if st.button("Запустить автоподбор", type="primary", use_container_width=True):
-        st.switch_page("pages/4_Подбор_пайплайна.py")
+    st.markdown("")
+    if st.button(
+        "Перейти к настройкам",
+        type="primary",
+        use_container_width=True,
+        key="btn_settings",
+    ):
+        st.switch_page("pages/1_Настройки.py")
 
 st.divider()
 st.subheader("Статус системы")
@@ -92,12 +86,13 @@ with col_a:
         import torch
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
-            vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            st.metric("GPU", gpu_name[:25] + "..." if len(gpu_name) > 25 else gpu_name)
+            vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            label = gpu_name[:25] + "..." if len(gpu_name) > 25 else gpu_name
+            st.metric("GPU", label)
             st.caption(f"VRAM: {vram:.1f} GB")
         else:
             st.metric("GPU", "Не обнаружен")
-            st.caption("Обучение будет на CPU (медленно)")
+            st.caption("Обучение будет на CPU (значительно медленнее)")
     except ImportError:
         st.metric("GPU", "PyTorch не установлен")
 
@@ -114,7 +109,8 @@ with col_b:
 with col_c:
     try:
         import ultralytics
-        st.metric("Ultralytics", ultralytics.__version__)
+        st.metric("Ultralytics YOLO", ultralytics.__version__)
         st.caption("YOLOv8 готов к работе")
     except ImportError:
-        st.metric("Ultralytics", "Не установлен")
+        st.metric("Ultralytics YOLO", "Не установлен")
+        st.caption("pip install ultralytics")
