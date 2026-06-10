@@ -1,22 +1,19 @@
 """
-pages/6_Объединение.py — Объединённый подбор пайплайна предобработки
+pages/2_Подбор_предобработки.py — Подбор пайплайна предобработки
 
-Алгоритм: Анализ модальности (опц.) + Group-wise SHA (Фаза 1) + SFS+SHA на survivors (Фаза 2)
+Алгоритм: Group-wise SHA (Фаза 1) + SFS+SHA на survivors (Фаза 2)
 
-Расширение 2_Предобработка.py:
-    Перед Фазой 1 опционально запускается анализ метрик изображений
-    (UniversalImageAnalyzer + ImageModalityClassifier из 5_Метрика_предобработка.py).
-    Для модальностей medical_xray / sar / microscopy применяются правила
-    PreprocessingRules — группы методов запрещённые для данной модальности
-    исключаются из CANDIDATE_GROUPS до начала Фазы 1.
-    Для natural_photo / infrared используется чистый SHA+SFS без фильтрации.
+Тип датасета задаётся вручную пользователем:
+    Для медицинских снимков и SAR применяются правила PreprocessingRules —
+    группы методов, запрещённые для данной модальности, исключаются из
+    CANDIDATE_GROUPS до начала Фазы 1.
+    Для натуральных изображений и «другой модальности» используется
+    чистый SHA+SFS без фильтрации.
 
     Научное обоснование фильтрации по модальности:
     - SAR: Oliver & Quegan (2004) — brightness/sharpening искажают физическую информацию
     - Medical: Pisano et al. (1998) J.Digital Imaging 11(4):193-200; Pisano et al. (2000) RadioGraphics 20:1479-1491
     - Microscopy: Kolarević et al. (2018) Journal of Microscopy 269(3):264-276; Sternberg (1983) Computer 16(1):22-34
-    Выборка для анализа: min(N_train × 0.3, 300), минимум 30
-    (CLT: Kim, 2017, PMC5370305 — n ≥ 30 достаточно для оценки среднего)
 
 Научное обоснование:
 - SHA:  Jamieson & Talwalkar (2016) "Non-stochastic best arm identification",
@@ -1210,81 +1207,6 @@ def _run_search(q: queue.Queue, config: Dict):
                 log(f"  [ПРЕДУПРЕЖДЕНИЕ] Не удалось применить правила модальности: {_e}")
                 log("  Продолжаем без фильтрации.")
                 modality_result = None
-
-        if config.get("use_modality", False) and modality_result is None:
-            log("")
-            log("=" * 70)
-            log("АНАЛИЗ МОДАЛЬНОСТИ ДАТАСЕТА")
-            log("Gonzalez & Woods (2018); Oliver & Quegan (2004); Pisano et al. (1998); Kolarević et al. (2018)")
-            log("Выборка: min(N_train×0.3, 300), мин. 30 — CLT (Kim 2017, PMC5370305)")
-            log("=" * 70)
-            try:
-                import sys as _sys
-                _sys.path.insert(0, str(Path(__file__).parent.parent))
-                from Utils.image_analyzer      import UniversalImageAnalyzer
-                from Utils.modality_classifier import ImageModalityClassifier
-                from Utils.preprocessing_rules import PreprocessingRules as PR
-
-                try:
-                    _train_dir = datasets_path / dataset_name / "train"
-                    if (_train_dir / "images").exists():
-                        _n = len(list((_train_dir / "images").glob("*.*")))
-                    else:
-                        _n = sum(1 for _f in _train_dir.rglob("*")
-                                 if _f.suffix.lower() in {".jpg",".jpeg",".png",".bmp"})
-                    _sample = max(30, min(int(_n * 0.3), 300))
-                except Exception:
-                    _sample = 100
-                log(f"  Датасет: {dataset_name} | выборка: {_sample} изображений")
-
-                _analyzer      = UniversalImageAnalyzer(verbose=False)
-                _ds_metrics, _ = _analyzer.analyze_dataset(
-                    datasets_path / dataset_name, sample_size=_sample, split="train"
-                )
-                _color_str = "цветной" if _ds_metrics.is_color_dataset else "grayscale"
-                log(f"  SNR: {_ds_metrics.avg_snr:.1f} dB | "
-                    f"Контраст: {_ds_metrics.avg_contrast:.3f} | "
-                    f"Яркость: {_ds_metrics.avg_brightness:.3f} | {_color_str}")
-
-                _classifier = ImageModalityClassifier()
-                _modal_info = _classifier.classify(_ds_metrics)
-                _modality   = _modal_info["modality"]
-                _confidence = _modal_info["confidence"]
-                log(f"  Тип: {_modality.upper()} (уверенность {_confidence*100:.1f}%)")
-
-                _excluded, _allowed = [], []
-                if _modality in _MODALITY_FILTER_TYPES:
-                    log(f"  Применяем правила для '{_modality}':")
-                    for _gid, _mname in _GROUP_TO_METHOD.items():
-                        _ok = PR.is_method_allowed(_modality, _mname)
-                        if _ok:
-                            _allowed.append(_gid)
-                            log(f"    {_gid} ({_mname}) — разрешён")
-                        else:
-                            _excluded.append(_gid)
-                            _rat = PR.get_rationale(_modality, _mname)
-                            log(f"    {_gid} — запрещён: "
-                                f"{_rat[:70]}{'...' if len(_rat) > 70 else ''}")
-                else:
-                    log(f"  Тип '{_modality}' — фильтрация не применяется (fallback)")
-                    _allowed = list(_GROUP_TO_METHOD.keys())
-
-                modality_result = {
-                    "modality":        _modality,
-                    "confidence":      _confidence,
-                    "excluded_groups": _excluded,
-                    "allowed_groups":  _allowed,
-                    "is_color":        _ds_metrics.is_color_dataset,
-                    "apply_filter":    _modality in _MODALITY_FILTER_TYPES,
-                }
-                q.put(("modality_result", modality_result))
-                log("  Анализ модальности завершён.")
-
-            except Exception as _e:
-                log(f"  [ПРЕДУПРЕЖДЕНИЕ] Анализ модальности не удался: {_e}")
-                log("  Продолжаем без фильтрации.")
-                modality_result = None
-
 
         # ══════════════════════════════════════════════════════════════════
         # BASELINE: быстрое обучение оригинала
