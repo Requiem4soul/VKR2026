@@ -257,8 +257,8 @@ class EarlyModelSelector:
         with open(log_file, 'w', encoding='utf-8') as f:
             json.dump(decision, f, indent=2, ensure_ascii=False)
         
-        print(f"\n✅ Решение сохранено: {log_file}")
-        print(f"📈 Продолжаем обучение {num_to_keep}/{num_models} моделей")
+        print(f"\nРешение сохранено: {log_file}")
+        print(f"Продолжаем обучение {num_to_keep}/{num_models} моделей")
         
         return True, f"Отобрано на эпохе {checkpoint_epoch}"
     
