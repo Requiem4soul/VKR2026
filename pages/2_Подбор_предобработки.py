@@ -3519,7 +3519,7 @@ elif st.session_state.p2_stage == "done":
 
             if result.get("winner_ds_name"):
                 st.info(
-                    f"💾 Датасет с предобработкой сохранён: `{result['winner_ds_name']}`\n\n"
+                    f"Датасет с предобработкой сохранён: `{result['winner_ds_name']}`\n\n"
                     "Перейди на страницу **Обучение** чтобы обучить финальную модель на нём."
                 )
 

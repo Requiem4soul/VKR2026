@@ -2,12 +2,12 @@
 Universal Model Trainer - ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ
 
 ВКЛЮЧАЕТ:
-1. ✅ Весь оригинальный код (wrapper'ы, датасеты, метрики, очистка памяти)
-2. ✅ Early Stopping для каждой модели (Prechelt, 1998)
-3. ✅ Ранний отбор моделей (Jamieson & Talwalkar, 2016)
-4. ✅ Критическая очистка памяти GPU после каждого чекпоинта
-5. ✅ Индивидуальные max_epochs для каждой модели
-6. ✅ Воспроизводимость через seed (Dodge & Karam, 2017) [НОВОЕ]
+1.  Весь оригинальный код (wrapper'ы, датасеты, метрики, очистка памяти)
+2.  Early Stopping для каждой модели (Prechelt, 1998)
+3.  Ранний отбор моделей (Jamieson & Talwalkar, 2016)
+4.  Критическая очистка памяти GPU после каждого чекпоинта
+5.  Индивидуальные max_epochs для каждой модели
+6.  Воспроизводимость через seed (Dodge & Karam, 2017) [НОВОЕ]
 
 ИСПРАВЛЕНИЯ из оригинала:
 - RetinaNet: score_threshold=0.1 (было 0.5)
@@ -63,10 +63,10 @@ class EarlyStoppingConfig:
     """Конфигурация Early Stopping (Prechelt, 1998)"""
     patience: int = 10
     # min_delta=1e-4: минимальное улучшение метрики для сброса patience.
-    # Prechelt (1998) "Early Stopping — But When?", Neural Networks:
+    # Prechelt (1998) "Early Stopping - But When?", Neural Networks:
     # рекомендует delta порядка 0.1% от масштаба метрики.
     # Для AUC/mAP в диапазоне [0,1] при high-accuracy (>0.95)
-    # улучшения идут на тысячные — min_delta=0.001 отсекает их.
+    # улучшения идут на тысячные - min_delta=0.001 отсекает их.
     # 1e-4 фиксирует это, сохраняя защиту от шумовых колебаний.
     min_delta: float = 0.0001
     metric: str = 'mAP50-95'
@@ -251,7 +251,7 @@ class YOLODatasetInfo:
 # ===================== DATASET CONVERTER (ОРИГИНАЛЬНЫЙ) =====================
 
 class YOLOToFasterRCNNDataset(Dataset):
-    """Конвертер YOLO → Faster R-CNN формат"""
+    """Конвертер YOLO -> Faster R-CNN формат"""
     
     def __init__(self, dataset_path: Path, split: str = 'train', transforms=None):
         self.dataset_path = dataset_path
@@ -502,7 +502,7 @@ class YOLOWrapper(BaseModelWrapper):
     
     def initialize(self, num_classes: int = None, **kwargs):
         # resume_from: путь к last.pt для warm-start.
-        # Если передан — загружаем веса вместо предобученных.
+        # Если передан - загружаем веса вместо предобученных.
         # Используется автоподбором процента скрининга (6_Объединение.py).
         resume_from = kwargs.get('resume_from', '')
         if resume_from and os.path.exists(resume_from):
@@ -581,7 +581,7 @@ class YOLOWrapper(BaseModelWrapper):
     
     def save(self, path: str):
         """
-        Сохраняет best.pt — лучшие веса по mAP за весь прогон.
+        Сохраняет best.pt - лучшие веса по mAP за весь прогон.
         Используется для финального сохранения результатов обучения
         (3_Обучение.py).
         """
@@ -593,18 +593,18 @@ class YOLOWrapper(BaseModelWrapper):
 
     def save_for_warmstart(self, path: str) -> bool:
         """
-        Сохраняет last.pt — чекпоинт последней эпохи для warm-start.
+        Сохраняет last.pt - чекпоинт последней эпохи для warm-start.
 
         Используется при сегментном обучении (train_model_segment) когда
         нужно продолжить обучение со следующего сегмента.
 
         Отличие от save():
-        - save()               → best.pt  (лучшие веса по mAP, для финала)
-        - save_for_warmstart() → last.pt  (последняя эпоха + epoch counter,
+        - save()               -> best.pt  (лучшие веса по mAP, для финала)
+        - save_for_warmstart() -> last.pt  (последняя эпоха + epoch counter,
                                            для дообучения)
 
         Почему last.pt а не best.pt для warm-start:
-        last.pt содержит корректный epoch counter — сколько эпох уже обучено.
+        last.pt содержит корректный epoch counter - сколько эпох уже обучено.
         best.pt может указывать на более раннюю эпоху (лучшую по mAP),
         что при следующем warm-start даст неверный epochs_delta и
         эффективно обучит больше эпох чем запланировано.
@@ -622,7 +622,7 @@ class YOLOWrapper(BaseModelWrapper):
                 shutil.copy(last_weights, path)
                 return True
             # Fallback: если last.pt нет (редкий случай при очень коротком
-            # обучении когда Ultralytics не успевает его записать) — берём best.pt
+            # обучении когда Ultralytics не успевает его записать) - берём best.pt
             best_weights = Path(self.last_project_path) / 'weights' / 'best.pt'
             if best_weights.exists():
                 shutil.copy(best_weights, path)
@@ -657,7 +657,7 @@ class FasterRCNNWrapper(BaseModelWrapper):
         in_features = self.model.roi_heads.box_predictor.cls_score.in_features
         self.model.roi_heads.box_predictor = FastRCNNPredictor(in_features, self.num_classes)
         
-        print(f"[✓] Инициализирован Faster R-CNN (classes={self.num_classes})")
+        print(f"[[OK]] Инициализирован Faster R-CNN (classes={self.num_classes})")
     
     def train_epoch(self, dataloader, device, optimizer, epoch, **kwargs):
         self.model.to(device)
@@ -765,7 +765,7 @@ class RetinaNetWrapper(BaseModelWrapper):
             num_classes=self.num_classes
         )
         
-        print(f"[✓] Инициализирован RetinaNet (classes={self.num_classes})")
+        print(f"[[OK]] Инициализирован RetinaNet (classes={self.num_classes})")
     
     def train_epoch(self, dataloader, device, optimizer, epoch, **kwargs):
         self.model.to(device)
@@ -872,8 +872,8 @@ class UniversalModelTrainer:
         max_epochs: int = 40,
         checkpoint_interval: int = 10,
         
-        # ── Воспроизводимость ──────────────────────────────────────────────
-        seed: int = 42,                        # ← НОВЫЙ ПАРАМЕТР
+        # -- Воспроизводимость ----------------------------------------------
+        seed: int = 42,                        # <- НОВЫЙ ПАРАМЕТР
         
         # Early Stopping
         enable_early_stopping: bool = False,
@@ -893,7 +893,7 @@ class UniversalModelTrainer:
         self.max_epochs = max_epochs
         self.checkpoint_interval = checkpoint_interval
 
-        # ── Воспроизводимость (Dodge & Karam, 2017) ───────────────────────
+        # -- Воспроизводимость (Dodge & Karam, 2017) -----------------------
         # Фиксируем seed ДО создания любых моделей и DataLoader'ов.
         # Результаты идентичны при одинаковом seed на одинаковом оборудовании.
         self.seed = seed
@@ -905,7 +905,7 @@ class UniversalModelTrainer:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         os.environ["PYTHONHASHSEED"] = str(seed)
-        # ──────────────────────────────────────────────────────────────────
+        # ------------------------------------------------------------------
         
         # Early Stopping
         self.enable_early_stopping = enable_early_stopping
@@ -1180,7 +1180,7 @@ class UniversalModelTrainer:
                 imgsz = get_image_size_from_dataset(dataset_path)
                 print(f"[INFO] Размер изображений: {imgsz}x{imgsz}")
 
-                # Определяем сколько эпох уже обучено — берём из метаданных
+                # Определяем сколько эпох уже обучено - берём из метаданных
                 # last.pt если модель загружена из чекпоинта (start_epoch > 0).
                 # Ultralytics хранит счётчик в поле 'epoch' (0-based).
                 # Нам нужно обучить только дополнительные (delta) эпохи, чтобы
@@ -1205,7 +1205,7 @@ class UniversalModelTrainer:
                             _meta = torch.load(_ckpt_path, map_location='cpu',
                                                weights_only=False)
                             # Ultralytics сохраняет epoch=-1 в финальных весах
-                            # (last.pt / best.pt) — это намеренное поведение
+                            # (last.pt / best.pt) - это намеренное поведение
                             # библиотеки для уменьшения размера файла инференса.
                             # Читаем число обученных эпох из train_results['epoch']
                             # (1-based список), либо из train_args['epochs'].
@@ -1224,10 +1224,10 @@ class UniversalModelTrainer:
                         except Exception:
                             yolo_trained_epochs = start_epoch
 
-                # epochs_delta — число дополнительных эпох для обучения.
+                # epochs_delta - число дополнительных эпох для обучения.
                 # При start_epoch=0: delta == epochs_to_train (обучение с нуля).
                 # При start_epoch=N: delta = epochs_to_train - уже обученные.
-                # Минимум 1 — защита от нулевого запуска.
+                # Минимум 1 - защита от нулевого запуска.
                 epochs_delta = max(1, epochs_to_train - yolo_trained_epochs)
                 self.log_message(
                     f"YOLO: запрошено доп. эпох={epochs_to_train}, "
@@ -1262,7 +1262,7 @@ class UniversalModelTrainer:
                 train_loader = self.dataloaders[key]['train']
                 val_loader = self.dataloaders[key]['val']
 
-                # Базовый lr — используется и при инициализации,
+                # Базовый lr - используется и при инициализации,
                 # и при сбросе lr после warm-start.
                 _det_base_lr = 0.005
                 optimizer = optim.SGD(
@@ -1282,7 +1282,7 @@ class UniversalModelTrainer:
                 # их потеря вызывает нестабильность в первых эпохах сегмента.
                 #
                 # Чекпоинт сохраняется ниже (в блоке сохранения сегмента)
-                # только если модель не YOLO — у PyTorch-моделей нет
+                # только если модель не YOLO - у PyTorch-моделей нет
                 # встроенного механизма сохранения optimizer state.
                 if start_epoch > 0:
                     _opt_ckpt_path = os.path.join(
@@ -1298,7 +1298,7 @@ class UniversalModelTrainer:
                             # Сбрасываем lr в базовое значение после загрузки.
                             # Howard & Ruder (2018) ACL, pp. 328-339: при каждом
                             # новом этапе fine-tuning lr возвращается к начальному
-                            # значению — иначе обучение стартует с нулевого lr.
+                            # значению - иначе обучение стартует с нулевого lr.
                             for _pg in optimizer.param_groups:
                                 _pg['lr'] = _det_base_lr
                             self.log_message(
@@ -1315,7 +1315,7 @@ class UniversalModelTrainer:
                 best_metrics = None  # метрики лучшей эпохи по ES
 
                 # Получаем stopper для этой модели если ES включён.
-                # ES проверяется на каждой эпохе (не на каждом чекпоинте) —
+                # ES проверяется на каждой эпохе (не на каждом чекпоинте) -
                 # это исправляет баг когда patience считался по чекпоинтам.
                 # Prechelt (1998): ES должен проверяться после каждой эпохи.
                 _stopper = None
@@ -1340,7 +1340,7 @@ class UniversalModelTrainer:
                     all_metrics.update(val_metrics)
                     all_metrics['train_loss'] = train_metrics['train_loss']
 
-                    # ES на каждой эпохе — модель ещё жива в self.models[key],
+                    # ES на каждой эпохе - модель ещё жива в self.models[key],
                     # поэтому save_checkpoint_with_metrics работает корректно.
                     if _stopper is not None:
                         def _save_fn(ep, mtr, _key=key):
@@ -1361,7 +1361,7 @@ class UniversalModelTrainer:
                             end_epoch = current_epoch
                             break
 
-                # Если ES сохранил лучшие веса — восстанавливаем их
+                # Если ES сохранил лучшие веса - восстанавливаем их
                 if _stopper and _stopper.best_model_path and os.path.exists(_stopper.best_model_path):
                     try:
                         ckpt = torch.load(_stopper.best_model_path, map_location=device)
@@ -1381,14 +1381,13 @@ class UniversalModelTrainer:
             self.current_epochs[key] = end_epoch
             
             self.log_message(f"Завершено обучение {key} до эпохи {end_epoch}")
-            self.log_metrics(key, metrics)
             
             if end_epoch < model_max_epochs:
                 checkpoint_path = os.path.join(
                     self.checkpoint_dir,
                     f"{key}_epoch_{end_epoch}.pt"
                 )
-                # Для YOLO используем save_for_warmstart() — сохраняет last.pt
+                # Для YOLO используем save_for_warmstart() - сохраняет last.pt
                 # с корректным epoch counter для следующего сегмента.
                 # Для Faster R-CNN / RetinaNet используем save() как раньше.
                 # Li et al. (2018) JMLR 18(185): warm-start использует
@@ -1408,7 +1407,7 @@ class UniversalModelTrainer:
                 # Для PyTorch-моделей (Faster R-CNN, RetinaNet) сохраняем
                 # отдельный файл с optimizer_state_dict.
                 # YOLO хранит optimizer state внутри last.pt автоматически;
-                # PyTorch-модели — нет, поэтому сохраняем явно.
+                # PyTorch-модели - нет, поэтому сохраняем явно.
                 # Без сохранения optimizer state momentum buffers теряются
                 # между сегментами, что нарушает непрерывность оптимизации.
                 # Sutskever et al. (2013) ICML, pp. 1139-1147.
@@ -1450,43 +1449,6 @@ class UniversalModelTrainer:
             import traceback
             self.log_message(traceback.format_exc())
             return None
-    
-    def log_metrics(self, key: str, metrics: Dict[str, float]):
-        self.log_message(f"Метрики для {key} (эпоха {metrics.get('epoch', 0)}):")
-        for metric_name, value in metrics.items():
-            if metric_name != 'epoch':
-                self.log_message(f"  {metric_name}: {value:.4f}")
-    
-    def compare_models(self, epoch: int):
-        self.log_message(f"\n=== СРАВНЕНИЕ МОДЕЛЕЙ НА ЭПОХЕ {epoch} ===")
-        
-        current_metrics = {}
-        for key in self.metrics_history:
-            if self.metrics_history[key]:
-                current_metrics[key] = self.metrics_history[key][-1]
-        
-        if len(current_metrics) < 2:
-            self.log_message("Недостаточно данных для сравнения")
-            return
-        
-        sample_metrics = next(iter(current_metrics.values()))
-        available_metrics = [k for k in sample_metrics.keys() if k != 'epoch']
-        
-        for metric in available_metrics:
-            self.log_message(f"\n{metric.upper()}:")
-            
-            reverse = 'loss' not in metric.lower()
-            
-            sorted_items = sorted(
-                current_metrics.items(),
-                key=lambda x: x[1].get(metric, 0),
-                reverse=reverse
-            )
-            
-            for i, (key, metrics) in enumerate(sorted_items):
-                rank = i + 1
-                value = metrics.get(metric, 0)
-                self.log_message(f"  {rank}. {key}: {value:.4f}")
     
     def run_training(self):
         """ОСНОВНОЙ ЦИКЛ С EARLY STOPPING И РАННИМ ОТБОРОМ"""
@@ -1537,10 +1499,10 @@ class UniversalModelTrainer:
                         continue
                     
                     # Early Stopping проверка.
-                    # Для YOLO: ES проверяется здесь по чекпоинтам —
+                    # Для YOLO: ES проверяется здесь по чекпоинтам -
                     # YOLO обучается единым вызовом .train(), внутренний ES недоступен.
                     # Для faster_rcnn / retinanet: ES уже обрабатывается внутри
-                    # train_model_segment на каждой эпохе — здесь не дублируем.
+                    # train_model_segment на каждой эпохе - здесь не дублируем.
                     model_type_for_es = model_config.get('type', '')
                     if (self.enable_early_stopping and self.early_stoppers
                             and model_type_for_es == 'yolo'):
@@ -1558,7 +1520,7 @@ class UniversalModelTrainer:
                                 self.log_message(f"[ES] Остановлено обучение {key}")
 
                     # Для faster_rcnn / retinanet: ES уже мог остановить обучение
-                    # внутри train_model_segment — синхронизируем training_active.
+                    # внутри train_model_segment - синхронизируем training_active.
                     if model_type_for_es in ('faster_rcnn', 'retinanet'):
                         if self.enable_early_stopping and self.early_stoppers:
                             stopper = self.early_stoppers.get(key)
@@ -1589,8 +1551,6 @@ class UniversalModelTrainer:
             
             gc.collect()
             
-            self.compare_models(end_epoch)
-            
             with open(self.metrics_file, 'w', encoding='utf-8') as f:
                 json.dump(self.metrics_history, f, indent=2)
             
@@ -1602,57 +1562,3 @@ class UniversalModelTrainer:
         self.log_message("\n" + "=" * 80)
         self.log_message("ОБУЧЕНИЕ ЗАВЕРШЕНО")
         self.log_message("=" * 80)
-
-
-# ===================== ПРИМЕР ИСПОЛЬЗОВАНИЯ =====================
-
-if __name__ == "__main__":
-    model_configs = [
-        {
-            'type': 'yolo',
-            'size': 's',
-            'name': 'yolo_small',
-            'max_epochs': 80,
-            'early_stopping': {
-                'patience': 15,
-                'metric': 'mAP50-95'
-            }
-        },
-        {
-            'type': 'faster_rcnn',
-            'pretrained': True,
-            'name': 'faster_rcnn',
-            'max_epochs': 25
-        },
-        {
-            'type': 'retinanet',
-            'pretrained': True,
-            'name': 'retinanet',
-            'max_epochs': 35
-        }
-    ]
-
-    dataset_names = ["dataset_LUNA16", "LUNA16_CHECK"]
-
-    trainer = UniversalModelTrainer(
-        model_configs=model_configs,
-        dataset_names=dataset_names,
-        max_epochs=max(m.get('max_epochs', 40) for m in model_configs),
-        checkpoint_interval=5,
-        seed=42,                           # ← задаётся здесь
-
-        # Early Stopping
-        enable_early_stopping=True,
-        early_stopping_patience=10,
-        early_stopping_min_delta=0.0001,
-        early_stopping_metric='mAP50-95',
-
-        # Ранний отбор
-        enable_early_selection=True,
-        early_selection_ratio=0.3,
-        early_selection_top_k=0.5,
-
-        clean_old_results=True
-    )
-
-    trainer.run_training()

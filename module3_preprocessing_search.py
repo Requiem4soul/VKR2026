@@ -1,22 +1,21 @@
 """
-module3_preprocessing_search.py — Автоматический подбор пайплайна предобработки
+module3_preprocessing_search.py - Автоматический подбор пайплайна предобработки
 
 Алгоритм: SFS (Sequential Forward Selection) + SHA (Successive Halving)
 
 Научное обоснование:
-- SFS: Kohavi & John (1997) "Wrappers for feature subset selection", AI, 97, 273–324
-- SHA: Jamieson & Talwalkar (2016) "Non-stochastic best arm identification", AISTATS, 240–248
-- CASH: Thornton et al. (2013) "Auto-WEKA", KDD, 847–855
+- SFS: Kohavi & John (1997) "Wrappers for feature subset selection", AI, 97, 273-324
+- SHA: Jamieson & Talwalkar (2016) "Non-stochastic best arm identification", AISTATS, 240-248
+- CASH: Thornton et al. (2013) "Auto-WEKA", KDD, 847-855
 
 Параметры методов:
 - Gonzalez & Woods (2018) Digital Image Processing
-- Tomasi & Manduchi (1998) ICCV, 839–846
-- Pisano et al. (1998) J. Digital Imaging, 11(4), 193–200
+- Tomasi & Manduchi (1998) ICCV, 839-846
+- Pisano et al. (1998) J. Digital Imaging, 11(4), 193-200
 """
 
 import os
 import gc
-import sys
 import json
 import math
 import shutil
@@ -31,7 +30,7 @@ import cv2
 import numpy as np
 import torch
 
-# ── Константы алгоритма ────────────────────────────────────────────────────
+# -- Константы алгоритма ----------------------------------------------------
 
 ETA = 2          # коэффициент отсева SHA (Jamieson & Talwalkar, 2016)
 EPSILON = 0.005  # порог улучшения mAP (стандарт в object detection)
@@ -44,39 +43,39 @@ def composite_score(metrics: Dict[str, float]) -> float:
 
     Используется одна метрика: mAP50-95 (COCO primary metric).
     Lin et al. (2014) "Microsoft COCO: Common Objects in Context", ECCV:
-    mAP усреднённый по IoU от 0.50 до 0.95 — основная метрика ранжирования.
+    mAP усреднённый по IoU от 0.50 до 0.95 - основная метрика ранжирования.
 
     Формула унифицирована с score_from_metrics (6_Объединение.py).
     """
     return float(metrics.get('mAP50-95', 0.0))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # ОПИСАНИЕ ПУЛА МЕТОДОВ
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def build_candidate_pool() -> List[Dict[str, Any]]:
     """
     Формирует пул методов-кандидатов согласно ТЗ.
 
     Итого 13 кандидатов:
-      1  × оригинал
-      2  × median (ksize=3, 5)
-      2  × gaussian (ksize=(3,3), (5,5))
-      2  × bilateral (sigma=75, 150)
-      2  × CLAHE (clip=1.0, 2.0)
-      2  × unsharp_mask (amount=0.5, 1.0)
-      2  × normalization (z-score, min-max)
+      1  x оригинал
+      2  x median (ksize=3, 5)
+      2  x gaussian (ksize=(3,3), (5,5))
+      2  x bilateral (sigma=75, 150)
+      2  x CLAHE (clip=1.0, 2.0)
+      2  x unsharp_mask (amount=0.5, 1.0)
+      2  x normalization (z-score, min-max)
     """
     pool = [
-        # ── Оригинал ──────────────────────────────────────────────────────
+        # -- Оригинал ------------------------------------------------------
         {
             'id': 'original',
             'display': 'Оригинал (baseline)',
             'methods': [],
             'params': {},
         },
-        # ── Median filter ─────────────────────────────────────────────────
+        # -- Median filter -------------------------------------------------
         {
             'id': 'median_k3',
             'display': 'Median (ksize=3)',
@@ -89,7 +88,7 @@ def build_candidate_pool() -> List[Dict[str, Any]]:
             'methods': ['denoise'],
             'params': {'denoise': {'method': 'median', 'ksize': 5}},
         },
-        # ── Gaussian blur ──────────────────────────────────────────────────
+        # -- Gaussian blur --------------------------------------------------
         {
             'id': 'gaussian_3x3',
             'display': 'Gaussian blur (3x3)',
@@ -102,7 +101,7 @@ def build_candidate_pool() -> List[Dict[str, Any]]:
             'methods': ['denoise'],
             'params': {'denoise': {'method': 'gaussian', 'ksize': 5}},
         },
-        # ── Bilateral filter ───────────────────────────────────────────────
+        # -- Bilateral filter -----------------------------------------------
         {
             'id': 'bilateral_s75',
             'display': 'Bilateral (d=9, s=75)',
@@ -117,7 +116,7 @@ def build_candidate_pool() -> List[Dict[str, Any]]:
             'params': {'denoise': {'method': 'bilateral', 'd': 9,
                                    'sigma_color': 150, 'sigma_space': 150}},
         },
-        # ── CLAHE ──────────────────────────────────────────────────────────
+        # -- CLAHE ----------------------------------------------------------
         {
             'id': 'clahe_c10',
             'display': 'CLAHE (clip=1.0)',
@@ -132,7 +131,7 @@ def build_candidate_pool() -> List[Dict[str, Any]]:
             'params': {'contrast_enhancement': {'method': 'clahe', 'clip_limit': 2.0,
                                                 'tile_grid_size': (8, 8)}},
         },
-        # ── Unsharp mask ───────────────────────────────────────────────────
+        # -- Unsharp mask ---------------------------------------------------
         {
             'id': 'unsharp_a05',
             'display': 'Unsharp mask (amount=0.5)',
@@ -145,7 +144,7 @@ def build_candidate_pool() -> List[Dict[str, Any]]:
             'methods': ['sharpening'],
             'params': {'sharpening': {'method': 'unsharp_mask', 'alpha': 1.0}},
         },
-        # ── Нормализация ───────────────────────────────────────────────────
+        # -- Нормализация ---------------------------------------------------
         {
             'id': 'norm_zscore',
             'display': 'Нормализация Z-score',
@@ -163,13 +162,13 @@ def build_candidate_pool() -> List[Dict[str, Any]]:
     return pool
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # СТРУКТУРЫ ДАННЫХ
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 @dataclass
 class Pipeline:
-    """Пайплайн предобработки — последовательность шагов."""
+    """Пайплайн предобработки - последовательность шагов."""
     steps: List[str] = field(default_factory=list)
     methods: List[str] = field(default_factory=list)
     params: Dict[str, Any] = field(default_factory=dict)
@@ -209,9 +208,9 @@ def _make_pipeline_from_base_and_candidate(
     return p
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # ПРИМЕНЕНИЕ ПРЕДОБРАБОТКИ К ВРЕМЕННОМУ ДАТАСЕТУ
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def _apply_normalize(image: np.ndarray, method: str) -> np.ndarray:
     """Применяет нормализацию к изображению."""
@@ -285,7 +284,7 @@ def create_preprocessed_dataset(
 
     yaml_src = source_dataset_path / 'data.yaml'
     if yaml_src.exists():
-        # Переписываем пути на абсолютные — относительные пути вида ../train/images
+        # Переписываем пути на абсолютные - относительные пути вида ../train/images
         # не работают когда YOLO запускает val() из своей внутренней директории.
         # Папки train/valid/test создаются всегда (mkdir выше), поэтому
         # пишем абсолютные пути безусловно, не проверяя exists().
@@ -294,14 +293,14 @@ def create_preprocessed_dataset(
             with open(yaml_src, 'r', encoding='utf-8') as _f:
                 _yaml_data = _yaml.safe_load(_f)
             # train -> target/train/images
-            # Относительные пути — работают при любом перемещении датасета
+            # Относительные пути - работают при любом перемещении датасета
             _yaml_data.pop('path', None)
             _yaml_data['train'] = '../train/images'
             _yaml_data['val']   = '../valid/images'
             _yaml_data['test']  = '../test/images' 
             with open(target_path / 'data.yaml', 'w', encoding='utf-8') as _f:
                 _yaml.dump(_yaml_data, _f, allow_unicode=True)
-            # Лог для диагностики — печатаем итоговый yaml
+            # Лог для диагностики - печатаем итоговый yaml
             print(f"[YAML] Записан data.yaml в {target_path}:")
             print(f"  train: {_yaml_data.get('train')}")
             print(f"  val:   {_yaml_data.get('val')}")
@@ -326,7 +325,7 @@ def create_preprocessed_dataset(
             if progress_callback:
                 progress_callback(i, len(image_files), split)
 
-            # Читаем в оригинальном формате — цветные датасеты сохраняют RGB.
+            # Читаем в оригинальном формате - цветные датасеты сохраняют RGB.
             # IMREAD_GRAYSCALE терял цветовую информацию у цветных датасетов,
             # что приводило к некорректному сравнению с baseline.
             img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
@@ -344,9 +343,9 @@ def create_preprocessed_dataset(
     return target_path
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # БЫСТРОЕ ОБУЧЕНИЕ (PROXY TRAINING)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def train_candidate_fast(
     pipeline: Pipeline,
@@ -366,7 +365,7 @@ def train_candidate_fast(
     Использует механизм очистки памяти из Модуля 2.
 
     ВАЖНО: tmp_dataset удаляется только ПОСЛЕ того как _run_training полностью
-    завершил val() — иначе YOLO не найдёт data.yaml при eval_split='test'.
+    завершил val() - иначе YOLO не найдёт data.yaml при eval_split='test'.
     """
     if log_fn is None:
         log_fn = print
@@ -385,7 +384,7 @@ def train_candidate_fast(
             target_path=tmp_dataset,
         )
 
-        # _run_training сам не удаляет tmp_dataset — только result_dir (веса).
+        # _run_training сам не удаляет tmp_dataset - только result_dir (веса).
         # tmp_dataset живёт до выхода из try-блока, чтобы val() мог
         # прочитать data.yaml с абсолютными путями на split='test'.
         metrics = _run_training(
@@ -411,7 +410,7 @@ def train_candidate_fast(
             torch.cuda.synchronize()
         gc.collect()
 
-        # Теперь безопасно удаляем временный датасет —
+        # Теперь безопасно удаляем временный датасет -
         # все обращения к data.yaml уже завершены
         if tmp_dataset.exists():
             try:
@@ -442,9 +441,9 @@ def _run_training(
     Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1'}.
 
     resume_from: путь к last.pt для warm-start (YOLO).
-        Если указан и файл существует — загружает веса как инициализацию.
+        Если указан и файл существует - загружает веса как инициализацию.
         Используется автоподбором процента скрининга (6_Объединение.py,
-        quick_train_n): вместо обучения с нуля на ep_b эпох — дообучаем
+        quick_train_n): вместо обучения с нуля на ep_b эпох - дообучаем
         с ep_a весов.
 
         Внутри функции вычисляется epochs_delta = ep_b - resume_start_epoch,
@@ -454,12 +453,12 @@ def _run_training(
 
         Научные обоснования допустимости warm-start для ранжирования:
         Li et al. (2018) "Hyperband", JMLR 18(185): successive halving
-        warm-start не требует непрерывного lr-schedule — достаточно
+        warm-start не требует непрерывного lr-schedule - достаточно
         стартовать с обученных весов для стабильного ранжирования.
         Egele et al. (2024) Neurocomputing 562: ранжирование Спирмена
         стабильно независимо от формы lr-schedule при дообучении.
 
-    keep_weights: если True — result_dir НЕ удаляется в finally.
+    keep_weights: если True - result_dir НЕ удаляется в finally.
         Необходимо при вызове из quick_train_n (keep_weights=True в
         _train_det), чтобы last.pt был доступен для следующего warm-start.
         При keep_weights=False (обычный SHA-скрининг) result_dir удаляется
@@ -486,7 +485,7 @@ def _run_training(
             #
             # Проблема исходного кода: передавался epochs=ep_b (абсолютное).
             # Без resume=True Ultralytics запускает lr-schedule заново с эпохи 0
-            # и обучает ep_b эпох — это fine-tuning с нуля по расписанию, а не
+            # и обучает ep_b эпох - это fine-tuning с нуля по расписанию, а не
             # дообучение с ep_a.
             #
             # Li et al. (2018) "Hyperband: A Novel Bandit-Based Approach to
@@ -500,7 +499,7 @@ def _run_training(
             # Это обходит проблему с Ultralytics: при warm-start счётчик
             # train_results['epoch'] сбрасывается с нуля в каждом запуске,
             # поэтому читать суммарное число эпох из last.pt ненадёжно.
-            # Решение: передавать дельту явно — тогда epochs_delta = epochs.
+            # Решение: передавать дельту явно - тогда epochs_delta = epochs.
             # При обычном обучении с нуля (resume_from пустой) epochs тоже
             # является правильным числом эпох.
             # Li et al. (2018) JMLR 18(185): warm-start SHA использует
@@ -526,18 +525,18 @@ def _run_training(
                 except Exception:
                     imgsz = 640
 
-            # epochs — это уже дельта (при warm-start) или полное число (с нуля).
-            # Минимум 1 — защита от нулевого запуска.
+            # epochs - это уже дельта (при warm-start) или полное число (с нуля).
+            # Минимум 1 - защита от нулевого запуска.
             epochs_delta = max(1, epochs)
 
-            # ── Определяем lr0 для warm-start ────────────────────────────
+            # -- Определяем lr0 для warm-start ----------------------------
             # При resume=False Ultralytics создаёт оптимизатор заново.
-            # По умолчанию lr0=0.01 — это слишком агрессивно для дообучения:
+            # По умолчанию lr0=0.01 - это слишком агрессивно для дообучения:
             # высокий lr разрушает тонкую настройку загруженных весов,
             # вызывая хаотичный разброс метрик (наблюдавшийся ρ≈0.2).
             #
             # Howard & Ruder (2018) ACL, pp. 328-339: при fine-tuning lr
-            # должен быть значительно ниже начального (1/10 — 1/3).
+            # должен быть значительно ниже начального (1/10 - 1/3).
             # Smith (2018) "A disciplined approach to neural network
             # hyper-parameters", arXiv:1803.09820: lr для transfer learning
             # рекомендуется 1/10 от базового lr0.
@@ -545,7 +544,7 @@ def _run_training(
             # Решение: при warm-start используем lr0=0.001 (1/10 дефолтного
             # 0.01), lrf=0.5 (lr в конце = lr0*lrf = 0.0005, не падает
             # до нуля за короткий цикл), warmup_epochs=1.0 (плавный старт).
-            # При обучении с нуля — дефолтные значения Ultralytics.
+            # При обучении с нуля - дефолтные значения Ultralytics.
             _is_warmstart = bool(resume_from and os.path.exists(resume_from))
             if _is_warmstart:
                 _lr0 = 0.001       # 1/10 дефолтного 0.01
@@ -556,13 +555,13 @@ def _run_training(
                 _lrf = 0.01        # дефолт Ultralytics
                 _warmup_ep = 3.0   # дефолт Ultralytics
 
-            # ── Логика lr-schedule и прерывания ─────────────────────────
-            # Если max_epochs_for_schedule задан (> epochs_delta) —
+            # -- Логика lr-schedule и прерывания -------------------------
+            # Если max_epochs_for_schedule задан (> epochs_delta) -
             # запускаем YOLO на полном бюджете, но прерываем через callback
             # после epochs_delta эпох. lr-schedule рассчитывается на
             # max_epochs_for_schedule, что согласует Фазы 1/2 с историями
             # автоподбора скрининга (тоже обученными на max_epochs).
-            # Если max_epochs_for_schedule не задан — обычный режим.
+            # Если max_epochs_for_schedule не задан - обычный режим.
             _use_schedule_override = (
                 max_epochs_for_schedule > 0
                 and max_epochs_for_schedule > epochs_delta
@@ -575,7 +574,7 @@ def _run_training(
 
             if _use_schedule_override:
                 # Callback прерывает обучение после _stop_at_epoch эпох.
-                # trainer.epoch — 0-based счётчик внутри текущего запуска.
+                # trainer.epoch - 0-based счётчик внутри текущего запуска.
                 def _early_stop_cb(trainer):
                     if (trainer.epoch + 1) >= _stop_at_epoch:
                         trainer.stop = True
@@ -599,7 +598,7 @@ def _run_training(
                 cache=False,
                 verbose=False,
                 save=True,
-                # resume=False явно — управляем эпохами через дельту сами.
+                # resume=False явно - управляем эпохами через дельту сами.
                 # resume=True потребовало бы что last.pt содержит ровно те
                 # total_epochs что были при исходном запуске, что не выполняется
                 # при сравнении разных процентов скрининга.
@@ -608,22 +607,22 @@ def _run_training(
                 lr0=_lr0,
                 lrf=_lrf,
                 warmup_epochs=_warmup_ep,
-                # close_mosaic: если disable_mosaic=True — отключаем полностью.
+                # close_mosaic: если disable_mosaic=True - отключаем полностью.
                 # Используется в Фазах 1/2 для согласованности условий с
                 # историями автоподбора (там тоже close_mosaic=0).
-                # Redmon & Farhadi (2018): мозаика влияет на метрики —
+                # Redmon & Farhadi (2018): мозаика влияет на метрики -
                 # равные условия требуют одинакового режима мозаики.
                 close_mosaic=0 if disable_mosaic else 10,
                 # seed: фиксирует случайность внутри Ultralytics
                 # (инициализация весов, порядок батчей, аугментации).
-                # Dodge & Karam (2017): seed фиксирован → воспроизводимость.
+                # Dodge & Karam (2017): seed фиксирован -> воспроизводимость.
                 seed=seed,
             )
             if use_early_stopping:
                 train_kwargs['patience'] = early_stopping_patience
             else:
                 # patience=0 отключает встроенный ES Ultralytics для честного
-                # SHA-сравнения — Jamieson & Talwalkar (2016) AISTATS 240-248.
+                # SHA-сравнения - Jamieson & Talwalkar (2016) AISTATS 240-248.
                 train_kwargs['patience'] = 0
 
             results = model.train(**train_kwargs)
@@ -632,7 +631,7 @@ def _run_training(
             # Отдельная валидация на нужном сплите (valid для SHA, test для финала)
             best_pt = result_dir / 'run' / 'weights' / 'best.pt'
             eval_model = YOLO(str(best_pt) if best_pt.exists() else f'yolov8{model_size}.pt')
-            # ultralytics принимает только 'val'/'train'/'test' — нормализуем 'valid' → 'val'
+            # ultralytics принимает только 'val'/'train'/'test' - нормализуем 'valid' -> 'val'
             _yolo_split = 'val' if eval_split in ('val', 'valid') else eval_split
             val_res = eval_model.val(
                 data=str(dataset_path / 'data.yaml'),
@@ -644,7 +643,7 @@ def _run_training(
 
             map5095 = float(val_dict.get('metrics/mAP50-95(B)', 0.0))
             map50   = float(val_dict.get('metrics/mAP50(B)',    0.0))
-            # F1 не отдаётся напрямую через results_dict — считаем вручную
+            # F1 не отдаётся напрямую через results_dict - считаем вручную
             # как в YOLOWrapper.extract_metrics() из Модуля 2
             _pre = float(val_dict.get('metrics/precision(B)', 0.0))
             _rec = float(val_dict.get('metrics/recall(B)', 0.0))
@@ -681,7 +680,7 @@ def _run_training(
             wrapper.initialize(num_classes=num_classes)
             wrapper.model.to(device)
 
-            # Базовый lr для SGD — используется и при обычном обучении,
+            # Базовый lr для SGD - используется и при обычном обучении,
             # и при явном сбросе lr после warm-start.
             # He et al. (2016) и стандартная практика детекции: lr=0.005.
             _base_lr = 0.005
@@ -694,23 +693,23 @@ def _run_training(
             )
 
             # Warm-start для Faster R-CNN / RetinaNet.
-            # В отличие от YOLO, здесь нет метаданных эпох в чекпоинте —
+            # В отличие от YOLO, здесь нет метаданных эпох в чекпоинте -
             # чекпоинт содержит только model_state_dict и optimizer_state_dict,
             # сохранённые через wrapper.save() предыдущего прогона.
             #
             # Стратегия аналогична classification_trainer._train_one:
-            # (a) Веса модели — загружаем полностью.
-            # (b) Optimizer state (momentum buffers) — загружаем.
+            # (a) Веса модели - загружаем полностью.
+            # (b) Optimizer state (momentum buffers) - загружаем.
             #     Sutskever et al. (2013) ICML, pp. 1139-1147: накопленные
             #     буферы v_t кодируют направление оптимизации; их потеря
             #     вызывает нестабильность в первых эпохах.
-            # (c) lr — сбрасываем в _base_lr после load_state_dict.
+            # (c) lr - сбрасываем в _base_lr после load_state_dict.
             #     Howard & Ruder (2018) ACL, pp. 328-339: при каждом новом
             #     этапе fine-tuning lr возвращается к начальному значению.
-            # (d) epochs — для Faster R-CNN / RetinaNet число эпох в
+            # (d) epochs - для Faster R-CNN / RetinaNet число эпох в
             #     чекпоинте не хранится, поэтому epochs_delta передаётся
             #     явно из вызывающего кода (quick_train_n передаёт дельту
-            #     аналогично YOLO — ep_b - ep_a).
+            #     аналогично YOLO - ep_b - ep_a).
             #     Li et al. (2018) JMLR 18(185): достаточно стартовать с
             #     обученных весов для стабильного ранжирования Спирмена.
             resume_start_epoch_det = 0
@@ -724,7 +723,7 @@ def _run_training(
                     # (b) Optimizer state (momentum buffers)
                     if 'optimizer_state_dict' in ckpt_det:
                         optimizer.load_state_dict(ckpt_det['optimizer_state_dict'])
-                        # (c) Сброс lr — ПОСЛЕ load_state_dict, иначе будет перезаписан
+                        # (c) Сброс lr - ПОСЛЕ load_state_dict, иначе будет перезаписан
                         for _pg in optimizer.param_groups:
                             _pg['lr'] = _base_lr
                     resume_start_epoch_det = int(ckpt_det.get('epoch', 0))
@@ -736,7 +735,7 @@ def _run_training(
                 except Exception as _re:
                     log_fn(
                         f"  [RESUME] Не удалось загрузить чекпоинт {model_type}: "
-                        f"{_re} — обучаем с нуля"
+                        f"{_re} - обучаем с нуля"
                     )
                     resume_start_epoch_det = 0
 
@@ -757,7 +756,7 @@ def _run_training(
 
             # Сохраняем чекпоинт для следующего warm-start прогона если нужно.
             # Чекпоинт содержит model_state_dict, optimizer_state_dict и номер
-            # последней эпохи — всё необходимое для корректного warm-start.
+            # последней эпохи - всё необходимое для корректного warm-start.
             # keep_weights управляет удалением result_dir в finally ниже;
             # здесь мы дополнительно сохраняем расширенный чекпоинт с
             # optimizer_state_dict (стандартный wrapper.save() его не включает).
@@ -783,7 +782,7 @@ def _run_training(
                 'mAP50':    float(val_metrics.get('mAP50',    0.0)),
                 'f1':       float(val_metrics.get('f1',       0.0)),
                 # Путь к чекпоинту для warm-start следующего прогона.
-                # При keep_weights=False файл не создаётся — пустая строка.
+                # При keep_weights=False файл не создаётся - пустая строка.
                 '_ckpt_path': str(result_dir / 'checkpoint_det.pt') if keep_weights else '',
             }
 
@@ -804,7 +803,7 @@ def _run_training(
         gc.collect()
         # result_dir удаляем только если keep_weights=False (обычный SHA-скрининг).
         # При keep_weights=True (quick_train_n для автоподбора скрининга)
-        # НЕ удаляем — last.pt должен быть доступен для следующего warm-start прогона.
+        # НЕ удаляем - last.pt должен быть доступен для следующего warm-start прогона.
         #
         # Исправление бага: исходный код всегда удалял result_dir, из-за чего
         # ckpt_path в quick_train_n всегда указывал на несуществующий файл и
@@ -818,9 +817,9 @@ def _run_training(
     return metrics
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # ОБУЧЕНИЕ ДО 100% С ИСТОРИЕЙ МЕТРИК (для автоподбора % скрининга)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def _run_training_warmstart(
     dataset_path: Path,
@@ -880,7 +879,7 @@ def _run_training_warmstart(
                 log_fn(f"  [WARMSTART] Загружен checkpoint: {resume_from}")
             else:
                 model = YOLO(f'yolov8{model_size}.pt')
-                log_fn(f"  [WARMSTART] checkpoint не найден — обучение с нуля")
+                log_fn(f"  [WARMSTART] checkpoint не найден - обучение с нуля")
 
             train_kwargs = dict(
                 data=str(yaml_path),
@@ -896,7 +895,7 @@ def _run_training_warmstart(
                 verbose=False,
                 save=True,
                 # resume=False: передаём дельту эпох явно.
-                # resume=True в Ultralytics имеет баг — иногда обучает
+                # resume=True в Ultralytics имеет баг - иногда обучает
                 # неверное число эпох. Дельта + resume=False гарантирует
                 # ровно epochs_delta дополнительных эпох.
                 resume=False,
@@ -969,19 +968,19 @@ def _run_training_full_history(
     mAP50-95 по каждой эпохе в виде списка [ep1, ep2, ..., ep_N].
 
     Используется автоподбором процента скрининга в 6_Объединение.py:
-    вместо нескольких отдельных прогонов (warm-start A→B→C) запускается
+    вместо нескольких отдельных прогонов (warm-start A->B->C) запускается
     один прогон до конца, а пороговые значения N% / N+10% / N+20%
-    извлекаются из истории как max(0..k) — без повторного обучения.
+    извлекаются из истории как max(0..k) - без повторного обучения.
 
     close_mosaic=0: отключает мозаику на последних 10 эпохах (дефолт
     Ultralytics). Без этого кандидаты при разных порогах N% получают
     разное число эпох без мозаики, что создаёт систематическое смещение
     при сравнении max(0..N%) vs max(0..N+10%).
-    Redmon & Farhadi (2018): мозаика меняет распределение входных данных —
+    Redmon & Farhadi (2018): мозаика меняет распределение входных данных -
     её отсутствие на части прогона влияет на финальные метрики.
 
     История читается из results.csv который Ultralytics всегда пишет
-    в result_dir/run/results.csv — по одной строке на эпоху.
+    в result_dir/run/results.csv - по одной строке на эпоху.
 
     Returns:
         List[float]: история mAP50-95 по эпохам (индекс 0 = эпоха 1).
@@ -1033,7 +1032,7 @@ def _run_training_full_history(
 
             # Читаем историю mAP50-95 из results.csv
             # Ultralytics пишет CSV с заголовком; колонка называется
-            # '                  metrics/mAP50-95(B)' (с пробелами — strip нужен)
+            # '                  metrics/mAP50-95(B)' (с пробелами - strip нужен)
             csv_path = result_dir / 'run' / 'results.csv'
             if csv_path.exists():
                 import csv as _csv
@@ -1053,7 +1052,7 @@ def _run_training_full_history(
 
             # Паддинг после ES: если ES остановил обучение раньше epochs,
             # дополняем историю последним реально полученным значением.
-            # Prechelt (1998): ES детектирует плато — после остановки
+            # Prechelt (1998): ES детектирует плато - после остановки
             # метрика не изменилась бы существенно. Паддинг последним
             # значением не вносит новых максимумов в историю, поэтому
             # max(0..N%) для любого порога остаётся корректным.
@@ -1064,7 +1063,7 @@ def _run_training_full_history(
                 padded = epochs - len(history)
                 history.extend([last_val] * padded)
                 log_fn(f"  [HISTORY] ES сработал на эпохе {epochs - padded} "
-                       f"из {epochs} — паддинг {padded} эпох "
+                       f"из {epochs} - паддинг {padded} эпох "
                        f"значением {last_val:.4f} (Prechelt, 1998)")
 
             del model
@@ -1121,7 +1120,7 @@ def _run_training_full_history(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        # result_dir НЕ удаляем — best.pt может понадобиться для финального
+        # result_dir НЕ удаляем - best.pt может понадобиться для финального
         # обучения если этот кандидат окажется победителем Фазы 2.
 
     return history
@@ -1142,7 +1141,7 @@ def _history_score_at(history: List[float], ratio: float) -> float:
         float: max mAP50-95 за первые ratio*N эпох. 0.0 если история пуста.
 
     Научное обоснование использования max:
-    Li et al. (2018) JMLR 18(185): SHA сохраняет лучшего кандидата —
+    Li et al. (2018) JMLR 18(185): SHA сохраняет лучшего кандидата -
     score кандидата определяется его пиковым потенциалом на данном бюджете,
     а не финальным состоянием (которое может быть хуже из-за шума).
     Использование max(0..k) корректно потому что best.pt в обычном
@@ -1156,9 +1155,9 @@ def _history_score_at(history: List[float], ratio: float) -> float:
     return max(history[:k])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # ФИНАЛЬНОЕ ОБУЧЕНИЕ (не удаляет веса, eval на test)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def _run_training_final(
     dataset_path: Path,
@@ -1306,14 +1305,14 @@ def _run_training_final(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        # result_dir НЕ удаляем — веса победителя остаются
+        # result_dir НЕ удаляем - веса победителя остаются
 
     return metrics
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # SHA-ОТСЕВ
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 def sha_prune(
     candidates: List[Pipeline],
@@ -1331,9 +1330,9 @@ def sha_prune(
     return sorted_candidates[:keep_count]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # ОСНОВНОЙ АЛГОРИТМ SFS + SHA
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 @dataclass
 class SearchResult:
@@ -1367,7 +1366,7 @@ def run_sfs_sha_search(
         early_stopping_patience: Patience для early stopping финального обучения
         datasets_global_path: Корневая папка датасетов (из .env).
                               Структура: <datasets_global_path>/m3_runs/<dataset>_<timestamp>/
-                              Если None — берётся из переменной окружения DATASETS_GLOBAL_PATH.
+                              Если None - берётся из переменной окружения DATASETS_GLOBAL_PATH.
         log_fn: Функция логирования
         progress_callback: Колбэк прогресса (iteration, total, stage, message)
 
@@ -1383,7 +1382,7 @@ def run_sfs_sha_search(
         if _env_path:
             datasets_global_path = Path(_env_path)
         else:
-            # Крайний случай — рядом с исходным датасетом
+            # Крайний случай - рядом с исходным датасетом
             datasets_global_path = source_dataset_path.parent
 
     # Формируем уникальную рабочую папку:
@@ -1418,13 +1417,13 @@ def run_sfs_sha_search(
     log_fn(f"Датасет:         {source_dataset_path.name}")
     log_fn(f"Модель:          {model_config.get('type', '?')} {model_config.get('size', '')}")
     log_fn(f"Max epochs:      {max_epochs}")
-    log_fn(f"Fast epochs:     {fast_epochs} (30%, без ES — честное сравнение SHA)")
+    log_fn(f"Fast epochs:     {fast_epochs} (30%, без ES - честное сравнение SHA)")
     log_fn(f"ES patience:     {early_stopping_patience} (только финал)")
     log_fn(f"eta:             {ETA}")
     log_fn(f"epsilon:         {EPSILON}")
     log_fn("")
 
-    # ── ИНИЦИАЛИЗАЦИЯ ──────────────────────────────────────────────────────
+    # -- ИНИЦИАЛИЗАЦИЯ ------------------------------------------------------
     pool = build_candidate_pool()
     pool_by_id = {c['id']: c for c in pool}
 
@@ -1447,7 +1446,7 @@ def run_sfs_sha_search(
     stop_reason = ''
     N = len(pool)
 
-    # ── ИТЕРАЦИИ SFS ──────────────────────────────────────────────────────
+    # -- ИТЕРАЦИИ SFS ------------------------------------------------------
     for iteration in range(1, N + 1):
         log_fn("-" * 70)
         log_fn(f"ИТЕРАЦИЯ {iteration}/{N}")
@@ -1457,7 +1456,7 @@ def run_sfs_sha_search(
             progress_callback(iteration, N, 'expand',
                               f'Итерация {iteration}: расширение кандидатов')
 
-        # ── 1. РАСШИРЕНИЕ ─────────────────────────────────────────────────
+        # -- 1. РАСШИРЕНИЕ -------------------------------------------------
         candidates = []
         for survivor in survivors:
             candidates.append(survivor.clone())
@@ -1486,7 +1485,7 @@ def run_sfs_sha_search(
 
         log_fn(f"Кандидатов после расширения: {len(candidates)}")
 
-        # ── 2. БЫСТРОЕ ОБУЧЕНИЕ ───────────────────────────────────────────
+        # -- 2. БЫСТРОЕ ОБУЧЕНИЕ -------------------------------------------
         log_fn(f"\nБыстрое обучение ({fast_epochs} эп., eval=valid, без ES):")
         for i, candidate in enumerate(candidates):
             log_fn(f"\n  [{i+1}/{len(candidates)}] {candidate.display_name}")
@@ -1519,7 +1518,7 @@ def run_sfs_sha_search(
             log_fn(f"  {i+1:2d}. {c.display_name:45s} "
                    f"score={c.score:.4f}  mAP={c.metrics.get('mAP50-95', 0.0):.4f}{marker}")
 
-        # ── 3. SHA-ОТСЕВ ──────────────────────────────────────────────────
+        # -- 3. SHA-ОТСЕВ --------------------------------------------------
         survivors_new = sha_prune(candidates, eta=ETA)
         eliminated = [c for c in candidates if c not in survivors_new]
 
@@ -1542,7 +1541,7 @@ def run_sfs_sha_search(
         }
         history.append(iter_data)
 
-        # ── 4. КРИТЕРИЙ ОСТАНОВКИ ─────────────────────────────────────────
+        # -- 4. КРИТЕРИЙ ОСТАНОВКИ -----------------------------------------
         if len(survivors_new) == 1:
             best_pipeline = survivors_new[0]
             best_map = best_pipeline.metrics.get('mAP50-95', 0.0)
@@ -1567,7 +1566,7 @@ def run_sfs_sha_search(
             log_fn(f"\n>>> СТОП: {stop_reason}")
             break
 
-    # ── ФИНАЛЬНОЕ ОБУЧЕНИЕ (100% эпох, eval на test) ───────────────────────
+    # -- ФИНАЛЬНОЕ ОБУЧЕНИЕ (100% эпох, eval на test) -----------------------
     log_fn("")
     log_fn("=" * 70)
     log_fn("ФИНАЛЬНОЕ ОБУЧЕНИЕ (100% эпох, eval=test, с early stopping)")
@@ -1603,7 +1602,7 @@ def run_sfs_sha_search(
     best_pipeline.score   = composite_score(final_metrics)
     final_map = final_metrics.get('mAP50-95', 0.0)
 
-    # Удаляем все временные папки кандидатов — оставляем только winner
+    # Удаляем все временные папки кандидатов - оставляем только winner
     log_fn("")
     log_fn("Очистка временных папок кандидатов...")
     for item in work_dir.iterdir():
@@ -1643,85 +1642,3 @@ def run_sfs_sha_search(
         stop_reason=stop_reason,
         winner_dataset_path=winner_dataset_path,
     )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI-ЗАПУСК
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Модуль 3: автоматический подбор пайплайна предобработки (SFS+SHA)'
-    )
-    parser.add_argument('--dataset', required=True,
-                        help='Название датасета (папка в DATASETS_GLOBAL_PATH)')
-    parser.add_argument('--model', default='yolo',
-                        choices=['yolo', 'faster_rcnn', 'retinanet'],
-                        help='Тип proxy-модели')
-    parser.add_argument('--yolo-size', default='n',
-                        choices=['n', 's', 'm', 'l', 'x'],
-                        help='Размер YOLO (только если model=yolo)')
-    parser.add_argument('--epochs', type=int, default=30,
-                        help='Максимальное число эпох для proxy-модели')
-    parser.add_argument('--patience', type=int, default=10,
-                        help='Early stopping patience для финального обучения')
-    parser.add_argument('--output', default='m3_result.json',
-                        help='Файл для сохранения результата')
-
-    args = parser.parse_args()
-
-    try:
-        from Data.Datasets.dataset_work import get_dataset_path
-        dataset_path = get_dataset_path(args.dataset)
-    except ImportError:
-        datasets_root = os.environ.get('DATASETS_GLOBAL_PATH', '.')
-        dataset_path = Path(datasets_root) / args.dataset
-
-    if not dataset_path.exists():
-        print(f"ОШИБКА: Датасет не найден: {dataset_path}")
-        sys.exit(1)
-
-    datasets_global_path = dataset_path.parent
-
-    model_config = {
-        'type': args.model,
-        'size': args.yolo_size,
-    }
-
-    result = run_sfs_sha_search(
-        source_dataset_path=dataset_path,
-        model_config=model_config,
-        max_epochs=args.epochs,
-        early_stopping_patience=args.patience,
-        datasets_global_path=datasets_global_path,
-    )
-
-    output = {
-        'best_pipeline': {
-            'display_name': result.best_pipeline.display_name,
-            'steps': result.best_pipeline.steps,
-            'methods': result.best_pipeline.methods,
-            'params': result.best_pipeline.params,
-        },
-        'best_map_fast': round(result.best_map, 4),
-        'final_map_100pct': round(result.final_map, 4),
-        'final_metrics_test': {k: round(v, 4) for k, v in result.final_metrics_test.items()},
-        'stop_reason': result.stop_reason,
-        'total_iterations': result.total_iterations,
-        'history': result.history,
-        'winner_dataset_path': str(result.winner_dataset_path),
-        'timestamp': datetime.now().isoformat(),
-    }
-
-    with open(args.output, 'w', encoding='utf-8') as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
-
-    print(f"\nРезультат сохранён в: {args.output}")
-    print(f"Датасет-победитель:   {result.winner_dataset_path}")
-    return result
-
-
-if __name__ == '__main__':
-    main()

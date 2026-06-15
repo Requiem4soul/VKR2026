@@ -1,6 +1,5 @@
 """
 Применение предобработки к датасету.
-Поддерживает глобальную и адаптивную (кластерную) стратегии обработки.
 Поддерживает два формата датасетов:
 - YOLO: split/images/*.jpg + split/labels/*.txt + data.yaml
 - Классификация: split/class_name/*.jpg (ImageFolder)
@@ -65,7 +64,7 @@ def _create_dst_structure(src_path: Path, dst_path: Path,
                 import yaml as _yaml
                 with open(src_path / 'data.yaml', 'r', encoding='utf-8') as _f:
                     _yaml_data = _yaml.safe_load(_f)
-                # Относительные пути — работают при любом перемещении датасета
+                # Относительные пути - работают при любом перемещении датасета
                 # (схема аналогична LUNA16: пути относительно data.yaml)
                 _yaml_data.pop('path', None)
                 _yaml_data['train'] = '../train/images'
@@ -151,8 +150,8 @@ class DatasetPreprocessor:
 
         _create_dst_structure(src_path, dst_path, splits, dataset_type)
 
-        # ── RAM-кеш оригинальных изображений ──────────────────────────────
-        # На HDD чтение тысяч мелких файлов — основное узкое место.
+        # -- RAM-кеш оригинальных изображений ------------------------------
+        # На HDD чтение тысяч мелких файлов - основное узкое место.
         # Читаем все изображения один раз в RAM, повторные вызовы берут из кеша.
         # Лимит: 70% от реально доступной памяти (psutil.virtual_memory().available).
         # available уже учитывает кеш ОС который может быть освобождён при нужде.
@@ -190,7 +189,7 @@ class DatasetPreprocessor:
                             _img_cache[str(_fp)] = _img
                     print(f"  [RAM-кеш] Закешировано {len(_img_cache)} изображений")
                 else:
-                    print(f"  [RAM-кеш] Пропуск — датасет {_total_gb:.2f} GB"
+                    print(f"  [RAM-кеш] Пропуск - датасет {_total_gb:.2f} GB"
                           f" > лимит {_ram_limit_gb:.1f} GB, читаем с диска")
 
         for split in splits:
@@ -223,7 +222,7 @@ class DatasetPreprocessor:
                     image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
                     if image is None:
                         continue
-                    # Убираем alpha-канал если есть (BGRA → BGR).
+                    # Убираем alpha-канал если есть (BGRA -> BGR).
                     if image.ndim == 3 and image.shape[2] == 4:
                         image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
                     # Конвертируем 16-битные изображения в 8-битные.
@@ -247,150 +246,3 @@ class DatasetPreprocessor:
         # Освобождаем RAM-кеш
         if _img_cache:
             _img_cache.clear()
-
-    def apply_adaptive_preprocessing(
-            self,
-            source_dataset: str,
-            target_dataset: str,
-            clusters: Dict[int, Dict],
-            image_metrics: List,
-            params: Optional[Dict[str, Dict[str, Any]]] = None,
-            splits: List[str] = ['train', 'valid', 'test']
-    ):
-        """
-        Применяет разную предобработку к разным кластерам.
-
-        Args:
-            source_dataset: Название исходного датасета
-            target_dataset: Название нового датасета
-            clusters: Словарь с кластерами и их методами обработки
-            image_metrics: Метрики изображений (для автоопределения шума)
-            params: Параметры для методов (общие для всех кластеров)
-            splits: Какие splits обрабатывать
-        """
-        src_path = get_dataset_path(source_dataset)
-        dst_path = get_dataset_path(target_dataset)
-        dataset_type = _detect_dataset_type(src_path)
-
-        print(f"\nПрименяем адаптивную предобработку:")
-        print(f"  Тип датасета: {dataset_type}")
-        print(f"  Кластеров: {len(clusters)}")
-
-        if dst_path.exists():
-            shutil.rmtree(dst_path)
-
-        _create_dst_structure(src_path, dst_path, splits, dataset_type)
-
-        # Обрабатываем train split по кластерам
-        src_train_dir = src_path / 'train'
-        dst_train_dir = dst_path / 'train'
-        image_files = _collect_image_files(src_train_dir)
-
-        for cluster_id, cluster_info in clusters.items():
-            cluster_methods = cluster_info['preprocessing']
-            indices = cluster_info['image_indices']
-
-            print(f"\nКластер {cluster_id}: {len(indices)} изображений")
-            print(f"  Методы: {', '.join(cluster_methods) if cluster_methods else 'нет обработки'}")
-
-            for idx in tqdm(indices, desc=f"Cluster {cluster_id}"):
-                img_path = image_files[idx]
-                img_metrics = image_metrics[idx]
-
-                # Читаем в оригинальном формате: цветные датасеты остаются RGB,
-                # grayscale остаются grayscale. IMREAD_GRAYSCALE теряет
-                # цветовую информацию что критично для цветных датасетов.
-                image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
-                if image is None:
-                    continue
-                # Убираем alpha-канал если есть (BGRA → BGR).
-                if image.ndim == 3 and image.shape[2] == 4:
-                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-                # Конвертируем 16-битные изображения в 8-битные (см. выше).
-                if image.dtype == np.uint16:
-                    image = cv2.convertScaleAbs(image, alpha=255.0 / 65535.0)
-
-                if cluster_methods:
-                    combined_params = self._build_params_for_image(
-                        cluster_methods,
-                        img_metrics,
-                        params
-                    )
-                    processed = self.methods.apply_pipeline(image, cluster_methods, combined_params)
-                else:
-                    processed = image
-
-                out_path = _dst_image_path(img_path, src_train_dir, dst_train_dir)
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(out_path), processed)
-
-                # Копируем label только для YOLO
-                if dataset_type == 'yolo':
-                    label_src = src_train_dir / 'labels' / (img_path.stem + '.txt')
-                    if label_src.exists():
-                        label_dst = dst_train_dir / 'labels' / label_src.name
-                        shutil.copy(label_src, label_dst)
-
-        # Копируем valid и test без изменений
-        for split in ['valid', 'test']:
-            src_split = src_path / split
-            if src_split.exists():
-                self._copy_split_as_is(src_path, dst_path, split, dataset_type)
-
-        print(f"\nГотово! Датасет сохранён в {dst_path}")
-
-    def _copy_split_as_is(self, src_path: Path, dst_path: Path,
-                           split: str, dataset_type: str = 'yolo'):
-        """Копирует split без изменений."""
-        if dataset_type == 'yolo':
-            for subfolder in ['images', 'labels']:
-                src_dir = src_path / split / subfolder
-                dst_dir = dst_path / split / subfolder
-                if src_dir.exists():
-                    dst_dir.mkdir(parents=True, exist_ok=True)
-                    for file in src_dir.iterdir():
-                        shutil.copy(file, dst_dir / file.name)
-        else:
-            # Классификация: копируем всё дерево рекурсивно
-            src_split_dir = src_path / split
-            dst_split_dir = dst_path / split
-            if src_split_dir.exists():
-                if dst_split_dir.exists():
-                    shutil.rmtree(dst_split_dir)
-                shutil.copytree(src_split_dir, dst_split_dir)
-
-    def _build_params_for_image(
-        self,
-        methods: List[str],
-        img_metrics,
-        global_params: Optional[Dict]
-    ) -> Dict:
-        """
-        Строит параметры с учётом характеристик конкретного изображения.
-        Объединяет глобальные параметры из правил с поправками на метрики изображения.
-        """
-        combined_params = global_params.copy() if global_params else {}
-
-        if 'denoise' in methods:
-            if 'denoise' not in combined_params:
-                combined_params['denoise'] = {}
-
-            combined_params['denoise']['noise_type'] = img_metrics.noise_type
-            combined_params['denoise']['noise_level'] = img_metrics.noise_level
-
-            if 'method' not in combined_params['denoise']:
-                # Wiener заменяет NLM: сопоставимое качество при
-                # на порядок меньших вычислениях.
-                # Fan et al. (2019); Wiener (1949).
-                noise_to_method = {
-                    'gaussian': 'bilateral',
-                    'salt_pepper': 'median',
-                    'poisson': 'wiener',
-                    'speckle': 'median'
-                }
-                combined_params['denoise']['method'] = noise_to_method.get(
-                    img_metrics.noise_type,
-                    'median'
-                )
-
-        return combined_params
