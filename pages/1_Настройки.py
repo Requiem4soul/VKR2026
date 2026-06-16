@@ -1,7 +1,3 @@
-"""
-pages/1_Настройки.py — Настройка пути к датасетам
-"""
-
 import streamlit as st
 from pathlib import Path
 from ui.state import (

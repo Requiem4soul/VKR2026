@@ -1,7 +1,3 @@
-"""
-ui/sidebar.py — Общий сайдбар для всех страниц
-"""
-
 import os
 import signal
 import streamlit as st

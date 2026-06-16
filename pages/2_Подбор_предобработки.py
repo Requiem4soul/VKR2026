@@ -1,48 +1,3 @@
-"""
-pages/2_Подбор_предобработки.py — Подбор пайплайна предобработки
-
-Алгоритм: Group-wise SHA (Фаза 1) + SFS+SHA на survivors (Фаза 2)
-
-Тип датасета задаётся вручную пользователем:
-    Для медицинских снимков и SAR применяются правила PreprocessingRules —
-    группы методов, запрещённые для данной модальности, исключаются из
-    CANDIDATE_GROUPS до начала Фазы 1.
-    Для натуральных изображений и «другой модальности» используется
-    чистый SHA+SFS без фильтрации.
-
-    Научное обоснование фильтрации по модальности:
-    - SAR: Oliver & Quegan (2004) — brightness/sharpening искажают физическую информацию
-    - Medical: Pisano et al. (1998) J.Digital Imaging 11(4):193-200; Pisano et al. (2000) RadioGraphics 20:1479-1491
-    - Microscopy: Kolarević et al. (2018) Journal of Microscopy 269(3):264-276; Sternberg (1983) Computer 16(1):22-34
-
-Научное обоснование:
-- SHA:  Jamieson & Talwalkar (2016) "Non-stochastic best arm identification",
-        AISTATS, pp. 240–248
-- SFS:  Kohavi & John (1997) "Wrappers for feature subset selection",
-        Artificial Intelligence, 97(1-2), 273–324
-- Двухфазная группировка методов перед отбором:
-        Guyon & Elisseeff (2003) "An Introduction to Variable and Feature Selection",
-        Journal of Machine Learning Research, 3, 1157–1182
-        Liu & Motoda (2007) "Computational Methods of Feature Selection",
-        Chapman and Hall/CRC, ISBN 978-1584888789
-- 30% эпох для быстрой оценки кандидатов:
-        Jamieson & Talwalkar (2016), ibid.
-- Воспроизводимость через seed:
-        Dodge & Karam (2017) "A Study and Comparison of Human and
-        Deep Learning Recognition Performance Under Visual Distortions"
-
-Отличие от Модуля 3 (SFS+SHA на полном пуле):
-    Данный модуль делит пул на тематические группы (шум, контраст, яркость, резкость),
-    проводит SHA-скрининг внутри каждой группы (Фаза 1), сокращая пул до survivors,
-    и лишь затем запускает SFS+SHA только на survivors (Фаза 2).
-    Компромисс: возможна частичная потеря межгрупповых взаимодействий на Фазе 1,
-    выигрыш — значительное сокращение числа обучений относительно Модуля 3.
-
-Обязательная очистка памяти после каждого обучения:
-    После каждой модели: del model, torch.cuda.empty_cache(), gc.collect()
-    Аналогично classification_trainer.py (Модуль 2).
-"""
-
 import gc
 import os
 import sys
@@ -80,19 +35,16 @@ if not is_path_configured():
     st.error("Сначала настрой путь к датасетам в разделе **Настройки**.")
     st.stop()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# СОСТОЯНИЕ СТРАНИЦЫ
-# ══════════════════════════════════════════════════════════════════════════════
+# Состояние странциы
 
 _STATE_DEFAULTS = {
     "p2_stage":          "configure",   # configure | running | done
-    # Модальный анализ (6_Объединение.py)
     "p2_use_modality":   True,
-    "p2_manual_modality": "other",  # одна из модальностей или "other" (все методы)
+    "p2_manual_modality": "other",
     "p2_use_wiener":     False,
-    "p2_sha_fallback":   False,   # SHA без baseline-фильтра если Фаза 1 пуста
+    "p2_sha_fallback":   False,
     "p2_use_torch_compile": True,
-    "p2_modality_result": None,   # результат анализа модальности
+    "p2_modality_result": None,
     "p2_log_lines":      [],
     "p2_output_queue":   None,
     "p2_thread_done":    False,
@@ -120,10 +72,10 @@ _STATE_DEFAULTS = {
     "p2_winner_ds":      None,
     # Автоподбор процента скрининга
     "p2_auto_screen":         False,   # включить автоподбор
-    "p2_auto_screen_start":   40,      # начальный % (пользователь задаёт)
-    "p2_auto_screen_direction": "top_down",  # направление поиска: top_down / bottom_up / full_budget / warm_start
-    "p2_history_csv_content":   "",          # содержимое загруженного CSV истории
-    "p2_top_k_winners":       1,       # сколько топ-survivors обучать финально
+    "p2_auto_screen_start":   40,      # начальный ограниченный бюджет
+    "p2_auto_screen_direction": "top_down",  # метод поиска
+    "p2_history_csv_content":   "",          # содержимое загруженного CSV
+    "p2_top_k_winners":       1,       # сколько финалистов будет обучено
 }
 for _k, _v in _STATE_DEFAULTS.items():
     if _k not in st.session_state:
@@ -134,17 +86,6 @@ def _reset():
     for k, v in _STATE_DEFAULTS.items():
         st.session_state[k] = v
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ОПИСАНИЕ ГРУПП МЕТОДОВ (пул кандидатов)
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Группы сформированы по типу воздействия на изображение.
-# Параметры выбраны на основе:
-#   Gonzalez & Woods (2018) "Digital Image Processing", 4th ed.
-#   Tomasi & Manduchi (1998) "Bilateral filtering for gray and color images", ICCV.
-#   Pisano et al. (1998) "Contrast Limited Adaptive Histogram Equalization",
-#       J. Digital Imaging, 11(4), 193–200.
 
 CANDIDATE_GROUPS = {
     "denoise": {
@@ -213,26 +154,6 @@ CANDIDATE_GROUPS = {
                 "params": {"denoise": {"method": "lee", "ksize": 5}},
             },
         ],
-        # Пул шумоподавления покрывает три классических пространственных фильтра
-        # (базовый набор, всегда активен):
-        #   Median    — импульсный шум (salt & pepper). Gonzalez & Woods (2018).
-        #   Gaussian  — равномерный фоновый шум, speckle. Gonzalez & Woods (2018).
-        #   Bilateral — Gaussian шум с сохранением краёв. Tomasi & Manduchi (1998).
-        # Wiener (опционально, включается пользователем):
-        #   Wiener    — адаптивный линейный фильтр, минимизирует MSE.
-        #               Wiener (1949); Fan et al. (2019) "Brief review of image
-        #               denoising techniques", Visual Computing for Industry,
-        #               Biomedicine, and Art, 2(1).
-        #               Исключён по умолчанию: scipy.signal.wiener реализован на
-        #               Python без SIMD-оптимизации — ~1–1.5 сек/изображение vs
-        #               ~3–8 мс для OpenCV-фильтров. На датасетах >10k изображений
-        #               применение Wiener увеличивает время предобработки на часы.
-        # Lee — специализированный фильтр для мультипликативного speckle-шума SAR.
-        #   Lee (1980) IEEE Trans. PAMI-2(2):165-168;
-        #   Lee (1981) Comput. Graph. Image Process. 17(1):24-32.
-        #   Включён в базовый пул: реализован через numpy/cv2, быстрый (~5-10 мс).
-        # NLM исключён: O(N²) сложность непрактична для SHA-скрининга.
-        # Jamieson & Talwalkar (2016) — бюджет на обучение, не предобработку.
     },
     "contrast": {
         "label": "Контраст",
@@ -285,15 +206,6 @@ CANDIDATE_GROUPS = {
                 "params": {"brightness_correction": {"gamma": 1.2}},
             },
         ],
-        # Гамма-коррекция — нелинейное степенное преобразование яркости.
-        # gamma < 1 осветляет (подтягивает тёмные области),
-        # gamma > 1 затемняет (подавляет пересветы).
-        # Три значения покрывают типичные проблемы датасетов:
-        #   γ=0.5 — сильное осветление (недоэкспонированные изображения)
-        #   γ=0.8 — мягкая коррекция (слегка тёмные датасеты)
-        #   γ=1.2 — мягкое затемнение (слегка пересвеченные датасеты)
-        # Реализация через LUT — O(1) на пиксель, очень быстро.
-        # Gonzalez & Woods (2018) "Digital Image Processing", 4th ed., гл. 3.2.
     },
     "sharpening": {
         "label": "Резкость",
@@ -321,14 +233,11 @@ CANDIDATE_GROUPS = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ АЛГОРИТМА
-# ══════════════════════════════════════════════════════════════════════════════
+# Утилиты
 
 def sha_prune(candidates: List[Dict], eta: int = 2) -> List[Dict]:
     """
-    Successive Halving: оставляет top-ceil(N/eta) кандидатов по score.
-    Jamieson & Talwalkar (2016) "Non-stochastic best arm identification", AISTATS.
+    SHA отсев
     """
     n = len(candidates)
     keep = math.ceil(n / eta)
@@ -339,21 +248,7 @@ def sha_prune(candidates: List[Dict], eta: int = 2) -> List[Dict]:
 
 def _spearman_rho(scores_a: Dict[str, float], scores_b: Dict[str, float]) -> float:
     """
-    Коэффициент ранговой корреляции Спирмена между двумя наборами scores.
-
-    Принимает словари {candidate_id: score} для двух прогонов.
-    Учитывает только общие ключи (кандидаты присутствующие в обоих прогонах).
-
-    Используется для автоподбора процента скрининга:
-    если ρ(x%, x+10%) >= критического значения, то x% достаточно.
-
-    Научное обоснование:
-    Li et al. (2018) "Hyperband", JMLR 18(185): warm-start successive
-    halving с бюджетным ранжированием.
-
-    Returns:
-        float: ρ ∈ [-1, 1]. 1.0 — идеальное совпадение рангов.
-               0.0 если менее 2 общих кандидатов (нет смысла считать).
+    Коэффициент ранговой корреляции Спирмена
     """
     # Общие ключи
     common_keys = [k for k in scores_a if k in scores_b]
@@ -382,25 +277,7 @@ def _spearman_rho(scores_a: Dict[str, float], scores_b: Dict[str, float]) -> flo
 
 def _spearman_critical_rho(n: int, alpha: float = 0.05) -> float:
     """
-    Критическое значение ρ Спирмена для заданного N и уровня значимости α.
-
-    Вычисляется через обратное t-распределение:
-      t_crit = t_{α/2, n-2}
-      ρ_crit = t_crit / sqrt(t_crit² + n - 2)
-
-    Zar J.H. (2005) "Spearman Rank Correlation", Encyclopedia of
-    Biostatistics, Wiley. DOI: 10.1002/0470011815.b2a15150.
-
-    Ramsey P.H. (1989) "Critical Values for Spearman's Rank Order
-    Correlation", J. Educational Statistics, 14(3), 245–253.
-
-    Args:
-        n:     число наблюдений (кандидатов)
-        alpha: уровень значимости (двусторонний тест). 0.05 → p < 0.05.
-
-    Returns:
-        ρ_crit: минимальное значение |ρ| для статистической значимости.
-                При n < 4 возвращает 1.0 (невозможно достичь значимости).
+    Критическое значение ρ Спирмена для заданного N и уровня значимости α
     """
     if n < 4:
         return 1.0
@@ -418,40 +295,19 @@ def _spearman_critical_rho(n: int, alpha: float = 0.05) -> float:
     _d1, _d2, _d3 = 1.432788, 0.189269, 0.001308
     z = _t - (_c0 + _c1 * _t + _c2 * _t ** 2) / (1 + _d1 * _t + _d2 * _t ** 2 + _d3 * _t ** 3)
 
-    # Cornish-Fisher поправка для t-распределения (малые df)
-    # Johnson N.L. et al. (1995) "Continuous Univariate Distributions", Vol.2, Wiley.
+    # Поправка для t-распределения (малые df)
     g1 = (z ** 3 + z) / (4 * df)
     g2 = (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * df ** 2)
     t_crit = z + g1 + g2
 
-    # ρ_crit из t_crit: Zar (2005), формула обратного преобразования
+    # Формула обратного преобразования
     rho_crit = t_crit / math.sqrt(t_crit ** 2 + df)
     return round(min(rho_crit, 0.99), 4)  # cap at 0.99 для n=4
 
 
 def _check_flat_scores(scores: Dict[str, float], log_fn=None) -> bool:
     """
-    Проверяет являются ли scores кандидатов «плоскими» (слишком близкими).
-
-    Если коэффициент вариации (CV = stdev/mean) ниже порога, ранжирование
-    нестабильно: стохастический шум обучения превышает различия между
-    кандидатами, и Спирмен ρ не может сойтись ни при каком числе эпох.
-
-    Порог CV < 1.5% выбран эмпирически: при типичном шуме YOLO ±0.005–0.01
-    по composite score, spread < 0.02 делает ранги случайными.
-
-    Научное обоснование:
-    Audibert, Bubeck & Munos (2010) "Best Arm Identification in Multi-Armed
-    Bandits", COLT 2010: при ε-close arms (разница между arms < ε) число
-    сэмплов для идентификации лучшего растёт как O(1/ε²). При ε→0
-    идентификация требует бесконечного бюджета.
-
-    Args:
-        scores: словарь {candidate_id: score}
-        log_fn: функция логирования
-
-    Returns:
-        True если scores плоские (предобработка не даёт значимого эффекта).
+    Проверяет являются ли scores кандидатов слишком близкими
     """
     import statistics
 
@@ -482,16 +338,7 @@ def _check_flat_scores(scores: Dict[str, float], log_fn=None) -> bool:
 
 def merge_methods_params(candidates: List[Dict]) -> Tuple[List[str], Dict]:
     """
-    Объединяет методы и параметры нескольких кандидатов в один пайплайн.
-
-    Поддерживает несколько кандидатов из одной группы (например два denoise-фильтра
-    последовательно): Gaussian k3 → Wiener s3 — легитимная комбинация для смешанного
-    шума (Gonzalez & Woods, 2018; PMC7036412).
-
-    Возвращает:
-        methods: список шагов вида "denoise__0", "denoise__1", ...
-                 (уникальные ключи для apply_pipeline)
-        params:  {"denoise__0": {...}, "denoise__1": {...}, ...}
+    Создание комбинаций методов для датасета
     """
     methods = []
     params = {}
@@ -511,25 +358,7 @@ def merge_methods_params(candidates: List[Dict]) -> Tuple[List[str], Dict]:
 
 def score_from_metrics(metrics: Dict) -> float:
     """
-    Скалярная оценка для ранжирования кандидатов предобработки.
-
-    Используется одна метрика — стандарт соответствующей задачи:
-
-    Классификация: AUC (Area Under ROC Curve).
-      Huang & Ling (2005) "Using AUC and Accuracy in Evaluating Learning
-      Algorithms", IEEE TKDE, 17(3): AUC консистентнее и дискриминативнее
-      Accuracy для сравнения моделей. Инвариантен к порогу и дисбалансу.
-      Bradley (1997) Pattern Recognition, 30(7): AUC предпочтительнее
-      для ранжирования классификаторов.
-
-    Детекция: mAP50-95 (COCO primary metric).
-      Lin et al. (2014) "Microsoft COCO", ECCV: mAP усреднённый по IoU
-      от 0.50 до 0.95 — основная метрика для ранжирования детекторов.
-      Используется во всех крупных бенчмарках (COCO, LVIS, Open Images).
-
-    Остальные метрики (mAP50, F1, precision, recall, accuracy)
-    сохраняются в метриках и отображаются в таблицах результатов,
-    но не участвуют в ранжировании.
+    Оценка для ранжирования кандидатов предобработки
     """
     if metrics is None:
         return 0.0
@@ -542,13 +371,7 @@ def score_from_metrics(metrics: Dict) -> float:
     return float(metrics.get("mAP50-95", 0.0))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ЯДРО АЛГОРИТМА (запускается в фоновом потоке)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# АНАЛИЗ МОДАЛЬНОСТИ (опциональный предшественник Фазы 1)
-# ══════════════════════════════════════════════════════════════════════════════
+# Начало
 
 # Типы для которых правила содержательны и применяются
 _MODALITY_FILTER_TYPES = {"medical_xray", "sar", "microscopy"}
@@ -564,17 +387,6 @@ _GROUP_TO_METHOD = {
     "sharpening": "sharpening",
 }
 
-# Кандидаты группы denoise запрещённые для конкретных модальностей.
-# Основание:
-#   SAR    — Gaussian/Bilateral не учитывают мультипликативную природу speckle;
-#            Lee фильтр разработан именно для мультипликативного шума SAR.
-#            Lee J.S. (1980) IEEE Trans. PAMI-2(2):165-168;
-#            Lee J.S. (1981) Comput. Graph. Image Process. 17(1):24-32.
-#            Lee фильтр не применяется к non-SAR модальностям т.к. там шум
-#            аддитивный (Gaussian/Poisson) — мультипликативная модель некорректна.
-#   microscopy — Gaussian blur размывает мелкие клеточные структуры (ядра,
-#            митозы) критичные для гистопатологической классификации.
-#            Kolarević et al. (2018) Journal of Microscopy 269(3):264-276.
 _MODALITY_DENIED_CANDIDATES: Dict[str, set] = {
     "sar":        {"gaussian_k3", "gaussian_k5", "bilateral_s75", "bilateral_s150"},
     "microscopy": {"gaussian_k3", "gaussian_k5", "lee_k3", "lee_k5"},
@@ -587,22 +399,9 @@ _MODALITY_DENIED_CANDIDATES: Dict[str, set] = {
 def _get_active_candidate_groups(modality_result: Optional[Dict],
                                   use_wiener: bool = False) -> Dict:
     """
-    Возвращает CANDIDATE_GROUPS с учётом трёх фильтров:
-    1. Модальность — исключает группы методов запрещённые для типа датасета.
-    2. Модальность — исключает конкретных кандидатов внутри группы denoise
-                     (например Gaussian для SAR, Lee для non-SAR модальностей).
-    3. use_wiener  — если False, удаляет кандидатов wiener_s3 и wiener_s5
-                     из группы denoise.
-
-    Аргументы:
-        modality_result: результат анализа модальности или None
-        use_wiener: включить ли Wiener-фильтры в пул кандидатов.
-            По умолчанию False — Wiener реализован через scipy.signal.wiener
-            без SIMD-оптимизации (~1–1.5 сек/изображение против ~3–8 мс для
-            OpenCV-фильтров). На датасетах >10k изображений это критично.
-            Fan et al. (2019); сравнительный анализ скорости OpenCV vs scipy.
+    Работа с модальностью
     """
-    # Шаг 1: фильтр по модальности (исключение групп целиком)
+    # Фильтр по модальности
     if modality_result is None or not modality_result.get("apply_filter", False):
         groups = CANDIDATE_GROUPS
     else:
@@ -610,11 +409,10 @@ def _get_active_candidate_groups(modality_result: Optional[Dict],
         groups = {k: v for k, v in CANDIDATE_GROUPS.items() if k not in excluded} \
             if excluded else CANDIDATE_GROUPS
 
-    # Шаг 2: фильтр кандидатов внутри denoise по модальности
     modality = (modality_result or {}).get("modality", "")
     denied_ids = _MODALITY_DENIED_CANDIDATES.get(modality, set())
 
-    # Шаг 3: фильтр Wiener
+    # вкл/выкл фильтр Винера
     wiener_ids = set() if use_wiener else {"wiener_s3", "wiener_s5"}
 
     # Объединяем все исключения для denoise
@@ -638,17 +436,6 @@ def _get_active_candidate_groups(modality_result: Optional[Dict],
 def _run_search(q: queue.Queue, config: Dict):
     """
     Полный цикл двухфазного поиска. Запускается в отдельном потоке.
-
-    Алгоритм: Group-wise SHA (Фаза 1) + SFS+SHA на survivors (Фаза 2).
-    Поддерживает классификацию (ClassificationTrainer) и детекцию
-    (YOLO / Faster R-CNN / RetinaNet через _run_training из module3).
-
-    Научное обоснование:
-    - Guyon & Elisseeff (2003) JMLR 3:1157-1182  — двухфазная группировка
-    - Liu & Motoda (2007) Chapman&Hall/CRC ISBN 978-1584888789 — группировка
-    - Jamieson & Talwalkar (2016) AISTATS 240-248 — SHA, 30% эпох
-    - Kohavi & John (1997) AI 97(1-2):273-324     — SFS
-    - Dodge & Karam (2017) CVPRW                  — seed фиксация
     """
 
     def log(msg: str):
@@ -681,7 +468,7 @@ def _run_search(q: queue.Queue, config: Dict):
         max_epochs   = config["epochs"]
         patience     = config["patience"]
 
-        # ── Параметры модели ───────────────────────────────────────────────
+        # Параметры модели
         if task == "classification":
             model_type = config["model_type"]
             imgsz      = config["imgsz"]
@@ -718,18 +505,14 @@ def _run_search(q: queue.Queue, config: Dict):
         fast_epochs     = max(1, int(max_epochs * (screening_ratio / 100)))
         datasets_path = Path(config["datasets_path"])
 
-        # Рабочая папка запуска — хранит временные датасеты и финальные веса
+        # Рабочая папка запуска
         ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
         work_dir = datasets_path / "p2_runs" / f"{dataset_name}_{ts}"
         work_dir.mkdir(parents=True, exist_ok=True)
 
         set_global_seed(seed)
 
-        # ── Прогрев GPU (warm-up) ──────────────────────────────────────────
-        # Первый forward+backward pass на GPU инициализирует CUDA-буферы и
-        # JIT-кеш torch.compile — без этого первый кандидат получает другой
-        # score из-за недетерминированной инициализации.
-        # Занимает ~2-5 сек. Dodge & Karam (2017) — воспроизводимость в DL.
+        # Прогрев GPU чтобы была воспроизводимость
         try:
             import torch as _tw
             if _tw.cuda.is_available():
@@ -756,15 +539,12 @@ def _run_search(q: queue.Queue, config: Dict):
 
         preprocessor = DatasetPreprocessor()
 
-        # ══════════════════════════════════════════════════════════════════
-        # ВНУТРЕННИЕ УТИЛИТЫ
-        # ══════════════════════════════════════════════════════════════════
+        # Вспомогательные функции
 
         def _make_tmp_ds(candidate_id: str, methods: List[str],
                          params: Dict) -> str:
             """
-            Создаёт временный предобработанный датасет.
-            Возвращает его имя (для get_dataset_path).
+            Создаёт временный предобработанный датасет
             """
             safe_id = candidate_id[:35].replace("+", "_").replace(" ", "_")
             ds_name = f"_p2tmp_{dataset_name}_{safe_id}_{ts}"
@@ -773,19 +553,20 @@ def _run_search(q: queue.Queue, config: Dict):
                 target_dataset=ds_name,
                 methods=methods,
                 params=params,
+                target_path=datasets_path / ds_name,
             )
             return ds_name
 
         def _cleanup_ds(ds_name: str):
             """Удаляет временный датасет."""
             try:
-                p = get_dataset_path(ds_name)
+                p = datasets_path / ds_name
                 if p.exists():
                     _shutil.rmtree(p)
             except Exception:
                 pass
 
-        # ── Обучение для классификации ─────────────────────────────────────
+        # Обучение для классификации
 
         def _train_cls(ds_name: str, epochs: int, use_es: bool,
                        name_suffix: str,
@@ -793,23 +574,7 @@ def _run_search(q: queue.Queue, config: Dict):
                        return_last: bool = False,
                        return_history: bool = False):
             """
-            Обучает ClassificationTrainer. Возвращает лучшие метрики.
-            Очистка памяти гарантирована в finally ClassificationTrainer._train_one.
-
-            checkpoint_interval:
-            - Быстрое обучение (use_es=False, SHA-скрининг): чекпоинты не нужны,
-              ставим epochs чтобы сохранить только финальный.
-            - Финальное обучение (use_es=True): сохраняем лучший чекпоинт для ES,
-              но не чаще чем раз в 10 эпох — избегаем лишних записей на диск.
-
-            resume_from_path: путь к чекпоинту для warm-start (автоподбор скрининга).
-            return_last: если True — возвращает метрики последней эпохи, а не лучшей.
-                Используется автоподбором скрининга (quick_train_n) при warm-start:
-                при max(history) с warm-start запись прогона A включается в историю
-                и max всегда возвращает score ≥ прогона A, даже если дообучение
-                ничего не улучшило. Это даёт ρ=1.0 тривиально — ложное подтверждение.
-                return_last решает проблему: score отражает реальное состояние
-                модели после дополнительных эпох.
+            Обучает ClassificationTrainer. Возвращает лучшие метрики
             """
             _cfg = {
                 **_model_cfg_base,
@@ -844,21 +609,17 @@ def _run_search(q: queue.Queue, config: Dict):
                 return {}
 
             if return_last:
-                # Для автоподбора скрининга: метрики последней реально
-                # обученной эпохи (не из чекпоинта warm-start).
-                # Исключаем записи с _from_checkpoint=True.
+                # Загрузка последней эпохи и результатов
                 real_epochs = [h for h in history if not h.get('_from_checkpoint')]
                 result = real_epochs[-1] if real_epochs else history[-1]
             else:
-                # Для Фазы 1 / финала: лучший результат за всю историю.
+                # Лучший результат за историю
                 result = max(history, key=lambda x: x.get("val_auc", x.get("val_acc", 0.0)))
 
-            # Возвращаем также путь к чекпоинту для возможного warm-start
+            # Возвращаем путь к чекпоинту
             result["_ckpt_path"] = trainer.last_checkpoint_paths.get(_key, "")
 
             if return_history:
-                # Полная per-epoch история AUC (без записей warm-start и дубля
-                # run_training) — используется для построения графика обучения.
                 _auc_hist = [
                     float(h.get("val_auc", h.get("auc", 0.0)))
                     for h in history
@@ -874,28 +635,7 @@ def _run_search(q: queue.Queue, config: Dict):
                        resume: str = '',
                        final: bool = False) -> Dict:
             """
-            Обучает детекционную модель через _run_training / _run_training_final.
-
-            Параметр final=True: финальное обучение победителя.
-                Вызывает _run_training_final (ES включён, eval на test,
-                result_dir не удаляется — веса сохраняются).
-                Используется из full_train.
-
-            Параметр final=False (по умолчанию): скрининговое обучение.
-                Вызывает _run_training с keep_weights и resume.
-                keep_weights=True  → result_dir НЕ удаляется (last.pt нужен
-                                     для следующего warm-start прогона).
-                keep_weights=False → result_dir удаляется (экономия места).
-                Используется из quick_train (без warm-start) и
-                quick_train_n (с warm-start, keep_weights=True).
-
-            Исправление бага: исходный код при keep_weights=True всегда
-            вызывал _run_training_final, которая игнорирует resume и
-            обучает с нуля. Прогон B автоподбора скрининга попадал туда
-            и получал обучение с 0% вместо дообучения с N%.
-            Теперь final=False → всегда _run_training с корректным resume.
-            Jamieson & Talwalkar (2016) AISTATS 240-248: warm-start SHA
-            требует сохранения и загрузки весов предыдущего прогона.
+            Обучает детекционную модель через _run_training / _run_training_final
             """
             from module3_preprocessing_search import (
                 _run_training,
@@ -905,9 +645,7 @@ def _run_search(q: queue.Queue, config: Dict):
             result_dir = work_dir / result_subdir
 
             if final:
-                # Финальное обучение победителя: ES включён, eval на test.
-                # resume здесь не нужен — победитель обучается с нуля на
-                # полном числе эпох с early stopping.
+                # Финальное обучение победителя
                 metrics = _run_training_final(
                     dataset_path=ds_path,
                     model_config=_model_cfg_base,
@@ -919,11 +657,6 @@ def _run_search(q: queue.Queue, config: Dict):
                     seed=seed,
                 )
             else:
-                # Скрининговое обучение (SHA или warm-start автоподбора).
-                # resume_from передаётся только для warm-start (прогон B).
-                # keep_weights=True → result_dir не удаляется, last.pt
-                # остаётся для следующего warm-start.
-                # keep_weights=False → result_dir удаляется после обучения.
                 metrics = _run_training(
                     dataset_path=ds_path,
                     model_config=_model_cfg_base,
@@ -941,25 +674,9 @@ def _run_search(q: queue.Queue, config: Dict):
                 )
             return metrics
 
-        # ── Универсальные quick_train / full_train ─────────────────────────
-
         def quick_train(ds_name: str, label: str) -> float:
             """
-            Быстрое обучение (screening_ratio% эпох) для Фазы 1 и Фазы 2.
-
-            Классификация: ES выключен — история единая, max(history)
-            корректно отражает пик кандидата.
-
-            Детекция (YOLO): ES включён с patience из UI.
-            Обоснование: каждый вызов model.train() независим, best.pt
-            сохраняет пик кривой автоматически. ES останавливает обучение
-            после patience эпох без улучшения — лишних вычислений нет,
-            score из best.pt не изменяется. При переобучении (наблюдалось
-            на WGISD ~эпоха 40) без ES модель тратит оставшиеся эпохи
-            впустую, score всё равно берётся из best.pt — ES устраняет
-            эти бесполезные итерации.
-            Prechelt (1998): ES как детектор плато корректен для
-            ранжирования при условии что score берётся из best, а не last.
+            Обучение кандидатов
             """
             log(f"  Обучаю [{label}] — {fast_epochs} эп. (быстрый)...")
             try:
@@ -1000,28 +717,10 @@ def _run_search(q: queue.Queue, config: Dict):
                           resume_from: Optional[str] = None,
                           score_floor: float = 0.0) -> Tuple[float, str]:
             """
-            Быстрое обучение на произвольном числе эпох n_epochs.
-            Используется автоподбором процента скрининга.
-
-            resume_from: путь к чекпоинту для warm-start (дообучение с x% до x+10%).
-            score_floor: минимальный score из предыдущего прогона (прогон A).
-                При resume history содержит только новые эпохи — если все они
-                хуже score_floor, возвращаем score_floor как нижнюю границу.
-                Это гарантирует что resume не даёт результат хуже прогона A.
-
-            Returns:
-                (score, ckpt_path) — score для ранжирования и путь к
-                финальному чекпоинту для следующего warm-start прогона.
-                ckpt_path = "" если чекпоинт недоступен.
+            Устаревший код
             """
             try:
                 if task == "classification":
-                    # При warm-start (resume_from указан) используем return_last=True:
-                    # возвращаем score последней реально обученной эпохи, а не
-                    # max(history) который включает запись прогона A из чекпоинта.
-                    # Без этого scores прогонов A и B идентичны (max всегда
-                    # возвращает лучший из A), ρ=1.0 тривиально — ложное
-                    # подтверждение стабильности ранжирования.
                     _is_resume = bool(resume_from)
                     m = _train_cls(ds_name, n_epochs, use_es=False,
                                    name_suffix=f"qas{n_epochs}ep",
@@ -1032,49 +731,17 @@ def _run_search(q: queue.Queue, config: Dict):
                     return sc, ckpt_path
                 else:
                     safe_label = label[:20].replace(" ", "_").replace("+", "_")
-                    # Добавляем короткий уникальный суффикс чтобы прогоны A / B / C
-                    # одного кандидата с одинаковым n_epochs не перезаписывали
-                    # папку и last.pt друг друга.
-                    # Проблема: прогон C (подтверждение) может иметь ту же дельту
-                    # что прогон A → одинаковый subdir → last.pt перезаписывается.
                     import uuid as _uuid
                     subdir = f"det_qas_{safe_label}_{n_epochs}ep_{_uuid.uuid4().hex[:6]}"
-                    # YOLO: передаём resume через result_subdir last.pt если есть
                     _resume_arg = resume_from if resume_from and os.path.exists(
                         resume_from) else False
-                    # final=False: скрининговый прогон, не финальное обучение.
-                    # keep_weights=True: result_dir НЕ удаляется — last.pt
-                    # нужен для следующего warm-start прогона.
-                    # Это исправляет баг где keep_weights=True направлял в
-                    # _run_training_final, которая игнорирует resume и
-                    # обучала с нуля вместо дообучения с N%.
                     m = _train_det(ds_name, n_epochs, use_es=False,
                                    result_subdir=subdir, keep_weights=True,
                                    resume=_resume_arg, final=False)
-                    # Для YOLO ищем last.pt в папке результатов.
-                    # _run_training сохраняет в result_dir/'run'/'weights'/last.pt,
-                    # где result_dir = work_dir / subdir.
-                    # Исправление бага: исходный код не включал подпапку 'run',
-                    # из-за чего last.pt никогда не находился и warm-start
-                    # для детекции фактически не работал.
                     _det_dir = str(work_dir / subdir)
                     _last_pt = os.path.join(_det_dir, "run", "weights", "last.pt")
                     ckpt_path = _last_pt if os.path.exists(_last_pt) else ""
                     sc = score_from_metrics(m)
-                    # score_floor для детекции: гарантируем что warm-start прогон B/C
-                    # не возвращает score хуже прогона A.
-                    #
-                    # В _run_training метрики берутся через best.pt (module3, _run_training
-                    # строка: eval_model = YOLO(best_pt if best_pt.exists() else ...)).
-                    # best.pt в прогоне B охватывает только дельта-эпохи — если за них
-                    # улучшения не было, best.pt может быть хуже финального best.pt
-                    # всей траектории A+B. Без score_floor score прогона B < score прогона A
-                    # — это инвертирует ранги и ρ не сходится.
-                    #
-                    # Нижняя граница max(sc, score_floor) зеркалит логику классификации
-                    # (return_last + score_floor в _train_cls).
-                    # Li et al. (2018) JMLR 18(185): warm-start SHA сохраняет
-                    # лучших кандидатов — score не должен деградировать.
                     if score_floor > 0.0:
                         sc = max(sc, score_floor)
                     return sc, ckpt_path
@@ -1094,13 +761,7 @@ def _run_search(q: queue.Queue, config: Dict):
                        result_subdir: str = "final",
                        collect_history: bool = False):
             """
-            Полное обучение (100% эпох, ES вкл).
-            Для детекции сохраняет веса в work_dir/result_subdir.
-
-            collect_history=True: вместе с метриками возвращает список
-            значений AUC/mAP50-95 по эпохам для построения графика.
-            Классификация: берётся из ClassificationTrainer.metrics_history.
-            Детекция: читается из results.csv в YOLO-директории.
+            Полное обучение
             """
             log(f"  Финальное обучение [{label}] — {max_epochs} эп. + ES(patience={patience})...")
             try:
@@ -1158,12 +819,10 @@ def _run_search(q: queue.Queue, config: Dict):
                     pass
                 gc.collect()
 
-        # ── Анализ модальности (встроенный, если включён) ────────────────────
+        # Выбор модальности
         modality_result = config.get("modality_result", None)
         manual_modality = config.get("manual_modality", "auto")
 
-        # Если модальность задана вручную — строим modality_result без анализа.
-        # Применяем те же правила фильтрации групп что и при автоопределении.
         if (config.get("use_modality", False)
                 and manual_modality != "auto"
                 and modality_result is None):
@@ -1195,7 +854,7 @@ def _run_search(q: queue.Queue, config: Dict):
 
                 modality_result = {
                     "modality":        manual_modality,
-                    "confidence":      1.0,  # задано вручную — уверенность 100%
+                    "confidence":      1.0,  # Элемент устаревшего кода
                     "excluded_groups": _excluded,
                     "allowed_groups":  _allowed,
                     "is_color":        manual_modality not in {"sar", "medical_xray"},
@@ -1208,38 +867,14 @@ def _run_search(q: queue.Queue, config: Dict):
                 log("  Продолжаем без фильтрации.")
                 modality_result = None
 
-        # ══════════════════════════════════════════════════════════════════
-        # BASELINE: быстрое обучение оригинала
-        # ══════════════════════════════════════════════════════════════════
-        # ══════════════════════════════════════════════════════════════════
-        # АВТОПОДБОР ПРОЦЕНТА СКРИНИНГА (опционально)
-        #
-        # Запускает Фазу 1 дважды — на x% и x+10% эпох — и сравнивает
-        # ранги кандидатов через коэффициент Спирмена.
-        # Если ρ >= порога — x% достаточно, используем его результаты.
-        # Если нет — увеличиваем x на 10 и повторяем.
-        #
-        # Научное обоснование:
-        # Egele et al. (2024) Neurocomputing — ранги доминирующих моделей
-        # стабильны на ранних эпохах (early discarding).
-        # Спирмен ρ ≥ 0.9 — стандартный порог сильной корреляции.
-        # ══════════════════════════════════════════════════════════════════
+        # Обучение оригинального датасета
         auto_screen           = config.get("auto_screen", False)
         auto_screen_start     = config.get("auto_screen_start", 40)
         auto_screen_direction = config.get("auto_screen_direction", "top_down")
-        # Инициализируем до блока auto_screen чтобы переменная была
-        # гарантированно доступна снаружи блока независимо от того
-        # выполнился ли внутренний else (кандидатов >= 2).
+
         _baseline_history: List[float] = []
         _screening_table_data: List[Dict] = []  # таблица mAP50-95 по 10% шагам
-        # auto_screen_rho больше не задаётся пользователем —
-        # критическое значение ρ вычисляется автоматически по числу
-        # кандидатов N через _spearman_critical_rho(N, alpha=0.01).
-        # Zar (2005): критическое значение зависит от N и α.
-        # α=0.01 (p < 0.01) — строгий порог для научной работы.
 
-        # Будет заполнен автоподбором: {cand_id: score} при найденном %.
-        # Используется кэшем Фазы 1 — повторное обучение не нужно.
         _auto_screen_scores: Optional[Dict[str, float]] = None
 
         if auto_screen:
@@ -1272,28 +907,13 @@ def _run_search(q: queue.Queue, config: Dict):
                     _run_training_full_history,
                     _history_score_at,
                 )
-                # Метка основной метрики для логов и таблиц — определяем здесь
-                # чтобы переменная была доступна во всех ветках (включая warm_start).
                 _score_metric_label = "AUC" if task == "classification" else "mAP50-95"
 
-                # ── Шаг 1: обучаем каждого кандидата до 100% один раз ──────
-                # close_mosaic=0: равные условия на всех порогах N%.
-                # Без него последние 10 эпох (дефолт Ultralytics) проходят
-                # без мозаики — при сравнении max(0..N%) vs max(0..N+10%)
-                # кандидаты с бо́льшим N получают систематическое преимущество.
-                # Redmon & Farhadi (2018): мозаика меняет распределение входных
-                # данных, её отсутствие влияет на метрики финальных эпох.
+                # Обучаем начальных кандидатов
                 _as_ds_map: Dict[str, str] = {}
                 _as_histories: Dict[str, List[float]] = {}
 
-                # ── Загрузка истории из CSV (если предоставлен) ──────────
-                # Парсим CSV и заполняем _as_histories и _baseline_history.
-                # Формат: колонки "Метод", "10%", "20%", ..., "100%".
-                # Для каждого кандидата восстанавливаем историю длиной
-                # max_epochs: значение N% повторяется для эпох в диапазоне
-                # ((N-1)*max_epochs//10 .. N*max_epochs//10).
-                # Это корректно т.к. _history_score_at использует max(0..k),
-                # а CSV уже содержит max(0..N%) для каждого шага.
+                # Загрузка истории из CSV
                 _history_csv_content = config.get("history_csv_content", "")
                 _csv_loaded_cands: set = set()  # display-имена загруженных
                 if _history_csv_content:
@@ -1315,9 +935,7 @@ def _run_search(q: queue.Queue, config: Dict):
                                         _csv_row.get(_pc, "0").strip()))
                                 except ValueError:
                                     _vals.append(0.0)
-                            # Восстанавливаем историю длиной max_epochs:
-                            # для каждой эпохи берём значение из
-                            # соответствующего 10%-шага.
+                            # Восстанавливаем историю
                             _hist_full = []
                             for _ep in range(1, max_epochs + 1):
                                 _step_idx = min(
@@ -1346,7 +964,6 @@ def _run_search(q: queue.Queue, config: Dict):
                 _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
 
                 # Создаём датасеты для всех кандидатов — нужно для всех режимов
-                # включая warm_start (датасеты нужны для дообучения).
                 log(f"\n  Создаю датасеты для {_n_cands} кандидатов...")
                 for _cand in _as_all_cands:
                     try:
@@ -1370,10 +987,6 @@ def _run_search(q: queue.Queue, config: Dict):
                                 f"обучение пропущено")
                             continue
 
-                        # ВАЖНО: берём датасет конкретного кандидата из _as_ds_map,
-                        # а не переменную _ds из внешнего scope (после цикла создания
-                        # она равна последнему датасету и без этой строки все кандидаты
-                        # обучались бы на одном датасете).
                         _ds = _as_ds_map[_cand["id"]]
 
                         log(f"  Обучаю [{_cand['display']}] до {max_epochs} эп. "
@@ -1402,11 +1015,6 @@ def _run_search(q: queue.Queue, config: Dict):
                                 _trainer_hist.run_training(resume_paths={})
                                 _hkey = f"{model_type}_ashist_{_ds}"
                                 _raw = _trainer_hist.metrics_history.get(_hkey, [])
-                                # Фильтруем _from_checkpoint (запись warm-start) и
-                                # дубль best-метрик, который run_training дописывает
-                                # поверх per-epoch записей _train_one.
-                                # Срез [:max_epochs] = ровно N значений, по одному
-                                # на эпоху — как у детекции (_run_training_full_history).
                                 _as_histories[_cand["id"]] = [
                                     float(h.get("val_auc", h.get("auc", 0.0)))
                                     for h in _raw
@@ -1438,21 +1046,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             gc.collect()
                         log(f"    → история: {len(_as_histories.get(_cand['id'], []))} эпох")
 
-                    # ── Шаг 2: поиск минимального % по историям ─────────────────
-                    # Score кандидата при бюджете N% = max(history[0..N%*epochs]).
-                    # Li et al. (2018) JMLR 18(185): SHA использует пиковый
-                    # потенциал кандидата на данном бюджете.
-                    #
-                    # Условия принятия N%:
-                    #   p1 = ρ(scores_N%, scores_N+10%) ≥ ρ_crit
-                    #   p2 = ρ(scores_N+10%, scores_N+20%) ≥ ρ_crit
-                    # Обе проверки из одной истории — повторного обучения нет.
-                    # Максимальный стартовый N = 80% (N+20% ≤ 100%).
-                    # При N > 80% без успеха → 100%.
-                    #
-                    # Двойная проверка (p1 и p2):
-                    # Audibert & Bubeck (2010) COLT, Theorem 1: два подтверждения
-                    # дают экспоненциально меньшую вероятность ложного срабатывания.
+                    # Поиск минимального бюджета
 
                     def _scores_at(ratio: float) -> Dict[str, float]:
                         return {
@@ -1460,14 +1054,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             for _cid, _hist in _as_histories.items()
                         }
 
-                    # ── Baseline: обучение до 100% с историей ───────────────────
-                    # Baseline обучается на тех же условиях что кандидаты:
-                    # до 100% эпох, close_mosaic=0, ES с паддингом.
-                    # Score при найденном % берётся из истории через
-                    # _history_score_at — max(0..N%), равные условия.
-                    # Без этого baseline обучался бы только на fast_epochs
-                    # что создаёт систематическое преимущество.
-                    # Пропускаем если baseline уже загружен из CSV
+                    # Полное обучение оригинала с сохранением истории
                     if _baseline_history:
                         log(f"  baseline — история из CSV, обучение пропущено")
                     else:
@@ -1525,11 +1112,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             gc.collect()
                     log(f"    → baseline история: {len(_baseline_history)} эпох")
 
-                    # ── Таблица mAP50-95 по каждым 10% для всех кандидатов ──────
-                    # Выводится после сбора всех историй, до начала поиска %.
-                    # Содержит max(0..N%) для N = 10%, 20%, ..., 100% —
-                    # полная картина потенциала каждого кандидата.
-                    # Используется для анализа в научной работе.
+                    # Построение таблицы mAP50-95 с шагом 10%
                     _pct_steps = list(range(10, 110, 10))  # 10,20,...,100
                     log(f"\n{'─'*70}")
                     log(f"ТАБЛИЦА {_score_metric_label} max(0..N%) ПО ЭПОХАМ (все кандидаты)")
@@ -1566,11 +1149,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     # Сохраняем для передачи в result dict и CSV
                     _screening_table_data = _screening_table_rows
 
-                # ── Шаг 2: таблица рангов ────────────────────────────────
-                # Для каждого столбца (10%..100%) независимо ранжируем
-                # кандидатов по mAP50-95 (1 = лучший).
-                # Baseline не участвует в ранжировании — он не кандидат SHA.
-                # Используется для визуального анализа стабильности рангов.
+                # Построение таблицы ранжирования
                 log(f"\n{'─'*70}")
                 log(f"ТАБЛИЦА РАНГОВ (1=лучший, по {_score_metric_label} для каждых 10% эпох)")
                 log(f"{'─'*70}")
@@ -1609,7 +1188,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     log(_rline)
                 log(f"{'─'*70}")
 
-                # ── Шаг 3: выбор бюджета скрининга ──────────────────
+                # Определение бюджета
                 # Четыре режима: top_down, bottom_up, full_budget, warm_start.
 
                 _sc_100_ref   = _scores_at(1.0) if auto_screen_direction != "warm_start" else {}
@@ -1617,25 +1196,13 @@ def _run_search(q: queue.Queue, config: Dict):
                 _as_found      = False
 
                 if auto_screen_direction == "full_budget":
-                    # ── 100% бюджет ──────────────────────────────────────
+                    # При полном бюджете
                     log(f"\n  Режим: 100% бюджет (поиск % не выполняется)")
                     _as_ratio_best = 100
                     _as_found = True
 
                 elif auto_screen_direction == "warm_start":
-                    # ── Warm-start: инкрементальное дообучение ───────────
-                    # Алгоритм: Li et al. (2018) JMLR 18(185) warm-start SHA.
-                    # Кандидаты обучаются с нуля до r_A%, затем дообучаются
-                    # warm-start через _run_training до r_B% и r_C%.
-                    # Score = max(score_prev, score_new) — защита от деградации.
-                    # Две локальные проверки: ρ(A,B) и ρ(B,C) ≥ ρ_crit.
-                    # Если обе прошли → фиксируем r_A%.
-                    # Если нет → r_A=r_B, ckpts сдвигаются, дообучаем r_D.
-                    # При r_A=90% → бюджет 100%.
-                    #
-                    # Таблица строится по накопленным scores для каждых 10%.
-                    # Значения после найденного бюджета заполняются последним
-                    # известным (паддинг). Prechelt (1998): ES детектирует плато.
+                    # Метод дообучения
 
                     log(f"\n  Режим: warm-start (снизу вверх с дообучением)")
                     log(f"  Начальный бюджет: {auto_screen_start}%")
@@ -1653,7 +1220,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     # accumulated_scores: {pct: {cand_id: score}} для таблицы
                     _ws_acc: Dict[int, Dict[str, float]] = {}
 
-                    # ── Шаг 1: обучаем с нуля до r_A% ───────────────────
+                    # Обучение с нуля до N%
                     _ws_ep_a = max(1, int(max_epochs * (_ws_ratio_a / 100)))
                     log(f"\n  Шаг 1: обучение с нуля до {_ws_ratio_a}% ({_ws_ep_a} эп.)")
                     for _cand in _as_all_cands:
@@ -1662,10 +1229,6 @@ def _run_search(q: queue.Queue, config: Dict):
                             continue
                         try:
                             if task == "classification":
-                                # Классификация: _train_cls без resume.
-                                # max_epochs=_ws_ep_a → обучение с нуля до r_A%.
-                                # _ckpt_path из результата — чекпоинт для след.
-                                # warm-start прогона.
                                 _m = _train_cls(
                                     _ds, _ws_ep_a, use_es=False,
                                     name_suffix=(
@@ -1721,14 +1284,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             gc.collect()
                     _ws_acc[_ws_ratio_a] = dict(_ws_scores)
 
-                    # ── Основной цикл warm-start ──────────────────────────
-                    # На каждом шаге дообучаем одну новую дельту и проверяем
-                    # две локальные корреляции.
-                    # scores_A = _ws_scores (текущие)
-                    # scores_B = дообучение до r_B%
-                    # scores_C = дообучение до r_C%
-                    # После сдвига: scores_A=scores_B, scores_B=scores_C,
-                    # ckpts_B=ckpts_C, дообучаем только r_C→r_D.
+                    # Основной цикл дообучения
 
                     def _ws_finetune(ratio_from: int, ratio_to: int,
                                      ckpts_from: Dict[str, str],
@@ -1751,12 +1307,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             _resume = ckpts_from.get(_cand["id"], "")
                             try:
                                 if task == "classification":
-                                    # Классификация: ClassificationTrainer тренирует
-                                    # range(resume_epoch+1, max_epochs+1), поэтому
-                                    # нужно передавать ОБЩЕЕ число эпох (ratio_to%),
-                                    # а не дельту. При resume_epoch = ep(ratio_from%)
-                                    # и max_epochs = ep(ratio_to%) цикл пройдёт
-                                    # ровно _ep_delta итераций.
+                                    # Классификация ClassificationTrainer
                                     _ep_total_to = max(
                                         1, int(max_epochs * (ratio_to / 100)))
                                     _m = _train_cls(
@@ -1885,10 +1436,7 @@ def _run_search(q: queue.Queue, config: Dict):
                             _ws_ckpts_b, _ws_scores_b)
                         _ws_acc[_ws_ratio_c] = dict(_ws_scores_c)
 
-                    # ── Строим таблицу для warm_start ─────────────────────
-                    # Значения накоплены в _ws_acc для вычисленных бюджетов.
-                    # Остальные 10%-шаги заполняем паддингом последнего
-                    # известного значения. Prechelt (1998): плато после ES.
+                    # Таблица для дообучения
                     log(f"\n{'─'*70}")
                     log(f"ТАБЛИЦА {_score_metric_label} (warm-start, накопленные значения)")
                     log(f"{'─'*70}")
@@ -2023,19 +1571,11 @@ def _run_search(q: queue.Queue, config: Dict):
                 log(f"  Li et al. (2018) Hyperband — однораундовый отсев "
                     f"(s=0 bracket) с подобранным бюджетом")
 
-        # ══════════════════════════════════════════════════════════════════
-        # BASELINE: быстрое обучение оригинала
-        # Выполняется ПОСЛЕ автоподбора чтобы использовать итоговый
-        # fast_epochs — baseline должен обучаться на том же проценте
-        # что и кандидаты для честного сравнения.
-        # ══════════════════════════════════════════════════════════════════
+        # Обучение оригинала до найденного бюджета
         log("")
         log("=" * 70)
         log(f"BASELINE: оригинальный датасет ({screening_ratio}% эпох)")
         log("=" * 70)
-        # Если автоподбор включён — baseline уже обучен до 100% с историей.
-        # Берём max(0..screening_ratio%) — равные условия с кандидатами.
-        # Если автоподбор выключен — обучаем baseline обычным способом.
         if auto_screen and _baseline_history:
             baseline_score = _history_score_at(
                 _baseline_history, screening_ratio / 100.0)
@@ -2045,17 +1585,10 @@ def _run_search(q: queue.Queue, config: Dict):
             baseline_score = quick_train(dataset_name, "baseline")
             log(f"  Baseline score = {baseline_score:.4f}")
 
-        # ══════════════════════════════════════════════════════════════════
-        # ФАЗА 1: Group-wise SHA-скрининг
-        # Guyon & Elisseeff (2003); Liu & Motoda (2007).
-        # Для каждой группы: обучаем всех кандидатов (screening_ratio% эпох),
-        # SHA-отсев оставляет ceil(N_group / eta) survivors.
-        # ══════════════════════════════════════════════════════════════════
+        # Отбор начальных кандидатов
         log("")
         log("=" * 70)
-        log("ФАЗА 1: Групповой скрининг (baseline-фильтр → SHA)")
-        log("Guyon & Elisseeff (2003) группировка; Kohavi & John (1997) фильтр по baseline;")
-        log("Jamieson & Talwalkar (2016) SHA среди кандидатов выше baseline")
+        log("Отбор полезных методов предобработки")
         log("=" * 70)
 
         # Получаем активные группы с учётом модальности и флага Wiener
@@ -2097,18 +1630,9 @@ def _run_search(q: queue.Queue, config: Dict):
 
         all_survivors: List[Dict] = []
         # Сохраняем scored по каждой группе для SHA-fallback
-        # (используется если все группы оказались ниже baseline)
         _scored_per_group: Dict[str, List[Dict]] = {}
 
-        # ── Кеш scores из автоподбора скрининга ───────────────────────
-        # При новом алгоритме автоподбора каждый кандидат обучается один
-        # раз до 100%, а scores при любом % извлекаются из истории.
-        # _auto_screen_scores содержит scores при итоговом screening_ratio%
-        # — кэш работает для любого найденного %.
-        #
-        # Dodge & Karam (2017) CVPRW: seed фиксирован → результат
-        # детерминирован. Scores из истории эквивалентны обучению с нуля
-        # на том же числе эпох при том же seed.
+        # Кэш из автоподбора
         _as_reusable: Dict[str, float] = {}
         if _auto_screen_scores:
             _as_reusable = _auto_screen_scores
@@ -2149,16 +1673,7 @@ def _run_search(q: queue.Queue, config: Dict):
             # Сохраняем для возможного SHA-fallback
             _scored_per_group[group_id] = scored
 
-            # Фаза 1: фильтр по baseline → SHA-отсев среди прошедших фильтр.
-            #
-            # Порядок: baseline-фильтр сначала, SHA после.
-            # Kohavi & John (1997) — отсев кандидатов хуже baseline бессмысленен
-            # для пула Фазы 2. SHA (Jamieson & Talwalkar, 2016) применяется только
-            # к кандидатам выше baseline, оставляя ceil(N/eta) лучших.
-            #
-            # Если вся группа хуже baseline — группа пропускается целиком.
-            # Обоснование: ни один метод группы не улучшает качество относительно
-            # оригинала, поэтому включать их в пул Фазы 2 нецелесообразно.
+            # Отсев по baseline + SHA
             above = [s for s in scored if s["score"] > baseline_score]
             if not above:
                 log(f"\n    Фильтр baseline: все {len(scored)} кандидатов группы "
@@ -2182,12 +1697,6 @@ def _run_search(q: queue.Queue, config: Dict):
             sha_fallback = config.get("sha_fallback", False)
             if sha_fallback:
                 # SHA-fallback: все группы оказались хуже baseline.
-                # Применяем SHA без baseline-фильтра — берём ceil(N/eta) лучших
-                # из каждой группы отдельно.
-                # Используется только когда НИ ОДНА группа не дала survivors выше
-                # baseline — если хотя бы одна группа прошла, мы уже не попадём сюда.
-                # Jamieson & Talwalkar (2016) — SHA ранжирует кандидатов независимо
-                # от абсолютного порога.
                 log("")
                 log("=" * 70)
                 log("SHA-FALLBACK: все группы Фазы 1 ниже baseline")
@@ -2195,13 +1704,6 @@ def _run_search(q: queue.Queue, config: Dict):
                 log("Jamieson & Talwalkar (2016) AISTATS 240-248")
                 log("=" * 70)
 
-                # Повторно собираем scored по группам из уже обученных результатов.
-                # Поскольку scored не сохранялся между группами — нужно пройти заново
-                # по active_groups и взять все кандидаты которые уже обучались.
-                # Но scored уже потерян после цикла. Поэтому используем другой подход:
-                # запускаем SHA напрямую на всех scored из каждой группы заново,
-                # но scored уже не доступен. Нужно сохранить scored_per_group.
-                # Исправление: сохраним scored_per_group в первом цикле.
                 log("  [INFO] Повторный проход по группам для SHA-fallback...")
                 for group_id, group_info in active_groups.items():
                     group_label = group_info["label"]
@@ -2277,29 +1779,14 @@ def _run_search(q: queue.Queue, config: Dict):
             log(f"    {s['display']:45s}  score={s['score']:.4f}  "
                 f"{'↑ выше baseline' if s['score'] > baseline_score else '↓ ниже baseline (группа без улучшений)'}")
 
-        # ══════════════════════════════════════════════════════════════════
-        # ФАЗА 2: SFS+SHA на survivors
-        #
-        # Правильная реализация по алгоритму:
-        #   - known_scores: Dict[tuple, float] — кеш оценок по кортежу id методов.
-        #     Порядок методов в кортеже важен: (A, B) != (B, A).
-        #   - На каждой итерации: берём survivors_prev, генерируем расширения
-        #     (добавляем каждый метод из общего пула survivors в конец каждого
-        #     survivor), исключаем дубли методов, используем кеш, обучаем новые,
-        #     SHA-отсев по ВСЕМУ пулу (survivors_prev + новые расширения).
-        #   - Критерий остановки: N-1 итераций макс, или все расширения содержат
-        #     дубли методов.
-        #
-        # Kohavi & John (1997) SFS + Jamieson & Talwalkar (2016) SHA.
-        # ══════════════════════════════════════════════════════════════════
+        # Итеративное построение новых кандидатов и их отсев
         log("")
         log("=" * 70)
         log("ФАЗА 2: SFS+SHA на survivors")
-        log("Kohavi & John (1997) SFS + Jamieson & Talwalkar (2016) SHA")
         log("Порядок методов учитывается: [A+B] != [B+A]")
         log("=" * 70)
 
-        # Пул survivors Фазы 1 — используется для генерации расширений на каждой итерации
+        # Пул выживших используется для построения новых комбинаций
         survivor_pool: List[Dict] = list(all_survivors)
         N_survivors = len(survivor_pool)
 
@@ -2383,20 +1870,9 @@ def _run_search(q: queue.Queue, config: Dict):
                 log("  [СТОП] Все возможные расширения содержат дубли методов — пайплайн достиг максимума.")
                 break
 
-            # Фаза 2: тот же принцип что в Фазе 1 — сначала фильтр по baseline,
-            # затем SHA. Порядок "фильтр → SHA" (Kohavi & John, 1997):
-            # пайплайны хуже baseline бессмысленно нести дальше.
-            # Если все хуже baseline — итерация останавливается, финальными
-            # survivors становятся survivors предыдущей итерации.
             combined_pool = current_survivors + new_extensions
 
-            # Дедупликация по pipeline_ids — убираем только точные дубли:
-            # одинаковые пайплайны с одинаковым порядком методов И одинаковыми id.
-            # ВАЖНО: используем tuple а не frozenset — порядок методов важен,
-            # [A+B] и [B+A] это разные пайплайны (применяются последовательно,
-            # результат зависит от порядка). frozenset их уравнивал — это было баг.
-            # Дубли возникают только когда несколько survivors расширяются
-            # абсолютно одинаково (совпадают и методы и порядок).
+            # Убираем дубли
             seen_pids: set = set()
             deduped_pool: List[Dict] = []
             for c in combined_pool:
@@ -2440,16 +1916,13 @@ def _run_search(q: queue.Queue, config: Dict):
 
             current_survivors = survivors_after_sha
 
-        # ── Финальные survivors последней итерации (или начальные если 0 итераций)
+        # Финальные выжившие кандидаты
         final_survivors = current_survivors
-        log(f"\n  Финальных survivors: {len(final_survivors)}")
+        log(f"\n  Финальных кандидаты: {len(final_survivors)}")
         for s in sorted(final_survivors, key=lambda x: x["score"], reverse=True):
             log(f"    {s['display']:55s}  score={s['score']:.4f}")
 
-        # ══════════════════════════════════════════════════════════════════
-        # ФИНАЛЬНОЕ ОБУЧЕНИЕ ПОБЕДИТЕЛЯ
-        # Победитель — лучший по score среди финальных survivors.
-        # ══════════════════════════════════════════════════════════════════
+        # Финальное обучение победителей
         log("")
         log("=" * 70)
         log("ФИНАЛЬНОЕ ОБУЧЕНИЕ ПОБЕДИТЕЛЕЙ (топ-N)")
@@ -2485,6 +1958,7 @@ def _run_search(q: queue.Queue, config: Dict):
                 target_dataset=_surv_ds_name,
                 methods=_surv_methods,
                 params=_surv_params,
+                target_path=datasets_path / _surv_ds_name,
             )
             _surv_result = full_train(_surv_ds_name, _surv_display,
                                       result_subdir=f"final_top{_rank}",
@@ -2496,10 +1970,10 @@ def _run_search(q: queue.Queue, config: Dict):
             _finalist_histories[_surv_display] = _surv_hist
             _surv_score = score_from_metrics(_surv_metrics)
             if task == "classification":
-                log(f"    → score(val_auc)={_surv_score:.4f}  "
+                log(f"    -> score(val_auc)={_surv_score:.4f}  "
                     f"acc={_surv_metrics.get('val_acc',0):.4f}")
             else:
-                log(f"    → score(test)={_surv_score:.4f}  "
+                log(f"    -> score(test)={_surv_score:.4f}  "
                     f"mAP50-95={_surv_metrics.get('mAP50-95',0):.4f}")
             _finalist_results.append((_surv, _surv_ds_name, _surv_metrics))
 
@@ -2515,16 +1989,21 @@ def _run_search(q: queue.Queue, config: Dict):
         _final_winner_ds = f"{dataset_name}_p2_winner"
         if winner_ds_name != _final_winner_ds:
             try:
-                import shutil as _sh
-                _src_p = get_dataset_path(winner_ds_name)
-                _dst_p = get_dataset_path(_final_winner_ds)
+                _src_p = datasets_path / winner_ds_name
+                _dst_p = datasets_path / _final_winner_ds
                 if _src_p.exists():
                     if _dst_p.exists():
-                        _sh.rmtree(_dst_p)
-                    _sh.copytree(_src_p, _dst_p)
+                        _shutil.rmtree(_dst_p)
+                    _shutil.copytree(_src_p, _dst_p)
                     winner_ds_name = _final_winner_ds
             except Exception as _re:
                 log(f"  [ПРЕДУПРЕЖДЕНИЕ] Не удалось переименовать датасет: {_re}")
+
+        # Удаляем оригинальные датасеты финалистов (_p2_top1, _p2_top2, ...):
+        # победитель был скопирован в _p2_winner, остальные больше не нужны.
+        for _s, _ds_name_orig, _m in _finalist_results:
+            if _ds_name_orig != winner_ds_name:
+                _cleanup_ds(_ds_name_orig)
 
         log(f"\n  Победитель финала: {winner_display}  "
             f"score(test)={score_from_metrics(final_metrics):.4f}")
@@ -2537,9 +2016,7 @@ def _run_search(q: queue.Queue, config: Dict):
                     f"score={score_from_metrics(_m):.4f}  "
                     f"mAP50-95={_m.get('mAP50-95',0):.4f}")
 
-        # ══════════════════════════════════════════════════════════════════
-        # ФИНАЛЬНЫЙ BASELINE (полное обучение для честного сравнения)
-        # ══════════════════════════════════════════════════════════════════
+        # Финальное обучение оригинального датасета
         log("")
         log("=" * 70)
         log("ФИНАЛЬНЫЙ BASELINE (полное обучение для сравнения)")
@@ -2553,9 +2030,7 @@ def _run_search(q: queue.Queue, config: Dict):
         else:
             baseline_final_metrics, _baseline_history = _baseline_result, []
 
-        # ══════════════════════════════════════════════════════════════════
-        # ИТОГ И СРАВНЕНИЕ
-        # ══════════════════════════════════════════════════════════════════
+        # Итоги сравнения
         winner_score_full   = score_from_metrics(final_metrics)
         baseline_score_full = score_from_metrics(baseline_final_metrics)
         improvement         = winner_score_full - baseline_score_full
@@ -2597,7 +2072,7 @@ def _run_search(q: queue.Queue, config: Dict):
 
         log("=" * 70)
 
-        # ── Сохраняем JSON-отчёт ──────────────────────────────────────────
+        # Сохранение JSON
         result = {
             "dataset_name":         dataset_name,
             "task":                 task,
@@ -2617,7 +2092,7 @@ def _run_search(q: queue.Queue, config: Dict):
                  "score": round(s["score"], 4)}
                 for s in all_survivors
             ],
-            # Финальные survivors последней итерации Фазы 2 (с quick-scores для таблицы)
+            # Последние выжившие
             "final_survivors": [
                 {
                     "display": s["display"],
@@ -2646,10 +2121,7 @@ def _run_search(q: queue.Queue, config: Dict):
             ],
             "baseline_quick_score": round(baseline_score, 4),
             "screening_ratio":      screening_ratio,
-            # Данные для графика кривых обучения финального прогона.
-            # winner_history / baseline_history — per-epoch AUC (classification)
-            # или mAP50-95 (detection) из full_train.
-            # Используется в UI для построения графика даже без auto_screen.
+            # Данные для графика кривых обучения
             "chart_data": {
                 "winner_display":    winner_display,
                 "winner_history":    _finalist_histories.get(winner_display, []),
@@ -2677,10 +2149,7 @@ def _run_search(q: queue.Queue, config: Dict):
             pass
         gc.collect()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # VRAM (кешируем чтобы не вызывать torch на каждый rerun)
-# ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
 def _get_vram_gb() -> float:
@@ -2694,7 +2163,7 @@ def _get_vram_gb() -> float:
 
 
 def _suggest_batch_cls(model_type: str, vram: float, imgsz: int) -> int:
-    """Подсказывает batch_size для классификации. Yang et al. (2021)."""
+    """batch_size для классификации"""
     if vram <= 0:
         return 16
     max_b = {"resnet18": 128, "resnet50": 64, "efficientnet_b0": 96}.get(model_type, 64)
@@ -2706,10 +2175,7 @@ def _suggest_batch_cls(model_type: str, vram: float, imgsz: int) -> int:
 def _suggest_batch_det(model_type: str, vram: float,
                        yolo_size: str = "n", imgsz: int = 640) -> int:
     """
-    Подсказывает batch_size для детекции с учётом размера модели и imgsz.
-    Базовые значения подобраны для GPU с 8 GB VRAM при imgsz=640.
-    Масштабируются на (640/imgsz)^2 — площадь изображения.
-    Для YOLO учитывается размер модели (n/s/m/l/x).
+    batch_size для детекции с учётом размера модели и imgsz
     """
     if vram <= 0:
         return 1
@@ -2724,9 +2190,7 @@ def _suggest_batch_det(model_type: str, vram: float,
     return max(1, int(base_at_8gb * imgsz_scale * vram_scale))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UI — ЭТАП 1: КОНФИГУРАЦИЯ
-# ══════════════════════════════════════════════════════════════════════════════
+# UI конфигурация
 
 if st.session_state.p2_stage == "configure":
 
@@ -2740,19 +2204,17 @@ if st.session_state.p2_stage == "configure":
         st.warning("Датасеты не найдены. Проверь путь в Настройках.")
         st.stop()
 
-    # ── Выбор типа изображений (ручной, без автоопределения) ─────────────────
+    # UI выбора типа изображений
     st.subheader("1. Выбор типа изображений")
     st.markdown(
-        "Для медицинских и SAR-снимков применяется ограниченный набор методов предобработки "
-        "согласно физическим особенностям данных типов изображений. "
-        "Для остальных типов — выбирайте **'Другая модальность'** — в этом случае "
-        "рассматриваются все методы предобработки."
+        "Если вашего типа изображений нет среди представленных, Вам необходимо выбрать 'Другая модальность'"
+        "В данном случае будут рассмотрены все методы для вашего датасета"
     )
 
-    # Автоматическое определение модальности отключено — тип задаётся только вручную.
+    # Автоматическое определение модальности отключен, но удалять может сломать всё
     st.session_state.p2_use_modality = True
 
-    _MODALITY_OPTIONS = ["medical_xray", "sar", "natural_photo", "other"]
+    _MODALITY_OPTIONS = ["medical_xray", "microscopy", "sar", "natural_photo", "other"]
     _current_modality = st.session_state.get("p2_manual_modality", "other")
     if _current_modality not in _MODALITY_OPTIONS:
         _current_modality = "other"
@@ -2762,7 +2224,8 @@ if st.session_state.p2_stage == "configure":
         options=_MODALITY_OPTIONS,
         index=_MODALITY_OPTIONS.index(_current_modality),
         format_func=lambda x: {
-            "medical_xray":  "Медицинские изображения",
+            "medical_xray":  "Рентгеновские и КТ снимки",
+            "microscopy": "Микроскопия",
             "sar":           "SAR (радарные снимки)",
             "natural_photo": "Натуральные изображения",
             "other":         "Другая модальность",
@@ -2834,7 +2297,7 @@ if st.session_state.p2_stage == "configure":
 
     st.divider()
 
-    # ── Датасет и задача ───────────────────────────────────────────────────
+    # Датасет и задача
     col_ds, col_task = st.columns(2, gap="large")
 
     with col_ds:
@@ -2863,7 +2326,7 @@ if st.session_state.p2_stage == "configure":
 
     st.divider()
 
-    # ── Модель ────────────────────────────────────────────────────────────
+    # Модель
     st.subheader("4. Модель для обучения")
     st.caption(
         "Эта модель используется для быстрой оценки кандидатов (30% эпох). "
@@ -3021,7 +2484,7 @@ if st.session_state.p2_stage == "configure":
 
     st.divider()
 
-    # ── Параметры обучения ────────────────────────────────────────────────
+    # Параметры обучения
     st.subheader("5. Параметры обучения")
     col_p1, col_p2 = st.columns(2, gap="large")
 
@@ -3078,7 +2541,7 @@ if st.session_state.p2_stage == "configure":
             help="Не используется при выборе опции автоподбора бюджета",
         ) if not st.session_state.get("p2_auto_screen", False) else st.session_state.get("p2_screening_ratio", 30)
 
-    # ── Автоподбор процента скрининга ─────────────────────────────────────
+    # Автоподбор бюджета
     st.divider()
     auto_screen = st.checkbox(
         "Автоподбор минимального достаточного бюджета",
@@ -3127,12 +2590,7 @@ if st.session_state.p2_stage == "configure":
             st.session_state.p2_auto_screen_direction = auto_screen_direction
 
 
-    # ── Загрузка истории скрининга из CSV ────────────────────────────────
-    # Позволяет переиспользовать результаты предыдущего прогона автоподбора
-    # вместо повторного обучения всех кандидатов до 100% эпох.
-    # Формат CSV: колонки "Метод", "10%", "20%", ..., "100%"
-    # (файл p2_screening_history_*.csv из предыдущего запуска).
-    # Требование: тот же seed, датасет, модель и max_epochs.
+    # Загрузка истории из CSV
     if auto_screen:
         st.markdown("**Переиспользовать историю из предыдущего прогона (опционально)**")
         uploaded_history_csv = st.file_uploader(
@@ -3168,7 +2626,7 @@ if st.session_state.p2_stage == "configure":
     st.session_state.p2_patience = patience
     st.session_state.p2_eta = eta
     st.session_state.p2_seed = seed
-    # Сохраняем screening_ratio только когда автоподбор выключен —
+    # Сохраняем screening_ratio только когда автоподбор выключен
     # при включённом автоподборе значение определяется автоматически
     if not auto_screen:
         st.session_state.p2_screening_ratio = screening_ratio
@@ -3185,7 +2643,7 @@ if st.session_state.p2_stage == "configure":
 
     st.divider()
 
-    btn_label = "▶ Запустить подбор предобработки"
+    btn_label = "Запустить подбор предобработки"
     if st.button(btn_label, type="primary", use_container_width=True):
         st.session_state.p2_stage = "running"
         st.session_state.p2_log_lines = []
@@ -3199,13 +2657,11 @@ if st.session_state.p2_stage == "configure":
             st.session_state.p2_modality_result = None
         st.rerun()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UI — ЭТАП 2: ВЫПОЛНЕНИЕ С ВЫВОДОМ ЛОГА
-# ══════════════════════════════════════════════════════════════════════════════
+# UI выполнение и вывод логов
 
 elif st.session_state.p2_stage == "running":
 
-    # ── Запускаем поток если ещё не запущен ───────────────────────────────
+    # Запускаем поток, если его ещё нет
     if st.session_state.p2_output_queue is None:
         q = queue.Queue()
         st.session_state.p2_output_queue = q
@@ -3241,17 +2697,11 @@ elif st.session_state.p2_stage == "running":
                                   st.session_state.get("p2_auto_screen_start", 40)),
             "auto_screen_direction": st.session_state.get("p2_auto_screen_direction_radio",
                                   st.session_state.get("p2_auto_screen_direction", "top_down")),
-            # CSV с историей скрининга: читаем через session_state.
-            # uploaded_history_csv может быть недоступен в этом блоке,
-            # поэтому используем session_state где файл был сохранён.
+            # CSV с историей скрининга: читаем через session_state
             "history_csv_content": st.session_state.get(
                 "p2_history_csv_content", ""),
             "top_k_winners":      st.session_state.get("p2_top_k_winners_input",
                                   st.session_state.get("p2_top_k_winners", 1)),
-            # auto_screen_rho убран — критическое значение ρ вычисляется
-            # автоматически внутри _run_search через _spearman_critical_rho(N).
-            # Zar (2005); Ramsey (1989).
-            # Анализ модальности
             "use_modality":    st.session_state.get("p2_use_modality", True),
             "manual_modality": st.session_state.get("p2_manual_modality", "other"),
             "modality_result": None,  # будет заполнен внутри _run_search если use_modality=True
@@ -3266,7 +2716,7 @@ elif st.session_state.p2_stage == "running":
         t = threading.Thread(target=_run_search, args=(q, config), daemon=True)
         t.start()
 
-    # ── Читаем очередь ─────────────────────────────────────────────────────
+    # Читаем очередь
     q = st.session_state.p2_output_queue
     if q is not None:
         try:
@@ -3295,13 +2745,11 @@ elif st.session_state.p2_stage == "running":
         except queue.Empty:
             pass
 
-    # ── Если процесс завершён — сразу переходим к результатам ─────────────
+    # Если процесс завершен - переходим к результатам
     if st.session_state.p2_thread_done:
         st.rerun()
 
-    # ── Рендерим страницу выполнения (только если ещё идёт) ───────────────
-    # st.empty() в начале гарантирует что весь предыдущий контент (configure)
-    # полностью вытесняется и не просачивается в running-страницу.
+    # Рендер страницы выполнения
     _task_label = st.session_state.p2_task
     if _task_label == "classification":
         _model_label = (
@@ -3325,7 +2773,7 @@ elif st.session_state.p2_stage == "running":
     )
     st.caption("Страница обновляется автоматически каждые ~1.5 сек.")
 
-    # ── Окно логов — единственный контент ниже ────────────────────────────
+    # Окно логов
     st.markdown("**Вывод процесса:**")
     lines = st.session_state.p2_log_lines
     log_text = "\n".join(lines[-300:]) if lines else "Инициализация..."
@@ -3335,10 +2783,7 @@ elif st.session_state.p2_stage == "running":
     time.sleep(1.5)
     st.rerun()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# UI — ЭТАП 3: РЕЗУЛЬТАТЫ
-# ══════════════════════════════════════════════════════════════════════════════
+# UI результаты
 
 elif st.session_state.p2_stage == "done":
 
@@ -3376,16 +2821,11 @@ elif st.session_state.p2_stage == "done":
             wm  = result.get("winner_metrics",       {}) or {}
             bqs = result.get("baseline_quick_score", 0.0)
 
-            # Процент эпох скрининга, который пользователь выставил в UI.
-            # Берём из session_state — он точно есть, так как пользователь
-            # выставил его перед запуском. Дефолт 30 на случай старых сессий.
+            # Процент эпох скрининга, который пользователь выставил в UI
             _sr = st.session_state.get("p2_screening_ratio", 30)
             _score_col = f"Score ({_sr}% эп.)"
 
-            # ─────────────────────────────────────────────────────────────
-            # ТАБЛИЦА 1: финальные survivors последней итерации vs baseline
-            #            (сравнение по quick-score, _sr% эпох)
-            # ─────────────────────────────────────────────────────────────
+            # Таблица 1: финальные survivors последней итерации vs baseline
             st.subheader(f"Таблица 1 — Финальные survivors vs Baseline (быстрое обучение, {_sr}% эпох)")
             st.caption(
                 "Все пайплайны, прошедшие SHA-отсев на последней итерации Фазы 2, "
@@ -3414,9 +2854,7 @@ elif st.session_state.p2_stage == "done":
 
             st.divider()
 
-            # ─────────────────────────────────────────────────────────────
-            # ТАБЛИЦА 2: победитель vs baseline (полное обучение)
-            # ─────────────────────────────────────────────────────────────
+            # Таблица 2: победитель vs baseline (полное обучение)
             st.subheader("Таблица 2 — Победитель vs Baseline (полное обучение, 100% эпох + ES)")
 
             def _fmt(v):
@@ -3525,9 +2963,7 @@ elif st.session_state.p2_stage == "done":
 
             st.divider()
 
-            # ─────────────────────────────────────────────────────────────
-            # ИСТОРИЯ ФАЗЫ 2
-            # ─────────────────────────────────────────────────────────────
+            # История SFS+SHA
             history = result.get("history", [])
             if history:
                 with st.expander("История итераций Фазы 2 (SFS+SHA)", expanded=False):
@@ -3543,9 +2979,7 @@ elif st.session_state.p2_stage == "done":
                     ]
                     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-            # ─────────────────────────────────────────────────────────────
-            # SURVIVORS ФАЗЫ 1
-            # ─────────────────────────────────────────────────────────────
+            # Первые выжившие
             survivors_p1 = result.get("phase1_survivors", [])
             if survivors_p1:
                 with st.expander("Survivors Фазы 1 (SHA-скрининг по группам)", expanded=False):
@@ -3560,9 +2994,7 @@ elif st.session_state.p2_stage == "done":
 
             st.divider()
 
-            # ─────────────────────────────────────────────────────────────
-            # ВСЕ ФИНАЛИСТЫ (топ-N)
-            # ─────────────────────────────────────────────────────────────
+            # Все финалисты (топ-N)
             all_finalists = result.get("all_finalists", [])
             if len(all_finalists) > 1:
                 with st.expander(
@@ -3598,9 +3030,7 @@ elif st.session_state.p2_stage == "done":
 
             st.divider()
 
-            # ─────────────────────────────────────────────────────────────
-            # ГРАФИК КРИВЫХ ОБУЧЕНИЯ
-            # ─────────────────────────────────────────────────────────────
+            # График кривых обучения
             _chart_data = result.get("chart_data", {})
             _winner_hist     = _chart_data.get("winner_history", [])
             _baseline_hist   = _chart_data.get("baseline_history", [])
@@ -3616,8 +3046,7 @@ elif st.session_state.p2_stage == "done":
                     "screening_ratio",
                     st.session_state.get("p2_screening_ratio", 30)))
 
-                # Профессиональная академическая палитра
-                # (colorblind-friendly, приглушённые тона)
+                # Из-за бага отображается только первый
                 _PALETTE = [
                     "#2563EB",  # синий  — победитель
                     "#16A34A",  # зелёный
@@ -3641,7 +3070,7 @@ elif st.session_state.p2_stage == "done":
                     import plotly.graph_objects as _go
                 except ImportError:
                     st.info(
-                        "📦 Для отображения графика установите plotly: "
+                        "Для отображения графика установите plotly: "
                         "`uv add plotly` или `uv pip install plotly`"
                     )
                     _go = None
@@ -3745,9 +3174,7 @@ elif st.session_state.p2_stage == "done":
 
             st.divider()
 
-            # ─────────────────────────────────────────────────────────────
-            # СКАЧИВАНИЕ
-            # ─────────────────────────────────────────────────────────────
+            # Скачать результаты
             st.subheader("Скачать результаты")
             dl_col1, dl_col2, dl_col3 = st.columns(3)
 

@@ -1,11 +1,3 @@
-"""
-Очистка кэша Python (__pycache__ и .pyc файлы).
-Запускать перед стартом Streamlit если менялись .py файлы в проекте.
-
-Использование:
-    python clear_cache.py
-"""
-
 import shutil
 from pathlib import Path
 

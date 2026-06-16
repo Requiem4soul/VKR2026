@@ -410,8 +410,7 @@ def train_candidate_fast(
             torch.cuda.synchronize()
         gc.collect()
 
-        # Теперь безопасно удаляем временный датасет -
-        # все обращения к data.yaml уже завершены
+        # Теперь безопасно удаляем временный датасет
         if tmp_dataset.exists():
             try:
                 shutil.rmtree(tmp_dataset)
@@ -439,34 +438,6 @@ def _run_training(
     """
     Запускает обучение через wrapper'ы из Модуля 2.
     Возвращает словарь метрик {'mAP50-95', 'mAP50', 'f1'}.
-
-    resume_from: путь к last.pt для warm-start (YOLO).
-        Если указан и файл существует - загружает веса как инициализацию.
-        Используется автоподбором процента скрининга (6_Объединение.py,
-        quick_train_n): вместо обучения с нуля на ep_b эпох - дообучаем
-        с ep_a весов.
-
-        Внутри функции вычисляется epochs_delta = ep_b - resume_start_epoch,
-        и в model.train() передаётся именно дельта. Это гарантирует что
-        lr-schedule охватывает только дополнительные эпохи, а не весь
-        диапазон 0..ep_b.
-
-        Научные обоснования допустимости warm-start для ранжирования:
-        Li et al. (2018) "Hyperband", JMLR 18(185): successive halving
-        warm-start не требует непрерывного lr-schedule - достаточно
-        стартовать с обученных весов для стабильного ранжирования.
-        Egele et al. (2024) Neurocomputing 562: ранжирование Спирмена
-        стабильно независимо от формы lr-schedule при дообучении.
-
-    keep_weights: если True - result_dir НЕ удаляется в finally.
-        Необходимо при вызове из quick_train_n (keep_weights=True в
-        _train_det), чтобы last.pt был доступен для следующего warm-start.
-        При keep_weights=False (обычный SHA-скрининг) result_dir удаляется
-        как раньше.
-
-        Исправление бага: исходный _run_training всегда удалял result_dir
-        в finally, из-за чего last.pt был недоступен для warm-start даже
-        при keep_weights=True в вызывающем коде.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -478,32 +449,7 @@ def _run_training(
             from ultralytics import YOLO
             model_size = model_config.get('size', 'n')
 
-            # Определяем число уже обученных эпох из метаданных last.pt.
-            # Ultralytics сохраняет счётчик в поле 'epoch' (0-based).
-            # При warm-start нужно обучить только дополнительные (delta) эпохи,
-            # чтобы lr-schedule охватывал именно их, а не весь диапазон 0..ep_b.
-            #
-            # Проблема исходного кода: передавался epochs=ep_b (абсолютное).
-            # Без resume=True Ultralytics запускает lr-schedule заново с эпохи 0
-            # и обучает ep_b эпох - это fine-tuning с нуля по расписанию, а не
-            # дообучение с ep_a.
-            #
-            # Li et al. (2018) "Hyperband: A Novel Bandit-Based Approach to
-            # Hyperparameter Optimization", JMLR, 18(185), 1-52:
-            # successive halving warm-start не требует непрерывного lr-schedule;
-            # достаточно стартовать с обученных весов для корректного ранжирования.
-            # Egele et al. (2024) Neurocomputing 562, art. 126930:
-            # ранжирование Спирмена стабильно независимо от формы lr-schedule.
-            # При warm-start вызывающий код (quick_train_n) передаёт уже
-            # готовую дельту эпох (ep_b - ep_a), а не абсолютное число.
-            # Это обходит проблему с Ultralytics: при warm-start счётчик
-            # train_results['epoch'] сбрасывается с нуля в каждом запуске,
-            # поэтому читать суммарное число эпох из last.pt ненадёжно.
-            # Решение: передавать дельту явно - тогда epochs_delta = epochs.
-            # При обычном обучении с нуля (resume_from пустой) epochs тоже
-            # является правильным числом эпох.
-            # Li et al. (2018) JMLR 18(185): warm-start SHA использует
-            # бюджет дополнительных эпох, а не абсолютный.
+            # Определяем число уже обученных эпох из метаданных last.pt
             if resume_from and os.path.exists(resume_from):
                 model = YOLO(resume_from)
                 log_fn(
@@ -529,22 +475,7 @@ def _run_training(
             # Минимум 1 - защита от нулевого запуска.
             epochs_delta = max(1, epochs)
 
-            # -- Определяем lr0 для warm-start ----------------------------
-            # При resume=False Ultralytics создаёт оптимизатор заново.
-            # По умолчанию lr0=0.01 - это слишком агрессивно для дообучения:
-            # высокий lr разрушает тонкую настройку загруженных весов,
-            # вызывая хаотичный разброс метрик (наблюдавшийся ρ≈0.2).
-            #
-            # Howard & Ruder (2018) ACL, pp. 328-339: при fine-tuning lr
-            # должен быть значительно ниже начального (1/10 - 1/3).
-            # Smith (2018) "A disciplined approach to neural network
-            # hyper-parameters", arXiv:1803.09820: lr для transfer learning
-            # рекомендуется 1/10 от базового lr0.
-            #
-            # Решение: при warm-start используем lr0=0.001 (1/10 дефолтного
-            # 0.01), lrf=0.5 (lr в конце = lr0*lrf = 0.0005, не падает
-            # до нуля за короткий цикл), warmup_epochs=1.0 (плавный старт).
-            # При обучении с нуля - дефолтные значения Ultralytics.
+            # Определяем lr0 для warm-start
             _is_warmstart = bool(resume_from and os.path.exists(resume_from))
             if _is_warmstart:
                 _lr0 = 0.001       # 1/10 дефолтного 0.01
@@ -555,13 +486,7 @@ def _run_training(
                 _lrf = 0.01        # дефолт Ultralytics
                 _warmup_ep = 3.0   # дефолт Ultralytics
 
-            # -- Логика lr-schedule и прерывания -------------------------
-            # Если max_epochs_for_schedule задан (> epochs_delta) -
-            # запускаем YOLO на полном бюджете, но прерываем через callback
-            # после epochs_delta эпох. lr-schedule рассчитывается на
-            # max_epochs_for_schedule, что согласует Фазы 1/2 с историями
-            # автоподбора скрининга (тоже обученными на max_epochs).
-            # Если max_epochs_for_schedule не задан - обычный режим.
+            # Логика lr-schedule и прерывания
             _use_schedule_override = (
                 max_epochs_for_schedule > 0
                 and max_epochs_for_schedule > epochs_delta
@@ -608,21 +533,14 @@ def _run_training(
                 lrf=_lrf,
                 warmup_epochs=_warmup_ep,
                 # close_mosaic: если disable_mosaic=True - отключаем полностью.
-                # Используется в Фазах 1/2 для согласованности условий с
-                # историями автоподбора (там тоже close_mosaic=0).
-                # Redmon & Farhadi (2018): мозаика влияет на метрики -
-                # равные условия требуют одинакового режима мозаики.
                 close_mosaic=0 if disable_mosaic else 10,
                 # seed: фиксирует случайность внутри Ultralytics
-                # (инициализация весов, порядок батчей, аугментации).
-                # Dodge & Karam (2017): seed фиксирован -> воспроизводимость.
                 seed=seed,
             )
             if use_early_stopping:
                 train_kwargs['patience'] = early_stopping_patience
             else:
-                # patience=0 отключает встроенный ES Ultralytics для честного
-                # SHA-сравнения - Jamieson & Talwalkar (2016) AISTATS 240-248.
+                # patience=0 отключает встроенный ES Ultralytics для честного сравнения
                 train_kwargs['patience'] = 0
 
             results = model.train(**train_kwargs)
@@ -680,9 +598,7 @@ def _run_training(
             wrapper.initialize(num_classes=num_classes)
             wrapper.model.to(device)
 
-            # Базовый lr для SGD - используется и при обычном обучении,
-            # и при явном сбросе lr после warm-start.
-            # He et al. (2016) и стандартная практика детекции: lr=0.005.
+            # Базовый lr для SGD - используется и при обычном обучении
             _base_lr = 0.005
 
             optimizer = torch.optim.SGD(
@@ -693,25 +609,7 @@ def _run_training(
             )
 
             # Warm-start для Faster R-CNN / RetinaNet.
-            # В отличие от YOLO, здесь нет метаданных эпох в чекпоинте -
-            # чекпоинт содержит только model_state_dict и optimizer_state_dict,
-            # сохранённые через wrapper.save() предыдущего прогона.
-            #
-            # Стратегия аналогична classification_trainer._train_one:
-            # (a) Веса модели - загружаем полностью.
-            # (b) Optimizer state (momentum buffers) - загружаем.
-            #     Sutskever et al. (2013) ICML, pp. 1139-1147: накопленные
-            #     буферы v_t кодируют направление оптимизации; их потеря
-            #     вызывает нестабильность в первых эпохах.
-            # (c) lr - сбрасываем в _base_lr после load_state_dict.
-            #     Howard & Ruder (2018) ACL, pp. 328-339: при каждом новом
-            #     этапе fine-tuning lr возвращается к начальному значению.
-            # (d) epochs - для Faster R-CNN / RetinaNet число эпох в
-            #     чекпоинте не хранится, поэтому epochs_delta передаётся
-            #     явно из вызывающего кода (quick_train_n передаёт дельту
-            #     аналогично YOLO - ep_b - ep_a).
-            #     Li et al. (2018) JMLR 18(185): достаточно стартовать с
-            #     обученных весов для стабильного ранжирования Спирмена.
+            # В отличие от YOLO, здесь нет метаданных эпох в чекпоинте
             resume_start_epoch_det = 0
             if resume_from and os.path.exists(resume_from):
                 try:
@@ -754,12 +652,7 @@ def _run_training(
 
             val_metrics = wrapper.validate(val_loader, device)
 
-            # Сохраняем чекпоинт для следующего warm-start прогона если нужно.
-            # Чекпоинт содержит model_state_dict, optimizer_state_dict и номер
-            # последней эпохи - всё необходимое для корректного warm-start.
-            # keep_weights управляет удалением result_dir в finally ниже;
-            # здесь мы дополнительно сохраняем расширенный чекпоинт с
-            # optimizer_state_dict (стандартный wrapper.save() его не включает).
+            # Сохраняем чекпоинт для следующего warm-start прогона если нужно
             if keep_weights:
                 _ckpt_det_path = result_dir / 'checkpoint_det.pt'
                 result_dir.mkdir(parents=True, exist_ok=True)
@@ -801,13 +694,7 @@ def _run_training(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        # result_dir удаляем только если keep_weights=False (обычный SHA-скрининг).
-        # При keep_weights=True (quick_train_n для автоподбора скрининга)
-        # НЕ удаляем - last.pt должен быть доступен для следующего warm-start прогона.
-        #
-        # Исправление бага: исходный код всегда удалял result_dir, из-за чего
-        # ckpt_path в quick_train_n всегда указывал на несуществующий файл и
-        # warm-start для детекции фактически не работал.
+        # result_dir удаляем только если keep_weights=False (обычный SHA-скрининг)
         if not keep_weights and result_dir.exists():
             try:
                 shutil.rmtree(result_dir)
@@ -816,10 +703,7 @@ def _run_training(
 
     return metrics
 
-
-# ==============================================================================
-# ОБУЧЕНИЕ ДО 100% С ИСТОРИЕЙ МЕТРИК (для автоподбора % скрининга)
-# ==============================================================================
+# Обучение до 100% с сохранением историей
 
 def _run_training_warmstart(
     dataset_path: Path,
@@ -836,22 +720,6 @@ def _run_training_warmstart(
 ) -> Dict[str, float]:
     """
     Дообучение YOLO warm-start с дельта-эпохами.
-
-    Передаём epochs=epochs_delta (дельта, не абсолютное число).
-    Загружаем веса из resume_from как инициализацию (resume=False),
-    lr0 снижен до 0.001 (fine-tune режим).
-
-    Использование дельты вместо total_epochs:
-    - Ultralytics с resume=True имеет баг: иногда обучает неверное
-      число эпох (не remaining = total - done, а total снова с нуля).
-    - Дельта-эпохи + resume=False гарантирует ровно epochs_delta
-      дополнительных эпох независимо от состояния checkpoint.
-    - lr0=0.001 (сниженный) компенсирует отсутствие resume lr-schedule.
-
-    Li et al. (2018) JMLR 18(185): warm-start ранжирование стабильно
-    при дообучении с пониженным lr независимо от формы schedule.
-    Egele et al. (2024) Neurocomputing 562: ранжирование Спирмена
-    устойчиво к вариациям lr-schedule при дообучении.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -966,25 +834,6 @@ def _run_training_full_history(
     """
     Обучает YOLO до 100% эпох с close_mosaic=0 и возвращает историю
     mAP50-95 по каждой эпохе в виде списка [ep1, ep2, ..., ep_N].
-
-    Используется автоподбором процента скрининга в 6_Объединение.py:
-    вместо нескольких отдельных прогонов (warm-start A->B->C) запускается
-    один прогон до конца, а пороговые значения N% / N+10% / N+20%
-    извлекаются из истории как max(0..k) - без повторного обучения.
-
-    close_mosaic=0: отключает мозаику на последних 10 эпохах (дефолт
-    Ultralytics). Без этого кандидаты при разных порогах N% получают
-    разное число эпох без мозаики, что создаёт систематическое смещение
-    при сравнении max(0..N%) vs max(0..N+10%).
-    Redmon & Farhadi (2018): мозаика меняет распределение входных данных -
-    её отсутствие на части прогона влияет на финальные метрики.
-
-    История читается из results.csv который Ultralytics всегда пишет
-    в result_dir/run/results.csv - по одной строке на эпоху.
-
-    Returns:
-        List[float]: история mAP50-95 по эпохам (индекс 0 = эпоха 1).
-                     Пустой список если обучение не удалось.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1050,14 +899,7 @@ def _run_training_full_history(
             else:
                 log_fn(f"  [HISTORY] results.csv не найден: {csv_path}")
 
-            # Паддинг после ES: если ES остановил обучение раньше epochs,
-            # дополняем историю последним реально полученным значением.
-            # Prechelt (1998): ES детектирует плато - после остановки
-            # метрика не изменилась бы существенно. Паддинг последним
-            # значением не вносит новых максимумов в историю, поэтому
-            # max(0..N%) для любого порога остаётся корректным.
-            # Li et al. (2018): все кандидаты должны иметь одинаковую
-            # длину истории для корректного сравнения при бюджете N%.
+            # Паддинг после ES: если ES остановил обучение раньше epochs
             if len(history) < epochs:
                 last_val = history[-1] if history else 0.0
                 padded = epochs - len(history)
@@ -1121,7 +963,6 @@ def _run_training_full_history(
             torch.cuda.empty_cache()
         gc.collect()
         # result_dir НЕ удаляем - best.pt может понадобиться для финального
-        # обучения если этот кандидат окажется победителем Фазы 2.
 
     return history
 
@@ -1129,23 +970,6 @@ def _run_training_full_history(
 def _history_score_at(history: List[float], ratio: float) -> float:
     """
     Возвращает max(mAP50-95) по первым ratio*len(history) эпохам.
-
-    Используется автоподбором скрининга для извлечения score кандидата
-    при бюджете ratio% из уже готовой истории одного прогона.
-
-    Args:
-        history: список mAP50-95 по эпохам (из _run_training_full_history)
-        ratio:   доля эпох, например 0.5 для 50%
-
-    Returns:
-        float: max mAP50-95 за первые ratio*N эпох. 0.0 если история пуста.
-
-    Научное обоснование использования max:
-    Li et al. (2018) JMLR 18(185): SHA сохраняет лучшего кандидата -
-    score кандидата определяется его пиковым потенциалом на данном бюджете,
-    а не финальным состоянием (которое может быть хуже из-за шума).
-    Использование max(0..k) корректно потому что best.pt в обычном
-    _run_training тоже отражает пик, а не финал.
     """
     if not history:
         return 0.0
@@ -1155,9 +979,7 @@ def _history_score_at(history: List[float], ratio: float) -> float:
     return max(history[:k])
 
 
-# ==============================================================================
-# ФИНАЛЬНОЕ ОБУЧЕНИЕ (не удаляет веса, eval на test)
-# ==============================================================================
+# Финальное полное обучение (не удаляет веса, eval на test)
 
 def _run_training_final(
     dataset_path: Path,
@@ -1171,10 +993,6 @@ def _run_training_final(
 ) -> Dict[str, float]:
     """
     Финальное обучение победителя на постоянном датасете.
-    Отличия от _run_training:
-    - Early stopping включён всегда
-    - result_dir НЕ удаляется (веса остаются рядом с датасетом-победителем)
-    - eval_split = 'test' (независимая оценка)
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1310,9 +1128,7 @@ def _run_training_final(
     return metrics
 
 
-# ==============================================================================
-# SHA-ОТСЕВ
-# ==============================================================================
+# Утилита SHA
 
 def sha_prune(
     candidates: List[Pipeline],
@@ -1320,7 +1136,6 @@ def sha_prune(
 ) -> List[Pipeline]:
     """
     Successive Halving: оставляет top-ceil(N/eta) кандидатов по composite score.
-    Jamieson & Talwalkar (2016).
     """
     n = len(candidates)
     keep_count = math.ceil(n / eta)
@@ -1330,9 +1145,7 @@ def sha_prune(
     return sorted_candidates[:keep_count]
 
 
-# ==============================================================================
-# ОСНОВНОЙ АЛГОРИТМ SFS + SHA
-# ==============================================================================
+# SFS + SHA
 
 @dataclass
 class SearchResult:
@@ -1358,20 +1171,6 @@ def run_sfs_sha_search(
 ) -> SearchResult:
     """
     Запускает SFS+SHA поиск пайплайна предобработки.
-
-    Args:
-        source_dataset_path: Путь к исходному датасету
-        model_config: Конфиг proxy-модели {'type': 'yolo', 'size': 'n', ...}
-        max_epochs: Максимальное число эпох proxy-модели (30% берётся автоматически)
-        early_stopping_patience: Patience для early stopping финального обучения
-        datasets_global_path: Корневая папка датасетов (из .env).
-                              Структура: <datasets_global_path>/m3_runs/<dataset>_<timestamp>/
-                              Если None - берётся из переменной окружения DATASETS_GLOBAL_PATH.
-        log_fn: Функция логирования
-        progress_callback: Колбэк прогресса (iteration, total, stage, message)
-
-    Returns:
-        SearchResult с лучшим пайплайном
     """
     if log_fn is None:
         log_fn = print
@@ -1423,7 +1222,7 @@ def run_sfs_sha_search(
     log_fn(f"epsilon:         {EPSILON}")
     log_fn("")
 
-    # -- ИНИЦИАЛИЗАЦИЯ ------------------------------------------------------
+    # Инициализация
     pool = build_candidate_pool()
     pool_by_id = {c['id']: c for c in pool}
 
@@ -1446,7 +1245,7 @@ def run_sfs_sha_search(
     stop_reason = ''
     N = len(pool)
 
-    # -- ИТЕРАЦИИ SFS ------------------------------------------------------
+    # Итерации SFS
     for iteration in range(1, N + 1):
         log_fn("-" * 70)
         log_fn(f"ИТЕРАЦИЯ {iteration}/{N}")
@@ -1456,7 +1255,7 @@ def run_sfs_sha_search(
             progress_callback(iteration, N, 'expand',
                               f'Итерация {iteration}: расширение кандидатов')
 
-        # -- 1. РАСШИРЕНИЕ -------------------------------------------------
+        # Расширение территории
         candidates = []
         for survivor in survivors:
             candidates.append(survivor.clone())
@@ -1485,7 +1284,7 @@ def run_sfs_sha_search(
 
         log_fn(f"Кандидатов после расширения: {len(candidates)}")
 
-        # -- 2. БЫСТРОЕ ОБУЧЕНИЕ -------------------------------------------
+        # Быстрое обучение
         log_fn(f"\nБыстрое обучение ({fast_epochs} эп., eval=valid, без ES):")
         for i, candidate in enumerate(candidates):
             log_fn(f"\n  [{i+1}/{len(candidates)}] {candidate.display_name}")
@@ -1518,7 +1317,7 @@ def run_sfs_sha_search(
             log_fn(f"  {i+1:2d}. {c.display_name:45s} "
                    f"score={c.score:.4f}  mAP={c.metrics.get('mAP50-95', 0.0):.4f}{marker}")
 
-        # -- 3. SHA-ОТСЕВ --------------------------------------------------
+        # SHA отсев
         survivors_new = sha_prune(candidates, eta=ETA)
         eliminated = [c for c in candidates if c not in survivors_new]
 
@@ -1541,7 +1340,7 @@ def run_sfs_sha_search(
         }
         history.append(iter_data)
 
-        # -- 4. КРИТЕРИЙ ОСТАНОВКИ -----------------------------------------
+        # Критерий остановки
         if len(survivors_new) == 1:
             best_pipeline = survivors_new[0]
             best_map = best_pipeline.metrics.get('mAP50-95', 0.0)
@@ -1566,7 +1365,7 @@ def run_sfs_sha_search(
             log_fn(f"\n>>> СТОП: {stop_reason}")
             break
 
-    # -- ФИНАЛЬНОЕ ОБУЧЕНИЕ (100% эпох, eval на test) -----------------------
+    # Финальное обучение
     log_fn("")
     log_fn("=" * 70)
     log_fn("ФИНАЛЬНОЕ ОБУЧЕНИЕ (100% эпох, eval=test, с early stopping)")

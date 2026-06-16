@@ -1,8 +1,3 @@
-"""
-VKR2026 — Streamlit интерфейс
-Главная страница: навигация и статус системы
-"""
-
 import streamlit as st
 from ui.state import init_session_state, get_datasets_path, is_path_configured
 from ui.sidebar import render_sidebar

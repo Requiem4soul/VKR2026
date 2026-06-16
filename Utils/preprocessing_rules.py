@@ -1,36 +1,14 @@
-"""
-Правила предобработки для различных типов изображений
-
-Каждый тип изображений требует специфического подхода к предобработке,
-основанного на физических характеристиках процесса получения изображения.
-
-Научное обоснование:
-- SAR: Oliver & Quegan (2004), Lee (1981) - speckle шум нельзя убирать стандартной коррекцией яркости
-- Medical: Pisano et al. (1998) - CLAHE с консервативными параметрами
-- Natural: Tomasi & Manduchi (1998) - bilateral filtering
-- Infrared: Vollmer & Möllmann (2017) - агрессивное улучшение контраста
-- Microscopy: Kolarević et al. (2018) Journal of Microscopy 269(3):264-276 — локальные методы эффективнее глобальных
-
-Автор: Система адаптивной предобработки
-Дата: 2025
-"""
-
 from typing import Dict, List, Any
 
 
 class PreprocessingRules:
     """
     Правила предобработки для различных модальностей изображений
-    
-    Каждое правило содержит:
-    - Разрешённые/запрещённые методы
-    - Параметры методов
-    - Научное обоснование
     """
     
     RULES = {
         'sar': {
-            # === РАЗРЕШЁННЫЕ МЕТОДЫ ===
+            # Да
             'denoise': {
                 'enabled': True,
                 'method': 'median',
@@ -38,9 +16,9 @@ class PreprocessingRules:
                     'ksize': 5
                 },
                 'rationale': 'Шумоподавление разрешено для SAR. Median фильтр подходит '
-                            'как простая альтернатива Lee-фильтру. Lee-фильтр (Lee, 1981) '
+                            'как простая альтернатива Lee-фильтру. Lee-фильтр '
                             'оптимален для мультипликативного speckle, но median также '
-                            'применяется в SAR (Gonzalez & Woods, 2018). Конкретный метод '
+                            'применяется в SAR. Конкретный метод '
                             'определяется алгоритмом подбора из пула кандидатов.'
             },
             
@@ -80,8 +58,7 @@ class PreprocessingRules:
                             'многократному усилению speckle вместо его подавления. '
                             'Oliver & Quegan (2004), ibid.'
             },
-            
-            # === ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ ===
+
             'source': 'Oliver & Quegan (2004) "Understanding Synthetic Aperture Radar Images", SciTech Publishing; '
                      'Lee J.S. (1981) IEEE Trans. Pattern Anal. Mach. Intell., 2:165-168',
             'description': 'SAR изображения требуют минимальной обработки - только подавление speckle шума'
@@ -332,12 +309,6 @@ class PreprocessingRules:
     def get_rules(cls, modality: str) -> Dict:
         """
         Получить правила предобработки для конкретного типа изображений
-        
-        Args:
-            modality: Тип изображений ('sar', 'medical_xray', и т.д.)
-            
-        Returns:
-            dict: Правила для данного типа
         """
         return cls.RULES.get(modality, cls.RULES['natural_photo'])  # По умолчанию - natural
     
@@ -345,13 +316,6 @@ class PreprocessingRules:
     def is_method_allowed(cls, modality: str, method: str) -> bool:
         """
         Проверяет разрешён ли метод для данного типа изображений
-        
-        Args:
-            modality: Тип изображений
-            method: Название метода ('denoise', 'brightness_correction', и т.д.)
-            
-        Returns:
-            bool: True если метод разрешён
         """
         rules = cls.get_rules(modality)
         
@@ -359,18 +323,12 @@ class PreprocessingRules:
             return True  # Если правила нет - разрешаем по умолчанию
         
         return rules[method].get('enabled', True)
-    
+
+    # Мертво, но удалять страшно
     @classmethod
     def get_method_params(cls, modality: str, method: str) -> Dict:
         """
         Получить рекомендуемые параметры метода для типа изображений
-        
-        Args:
-            modality: Тип изображений
-            method: Название метода
-            
-        Returns:
-            dict: Параметры метода
         """
         rules = cls.get_rules(modality)
         
@@ -383,13 +341,6 @@ class PreprocessingRules:
     def get_rationale(cls, modality: str, method: str) -> str:
         """
         Получить объяснение почему метод разрешён/запрещён
-        
-        Args:
-            modality: Тип изображений
-            method: Название метода
-            
-        Returns:
-            str: Объяснение
         """
         rules = cls.get_rules(modality)
         
@@ -402,9 +353,6 @@ class PreprocessingRules:
     def print_rules_summary(cls, modality: str):
         """
         Красиво печатает правила для типа изображений
-        
-        Args:
-            modality: Тип изображений
         """
         rules = cls.get_rules(modality)
         
@@ -452,8 +400,3 @@ def demonstrate_rules():
     for modality in modalities:
         PreprocessingRules.print_rules_summary(modality)
         print("\n")
-
-
-if __name__ == '__main__':
-    # Запускаем демонстрацию
-    demonstrate_rules()

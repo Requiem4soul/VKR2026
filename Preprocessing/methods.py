@@ -1,13 +1,3 @@
-"""
-Методы предобработки изображений
-
-Содержит все методы для улучшения качества изображений:
-- Шумоподавление (denoise)
-- Улучшение контраста (contrast_enhancement)
-- Коррекция яркости (brightness_correction)
-- Увеличение резкости (sharpening)
-"""
-
 import cv2
 import numpy as np
 from typing import Dict, List, Any, Optional
@@ -25,82 +15,27 @@ class PreprocessingMethods:
             **kwargs
     ) -> np.ndarray:
         """
-        Шумоподавление с автоматическим выбором фильтра
-
-        Научное обоснование выбора четырёх классических пространственных фильтров.
-
-        Набор фильтров сформирован на основе:
-          - Gonzalez & Woods (2018) "Digital Image Processing", 4th ed., Pearson —
-            глава 5 выделяет Gaussian, Median, Wiener и Adaptive (Bilateral) как
-            основные пространственные фильтры шумоподавления.
-          - Fan et al. (2019) "Brief review of image denoising techniques",
-            Visual Computing for Industry, Biomedicine, and Art, 2(1) —
-            сравнительный обзор подтверждает тот же набор как базовый.
-          - Tomasi & Manduchi (1998) "Bilateral filtering for gray and color images",
-            ICCV — оригинальная статья по Bilateral filter.
-          - Wiener N. (1949) "Extrapolation, Interpolation and Smoothing of
-            Stationary Time Series", MIT Press — оригинальный Wiener filter.
-
-        Покрытие типов шума:
-          1. Gaussian noise → Bilateral filter (сохраняет края)
-             Tomasi & Manduchi (1998), ibid.
-          2. Salt & Pepper → Median filter (золотой стандарт для импульсного шума)
-             Gonzalez & Woods (2018), ibid.
-          3. Смешанный / неизвестный → Gaussian blur (быстрый, общего назначения)
-             Gonzalez & Woods (2018), ibid.
-          4. Адаптивный (любой тип) → Wiener filter (локально адаптируется к
-             дисперсии шума; заменяет NLM ради вычислительной эффективности)
-             Wiener (1949), ibid.; Fan et al. (2019), ibid.
-          5. Мультипликативный speckle (SAR) → Lee filter (разработан специально
-             для мультипликативной модели шума SAR; адаптирует сглаживание по
-             локальному коэффициенту вариации)
-             Lee (1980) IEEE Trans. PAMI-2(2):165-168;
-             Lee (1981) Comput. Graph. Image Process. 17(1):24-32.
-
-        Args:
-            image: Входное изображение
-            method: 'auto' (автовыбор), 'median', 'gaussian', 'bilateral', 'wiener', 'lee'
-            noise_type: 'gaussian', 'salt_pepper', 'speckle', 'unknown'
-            noise_level: 'low', 'medium', 'high'
-            **kwargs: Дополнительные параметры для фильтров
-
-        Returns:
-            Обработанное изображение
+        Устаревший код, который не используется. Кстати ещё с первой реализации самой
         """
-
-        # Нормализуем (H,W,1) → (H,W).
-        # cv2.bilateralFilter и ряд других OpenCV-фильтров не принимают
-        # одноканальный 3D массив (scn=1 → ошибка). После обработки
-        # shape восстанавливается.
         squeezed = False
         if image.ndim == 3 and image.shape[2] == 1:
             image = image[:, :, 0]
             squeezed = True
 
-        # Автоматический выбор фильтра на основе типа шума.
-        # Gonzalez & Woods (2018) гл. 5; Fan et al. (2019).
         if method == 'auto':
             if noise_type == 'gaussian':
-                # Bilateral filter идеален для Gaussian noise — сохраняет края
-                # Tomasi & Manduchi (1998)
                 method = 'bilateral'
 
             elif noise_type in ('salt_pepper', 'speckle'):
-                # Median filter — золотой стандарт для импульсного шума
-                # Gonzalez & Woods (2018)
                 method = 'median'
 
-            else:  # unknown
-                # Wiener filter — адаптируется к локальной дисперсии шума,
-                # подходит при неизвестном типе шума. Wiener (1949).
+            else:
                 method = 'wiener'
                 if 'size' not in kwargs:
                     kwargs['size'] = 5
 
-        # Применяем выбранный фильтр
         result = image  # fallback если метод не распознан
         if method == 'median':
-            # Adaptive kernel size based on noise level
             if noise_level == 'high':
                 ksize = kwargs.get('ksize', 7)
             elif noise_level == 'medium':
@@ -111,7 +46,6 @@ class PreprocessingMethods:
             result = cv2.medianBlur(image, ksize)
 
         elif method == 'bilateral':
-            # Адаптивные параметры для bilateral filter
             if noise_level == 'high':
                 d = kwargs.get('d', 9)
                 sigma_color = kwargs.get('sigma_color', 90)
@@ -128,22 +62,12 @@ class PreprocessingMethods:
             result = cv2.bilateralFilter(image, d, sigma_color, sigma_space)
 
         elif method == 'gaussian':
-            # Gaussian blur — быстрый линейный фильтр общего назначения.
-            # Эффективен для равномерного фонового шума.
-            # Gonzalez & Woods (2018), гл. 3.
             ksize = kwargs.get('ksize', 3)
-            # ksize должен быть нечётным
             if ksize % 2 == 0:
                 ksize += 1
             result = cv2.GaussianBlur(image, (ksize, ksize), 0)
 
         elif method == 'wiener':
-            # Wiener filter — адаптивный фильтр, минимизирующий среднеквадратичную
-            # ошибку. Локально адаптируется к дисперсии шума: в однородных областях
-            # сглаживает сильнее, вблизи краёв — слабее.
-            # Wiener (1949); реализация через scipy.signal.wiener.
-            # Заменяет NLM: сопоставимое качество при на порядок меньших вычислениях.
-            # Fan et al. (2019) "Brief review of image denoising techniques".
             from scipy.signal import wiener as scipy_wiener
             size = kwargs.get('size', 5)
             # scipy.signal.wiener работает с float, возвращает float
@@ -158,24 +82,8 @@ class PreprocessingMethods:
             result = np.clip(filtered, 0, 255).astype(np.uint8)
 
         elif method == 'lee':
-            # Lee filter — специализированный фильтр для мультипликативного
-            # speckle-шума в SAR изображениях. Адаптирует степень сглаживания
-            # на основе локального коэффициента вариации (CV = std/mean):
-            # в однородных областях (низкий CV) сглаживает сильнее,
-            # вблизи краёв и ярких объектов (высокий CV) сохраняет детали.
-            #
-            # Модель шума: y = x * n, где n — мультипликативный speckle.
-            # Оценка сигнала: x_hat = mean + k * (y - mean),
-            # где k = var_x / var_y, var_x = max(0, var_y - mean²/ENL).
-            # ENL (Equivalent Number of Looks) = 1 для single-look SAR.
-            #
-            # Lee J.S. (1980) "Digital image enhancement and noise filtering
-            # by use of local statistics", IEEE Trans. Pattern Anal. Mach. Intell.,
-            # PAMI-2(2):165-168.
-            # Lee J.S. (1981) "Speckle analysis and smoothing of synthetic aperture
-            # radar images", Computer Graphics and Image Processing, 17(1):24-32.
             ksize = kwargs.get('ksize', 3)
-            enl = kwargs.get('enl', 1.0)  # Equivalent Number of Looks
+            enl = kwargs.get('enl', 1.0)
 
             def _lee_single_channel(img_ch: np.ndarray) -> np.ndarray:
                 img_f = img_ch.astype(np.float64)
@@ -184,13 +92,8 @@ class PreprocessingMethods:
                 mean_sq = cv2.boxFilter(img_f ** 2, ddepth=-1, ksize=(ksize, ksize))
                 var_y = mean_sq - mean ** 2
                 var_y = np.maximum(var_y, 0.0)
-                # Дисперсия сигнала (вычитаем вклад шума)
-                # Для мультипликативного шума: var_x = var_y - mean²/ENL
                 var_x = var_y - (mean ** 2) / enl
                 var_x = np.maximum(var_x, 0.0)
-                # Весовой коэффициент Lee
-                # k = 0 в однородных областях (чистое усреднение),
-                # k → 1 вблизи краёв (сохранение оригинала)
                 k = np.where(var_y > 0, var_x / var_y, 0.0)
                 filtered = mean + k * (img_f - mean)
                 return np.clip(filtered, 0, 255).astype(np.uint8)
@@ -215,19 +118,7 @@ class PreprocessingMethods:
     ) -> np.ndarray:
         """
         Улучшение контраста.
-
-        Поддерживает grayscale (2D), одноканальный 3D (H,W,1) и RGB (H,W,3).
-        Одноканальный 3D squeeze-ится до 2D перед обработкой и восстанавливается
-        в конце — это нужно для MIAS и аналогичных grayscale датасетов где
-        cv2.IMREAD_UNCHANGED может вернуть (H,W,1) вместо (H,W).
-
-        Args:
-            method: 'clahe', 'histogram_eq'
-            **kwargs: Дополнительные параметры
         """
-        # Нормализуем одноканальный 3D → 2D.
-        # cv2.IMREAD_UNCHANGED на grayscale PNG иногда возвращает (H,W,1),
-        # что вызывает ошибку cvtColor(COLOR_BGR2LAB): scn=1 не поддерживается.
         squeezed = False
         if image.ndim == 3 and image.shape[2] == 1:
             image = image[:, :, 0]
@@ -239,17 +130,12 @@ class PreprocessingMethods:
             clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
 
             if image.ndim == 3:
-                # RGB: применяем CLAHE только к L-каналу в LAB пространстве.
-                # Это стандартный подход для цветных изображений —
-                # улучшаем яркость не затрагивая цвет.
-                # Pisano et al. (1998); Gonzalez & Woods (2018).
+                # RGB: применяем CLAHE только к L-каналу в LAB пространстве..
                 lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
                 lab[:, :, 0] = clahe.apply(lab[:, :, 0])
                 result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
             else:
                 # Grayscale (2D): применяем CLAHE напрямую.
-                # Стандарт в медицинской визуализации.
-                # Pisano et al. (1998) J. Digital Imaging, 11(4), 193-200.
                 result = clahe.apply(image)
 
         elif method == 'histogram_eq':
@@ -276,41 +162,10 @@ class PreprocessingMethods:
     ) -> np.ndarray:
         """
         Гамма-коррекция яркости изображения.
-
-        Применяет нелинейное степенное преобразование: I_out = I_in ^ gamma.
-        Значения gamma < 1.0 осветляют изображение (подтягивают тёмные области),
-        gamma > 1.0 затемняют (подавляют пересветы).
-
-        Научное обоснование:
-        - Gonzalez & Woods (2018) "Digital Image Processing", 4th ed., гл. 3.2 —
-          степенное (гамма) преобразование как базовый инструмент коррекции яркости.
-        - Farid & Adelson (1994) показали что нелинейная гамма-коррекция точнее
-          отражает перцептивное восприятие яркости чем линейное масштабирование.
-
-        Реализация:
-          Для RGB применяется поканально в пространстве [0, 1].
-          Для grayscale — напрямую.
-          Цветовые соотношения между каналами сохраняются.
-
-        Args:
-            image: Входное изображение (uint8, любое число каналов)
-            gamma: Показатель степени. gamma < 1 → осветление; gamma > 1 → затемнение.
-                   gamma = 1.0 → изображение не изменяется.
-            **kwargs: Игнорируются (для совместимости с pipeline)
-
-        Returns:
-            Обработанное изображение (uint8, тот же shape)
         """
         if gamma <= 0:
             return image
 
-        # Строим LUT (Look-Up Table) 256 значений — O(1) на пиксель.
-        # Значительно быстрее поэлементного возведения в степень.
-        # Стандартная формула гамма-коррекции: I_out = I_in ^ gamma
-        # (Gonzalez & Woods, 2018, гл. 3.2):
-        #   gamma < 1 → осветляет (дробная степень, значения растут)
-        #   gamma > 1 → затемняет (квадратичная степень, значения падают)
-        #   gamma = 1 → изображение не изменяется
         lut = np.array(
             [((i / 255.0) ** gamma) * 255.0 for i in range(256)],
             dtype=np.uint8,
@@ -325,10 +180,6 @@ class PreprocessingMethods:
     ) -> np.ndarray:
         """
         Увеличение резкости
-
-        Args:
-            method: 'unsharp_mask', 'laplacian'
-            **kwargs: Дополнительные параметры
         """
         if method == 'unsharp_mask':
             # Unsharp masking
@@ -356,15 +207,6 @@ class PreprocessingMethods:
     ) -> np.ndarray:
         """
         Применяет последовательность методов
-
-        Args:
-            image: Входное изображение
-            methods: Список методов ['denoise', 'contrast_enhancement', ...]
-            params: Параметры для каждого метода
-                    Например: {
-                        'denoise': {'method': 'median', 'ksize': 5},
-                        'contrast_enhancement': {'clip_limit': 2.0}
-                    }
         """
         if params is None:
             params = {}
@@ -376,7 +218,6 @@ class PreprocessingMethods:
 
             # Поддержка ключей вида "denoise__1", "contrast_enhancement__0" и т.д.
             # merge_methods_params добавляет суффикс __N когда один тип метода
-            # встречается несколько раз в пайплайне (например Gaussian + Wiener).
             base_method = method.split("__")[0]
 
             if base_method == 'denoise':

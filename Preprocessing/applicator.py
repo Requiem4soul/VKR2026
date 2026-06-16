@@ -1,10 +1,3 @@
-"""
-Применение предобработки к датасету.
-Поддерживает два формата датасетов:
-- YOLO: split/images/*.jpg + split/labels/*.txt + data.yaml
-- Классификация: split/class_name/*.jpg (ImageFolder)
-"""
-
 import shutil
 from pathlib import Path
 from tqdm import tqdm
@@ -57,9 +50,6 @@ def _create_dst_structure(src_path: Path, dst_path: Path,
             (dst_path / split / 'images').mkdir(parents=True, exist_ok=True)
             (dst_path / split / 'labels').mkdir(parents=True, exist_ok=True)
         if (src_path / 'data.yaml').exists():
-            # Обновляем пути в data.yaml на абсолютные пути назначения.
-            # Относительные пути из оригинала не работают когда датасет
-            # скопирован в другую папку (YOLO не найдёт split='val'/'test').
             try:
                 import yaml as _yaml
                 with open(src_path / 'data.yaml', 'r', encoding='utf-8') as _f:
@@ -94,9 +84,7 @@ def _create_dst_structure(src_path: Path, dst_path: Path,
 def _dst_image_path(src_img: Path, src_split_dir: Path,
                      dst_split_dir: Path) -> Path:
     """
-    Вычисляет путь назначения для изображения, сохраняя относительную структуру.
-    Для YOLO: dst/split/images/file.jpg
-    Для классификации: dst/split/class_name/file.jpg
+    Вычисляет путь назначения для изображения, сохраняя относительную структуру
     """
     rel = src_img.relative_to(src_split_dir)
     return dst_split_dir / rel
@@ -114,24 +102,14 @@ class DatasetPreprocessor:
             target_dataset: str,
             methods: List[str],
             params: Optional[Dict[str, Dict[str, Any]]] = None,
-            splits: List[str] = ['train', 'valid', 'test']
+            splits: List[str] = ['train', 'valid', 'test'],
+            target_path: Optional[Path] = None,
     ):
         """
         Применяет одну и ту же предобработку ко всем изображениям.
-
-        Args:
-            source_dataset: Название исходного датасета
-            target_dataset: Название нового датасета
-            methods: Список методов ['denoise', 'contrast_enhancement', ...]
-            params: Параметры для методов, например:
-                    {
-                        'denoise': {'method': 'median', 'ksize': 5},
-                        'contrast_enhancement': {'clip_limit': 1.0}
-                    }
-            splits: Какие splits обрабатывать
         """
         src_path = get_dataset_path(source_dataset)
-        dst_path = get_dataset_path(target_dataset)
+        dst_path = target_path if target_path is not None else get_dataset_path(target_dataset)
         dataset_type = _detect_dataset_type(src_path)
 
         print(f"\nПрименяем глобальную предобработку:")
@@ -150,11 +128,7 @@ class DatasetPreprocessor:
 
         _create_dst_structure(src_path, dst_path, splits, dataset_type)
 
-        # -- RAM-кеш оригинальных изображений ------------------------------
-        # На HDD чтение тысяч мелких файлов - основное узкое место.
-        # Читаем все изображения один раз в RAM, повторные вызовы берут из кеша.
-        # Лимит: 70% от реально доступной памяти (psutil.virtual_memory().available).
-        # available уже учитывает кеш ОС который может быть освобождён при нужде.
+        # Загрузка в VRAM датасетов
         _img_cache: Dict[str, np.ndarray] = {}
         try:
             import psutil

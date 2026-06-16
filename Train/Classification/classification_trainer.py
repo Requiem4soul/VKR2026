@@ -1,33 +1,3 @@
-"""
-Train/Classification/classification_trainer.py
-Тренер моделей классификации изображений для задачи MedMNIST-подобных датасетов.
-
-Поддерживаемые модели:
-- ResNet-18  (He et al., 2016, CVPR)
-- ResNet-50  (He et al., 2016, CVPR)
-- EfficientNet-B0  (Tan & Le, 2019, ICML)
-
-Особенности (по образу universal_model_trainer.py):
-- Чекпоинты каждые N эпох + очистка GPU-памяти после каждой модели
-- Early Stopping (Prechelt, 1998)
-- Воспроизводимость через глобальный seed (torch, numpy, random, cudnn)
-- Поддержка multi-class / binary / multi-label задач
-- Автоматический подбор batch_size по VRAM
-- Гиперпараметры по умолчанию из Yang et al. (2021) MedMNIST:
-    epochs=100, SGD, lr=1e-3, batch=128
-
-Структура датасета (папка):
-    <dataset>/
-        train/   *.jpg / *.png  +  labels.csv  (или подпапки по классам)
-        valid/   ...
-        test/    ...
-        dataset_info.json   {"num_classes": N, "task": "multi-class"|"binary"|"multi-label"}
-
-Альтернативно поддерживается ImageFolder-структура (подпапки = классы).
-
-Автор: VKR2026
-"""
-
 from __future__ import annotations
 
 import gc
@@ -51,22 +21,11 @@ from torchvision import models, transforms
 from torchvision.datasets import ImageFolder
 from PIL import Image
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ВОСПРОИЗВОДИМОСТЬ (seed)
-# ══════════════════════════════════════════════════════════════════════════════
+# Воспроизводимость
 
 def set_global_seed(seed: int) -> None:
     """
-    Фиксирует все источники случайности для воспроизводимых результатов.
-
-    Научное обоснование необходимости фиксации seed:
-    Dodge & Karam (2017) показали, что случайная инициализация весов может
-    давать разброс метрик до 2-3% на стандартных бенчмарках.
-
-    Ограничение: torch.backends.cudnn.deterministic=True может немного
-    замедлить обучение, но гарантирует идентичность результатов при
-    одинаковом seed на одном и том же оборудовании.
+    Фиксирует все источники случайности для воспроизводимых результатов
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -78,9 +37,7 @@ def set_global_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# УТИЛИТЫ VRAM / BATCH SIZE
-# ══════════════════════════════════════════════════════════════════════════════
+# Утилиты
 
 def get_available_vram_gb() -> float:
     if not torch.cuda.is_available():
@@ -96,10 +53,7 @@ def calculate_optimal_batch_size_cls(
 ) -> int:
     """
     Вычисляет оптимальный batch_size для классификации на основе VRAM.
-    Базовые значения ориентированы на image_size=224 (стандарт ImageNet).
-
-    Из статьи Yang et al. (2021) batch=128 при изображениях 28x28 и 224x224
-    на ResNet. Масштабируем относительно доступной памяти.
+    Базовые значения ориентированы на image_size=224 (стандарт ImageNet)
     """
     if vram_gb <= 0:
         return 16  # CPU-fallback
@@ -122,17 +76,12 @@ def calculate_optimal_batch_size_cls(
     return max(1, min(max_batch, batch))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EARLY STOPPING (аналог из universal_model_trainer)
-# ══════════════════════════════════════════════════════════════════════════════
+# Раняя остановка
 
 @dataclass
 class EarlyStoppingConfig:
-    """Конфигурация Early Stopping (Prechelt, 1998)."""
+    """Конфигурация Early Stopping"""
     patience: int = 10
-    # Prechelt (1998) "Early Stopping — But When?": min_delta порядка
-    # 0.1% от масштаба метрики. Для AUC в high-accuracy режиме (>0.95)
-    # улучшения идут на тысячные — 0.001 отсекает их. 1e-4 корректнее.
     min_delta: float = 0.0001
     metric: str = "val_acc"   # или "val_auc", "val_loss"
     mode: str = "max"         # "max" для acc/auc, "min" для loss
@@ -142,7 +91,6 @@ class EarlyStoppingConfig:
 class EarlyStopping:
     """
     Early Stopping для предотвращения переобучения.
-    Научное обоснование: Prechelt (1998); Caruana et al. (2001).
     """
 
     def __init__(self, config: EarlyStoppingConfig, model_key: str):
@@ -206,30 +154,12 @@ class EarlyStopping:
             "stopped_early": self.patience_counter >= self.config.patience,
         }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PREFETCHER (overlap CPU loading и GPU compute)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class DataPrefetcher:
     """
     Однопоточный prefetcher для DataLoader.
 
     Проблема: при num_workers=0 на Windows DataLoader загружает батчи
     синхронно — GPU простаивает пока CPU читает и трансформирует изображения.
-
-    Решение: загружаем следующий батч в фоновом threading.Thread пока GPU
-    обрабатывает текущий. Это даёт реальный overlap CPU/GPU без multiprocessing
-    (который конфликтует с Streamlit на Windows из-за spawn-метода).
-
-    Использование threading.Thread (не multiprocessing) гарантирует:
-    - нет pickle-сериализации датасета (проблема multiprocessing на Windows)
-    - нет fork (недоступен на Windows)
-    - нет конфликтов с Streamlit-потоком
-    - исключения из prefetch-потока корректно пробрасываются в главный поток
-
-    Прирост скорости: 20–40% на типичных датасетах при num_workers=0.
-    Эффект тем больше, чем медленнее диск и больше трансформаций.
     """
 
     def __init__(self, loader: DataLoader, device: torch.device):
@@ -299,24 +229,11 @@ class DataPrefetcher:
         return len(self.loader)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ДАТАСЕТ
-# ══════════════════════════════════════════════════════════════════════════════
+# Работа с датасетами
 
 def _default_transforms(image_size: int, split: str) -> transforms.Compose:
     """
     Трансформации для классификации без аугментации.
-
-    Аугментации (RandomCrop, RandomHorizontalFlip) намеренно исключены:
-    данная работа исследует влияние предобработки на качество модели
-    на оригинальных данных. Аугментации вносят дополнительную случайность
-    и искусственно расширяют обучающую выборку, что затрудняет честное
-    сравнение пайплайнов предобработки.
-
-    Для всех сплитов применяется одинаковый детерминированный pipeline:
-    Resize → CenterCrop → ToTensor → Normalize (ImageNet stats).
-    CenterCrop вместо простого Resize сохраняет стандартную практику
-    Yang et al. (2021) MedMNIST для финального размера изображения.
     """
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -333,12 +250,6 @@ def _default_transforms(image_size: int, split: str) -> transforms.Compose:
 class ClassificationDataset(Dataset):
     """
     Универсальный датасет для классификации.
-
-    Поддерживает два формата:
-    1. ImageFolder-структура (подпапки = классы):
-       <split>/class_a/img.jpg, <split>/class_b/img.jpg
-    2. Flat-структура с labels.csv:
-       <split>/images/img.jpg  +  <split>/labels.csv  (колонки: filename, label)
     """
 
     def __init__(
@@ -411,18 +322,6 @@ class ClassificationDataset(Dataset):
         """
         Загружает все изображения в RAM (PIL, после предварительного Resize).
         Вызывается один раз при создании датасета если cache_in_memory=True.
-
-        ВАЖНО: Resize выполняется ДО кеширования.
-        Это предотвращает хранение оригинальных изображений (640×640 и крупнее)
-        вместо уменьшенных (224×224), что приводило бы к многократному
-        перерасходу RAM. Без этого Resize 7k изображений 640×640 занимали бы
-        ~2.6 GB вместо ~0.45 GB при 224×224.
-
-        В __getitem__ transform применяется поверх уже уменьшенного PIL —
-        CenterCrop и ToTensor работают корректно.
-
-        Оценка RAM: N × image_size² × 3 байт (uint8 PIL) после Resize.
-        При 7k изображений image_size=224: 7000 × 224² × 3 ≈ 0.45 GB.
         """
         # Размер для предварительного Resize: чуть больше image_size
         # чтобы CenterCrop в transform работал корректно (аналог _default_transforms).
@@ -490,9 +389,7 @@ def get_dataset_info(dataset_path: Path) -> Dict[str, Any]:
     return {"num_classes": 2, "task": "binary", "num_channels": 3, "image_size": 224}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# МОДЕЛИ
-# ══════════════════════════════════════════════════════════════════════════════
+# Модели
 
 def build_model(
     model_type: str,
@@ -502,22 +399,7 @@ def build_model(
     freeze_backbone: bool = False,
 ) -> nn.Module:
     """
-    Создаёт модель классификации с заменённой головой.
-
-    Поддерживаемые архитектуры:
-    - resnet18:        He et al. (2016), CVPR. ~11M параметров.
-    - resnet50:        He et al. (2016), CVPR. ~25M параметров.
-    - efficientnet_b0: Tan & Le (2019), ICML.  ~5M параметров.
-
-    При pretrained=True используются веса ImageNet-1k из torchvision.
-    При image_size=28 модель всё равно принимает 28×28 через Resize в датасете,
-    но голова перестраивается под num_classes.
-
-    freeze_backbone=True: замораживает все слои кроме головы классификатора.
-    Рекомендуется при малом датасете — предотвращает переобучение backbone.
-    Научное обоснование: Yosinski et al. (2014) "How transferable are features
-    in deep neural networks?", NeurIPS; Pan & Yang (2010) "A survey on transfer
-    learning", IEEE TKDE, 22(10), 1345–1359.
+    Создаёт модель классификации с заменённой головой
     """
     weights_map = {
         "resnet18":        models.ResNet18_Weights.DEFAULT if pretrained else None,
@@ -555,10 +437,7 @@ def build_model(
 
     return m
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# МЕТРИКИ
-# ══════════════════════════════════════════════════════════════════════════════
+# Метрики
 
 def compute_classification_metrics(
     model: nn.Module,
@@ -568,13 +447,7 @@ def compute_classification_metrics(
     task: str = "multi-class",
 ) -> Dict[str, float]:
     """
-    Вычисляет ACC и AUC для задач классификации.
-
-    Метрики соответствуют Yang et al. (2021) MedMNIST:
-    - ACC: доля верно классифицированных образцов
-    - AUC: площадь под ROC-кривой (macro-OvR для multi-class)
-
-    AUC вычисляется через sklearn.metrics.roc_auc_score.
+    Вычисляет ACC и AUC для задач классификации
     """
     model.eval()
     all_preds = []
@@ -625,13 +498,6 @@ def compute_classification_metrics(
     except Exception:
         auc = 0.0
 
-    # Precision, Recall, F1 — macro-average по всем классам.
-    # Macro-average считает метрику для каждого класса отдельно и усредняет,
-    # давая одинаковый вес каждому классу независимо от его размера.
-    # Это стандарт для многоклассовых задач (Sokolova & Lapalme, 2009,
-    # Information Processing & Management, 45(4), 427–437).
-    # zero_division=0: если класс не встречается в предсказаниях — ставим 0
-    # вместо предупреждения.
     precision, recall, f1 = 0.0, 0.0, 0.0
     try:
         from sklearn.metrics import precision_recall_fscore_support
@@ -656,41 +522,13 @@ def compute_classification_metrics(
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ВЗВЕШЕННЫЙ ЛОСС (адаптивный к балансу классов)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _get_class_weights(
     dataset: "ClassificationDataset",
     num_classes: int,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
     """
-    Вычисляет веса классов для CrossEntropyLoss на основе частот в train-сплите.
-
-    Формула: weight[c] = N_total / (N_classes × N_c)
-    Это inverse-frequency weighting — стандартный подход для несбалансированных
-    датасетов (King & Zeng, 2001; Japkowicz & Stephen, 2002).
-
-    Поведение:
-    - Сбалансированный датасет (все классы равны): все веса = 1.0 → поведение
-      идентично nn.CrossEntropyLoss() без весов.
-    - Несбалансированный: минорные классы получают больший вес, что предотвращает
-      застревание модели на предсказании мажоритарного класса.
-
-    Научное обоснование:
-    King & Zeng (2001) "Logistic Regression in Rare Events Data",
-        Political Analysis, 9(2), 137–163.
-    Japkowicz & Stephen (2002) "The class imbalance problem: A systematic study",
-        Intelligent Data Analysis, 6(5), 429–449.
-
-    Args:
-        dataset: ClassificationDataset с атрибутом .samples [(path, label), ...]
-        num_classes: число классов
-        device: устройство для тензора весов
-
-    Returns:
-        Тензор весов формы [num_classes] или None при ошибке
+    Вычисляет веса классов для CrossEntropyLoss на основе частот в train-сплите
     """
     try:
         from collections import Counter
@@ -711,25 +549,11 @@ def _get_class_weights(
         return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ОСНОВНОЙ КЛАСС ТРЕНЕРА
-# ══════════════════════════════════════════════════════════════════════════════
+# Основной класс
 
 class ClassificationTrainer:
     """
     Универсальный тренер моделей классификации.
-
-    Повторяет архитектуру UniversalModelTrainer из модуля детекции:
-    - Цикл по чекпоинтам (checkpoint_interval эпох)
-    - Очистка GPU-памяти после каждой модели × датасета
-    - Early Stopping для каждой комбинации
-    - Ранний отбор слабых моделей (Jamieson & Talwalkar, 2016)
-    - Фиксация seed для воспроизводимости
-
-    Гиперпараметры по умолчанию взяты из Yang et al. (2021) MedMNIST:
-    - epochs = 100
-    - optimizer = SGD, lr = 1e-3, momentum = 0.9, weight_decay = 1e-4
-    - batch_size = 128 (масштабируется под VRAM)
     """
 
     def __init__(
@@ -809,7 +633,7 @@ class ClassificationTrainer:
 
         self._log_header()
 
-    # ── Логирование ────────────────────────────────────────────────────────
+    # Логирование
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -845,7 +669,7 @@ class ClassificationTrainer:
                 shutil.rmtree(old)
                 self.log(f"[CLEAN] Удалена папка {old}")
 
-    # ── Вспомогательные методы ─────────────────────────────────────────────
+    # Вспомогательные методы
 
     def _get_dataset_path(self, dataset_name: str) -> Path:
         """Получает путь к датасету через dataset_work или из ENV."""
@@ -872,24 +696,13 @@ class ClassificationTrainer:
         )
         self.log(f"  batch_size={batch_size} (VRAM={self.vram_gb:.1f} GB, imgsz={image_size})")
 
-        # Оцениваем объём датасета для решения о кешировании в RAM.
-        # Кешируем PIL-изображения после предварительного Resize до pre_resize
-        # (= image_size * 1.15) — именно такой размер хранится в кеше.
-        # Это исправляет старый баг когда изображения кешировались в оригинальном
-        # размере (640×640) вместо уменьшенного (224×224).
-        # Формула: N * pre_resize^2 * 3 канала * 1 байт (uint8 PIL) → GB.
-        # Порог: 70% от доступной RAM — стандартный safety margin.
-        # psutil.virtual_memory().available возвращает реально свободную память
-        # (не просто total - used), что точнее для оценки допустимого объёма кеша.
+        # Оцениваем объём датасета для решения о кешировании в RAM
         pre_resize_size = int(image_size * 1.15)
 
         def _estimate_cache_ram_gb(n_samples: int) -> float:
             return n_samples * (pre_resize_size ** 2) * 3 / (1024 ** 3)
 
-        # Определяем допустимый порог RAM для кеша.
-        # Используем 70% от доступной RAM — оставляем место под модель, ОС и прочее.
-        # Минимум 1.0 GB (на случай если psutil недоступен или RAM почти занята),
-        # максимум 16 GB (защита от аномальных значений).
+        # Определяем допустимый порог RAM для кеша
         try:
             import psutil
             available_gb = psutil.virtual_memory().available / (1024 ** 3)
@@ -936,24 +749,9 @@ class ClassificationTrainer:
                 # Worker seed для воспроизводимости
                 g = torch.Generator()
                 g.manual_seed(self.seed)
-                # num_workers > 0: параллельная загрузка данных CPU-воркерами,
-                # пока GPU обрабатывает предыдущий батч — устраняет простой GPU.
-                # os.cpu_count() даёт логические ядра; делим на 2 для физических,
-                # но не меньше 2 и не больше 8 — выше обычно нет прироста.
-                # persistent_workers=True: воркеры живут между эпохами,
-                # не тратим время на их пересоздание каждый раз.
-                # На Windows PyTorch использует spawn для multiprocessing,
-                # что может конфликтовать с потоками Streamlit.
-                # Используем num_workers только если не Windows, либо явно
-                # задаём multiprocessing_context="spawn" для безопасности.
+                # num_workers > 0: параллельная загрузка данных CPU-воркерами
                 import platform
-                # Windows + Streamlit threading = pickle-конфликт при spawn.
-                # ClassificationDataset не сериализуется корректно в дочернем
-                # процессе когда модуль загружен из Streamlit-треда.
-                # Решение: num_workers=0 на Windows (однопоточная загрузка).
-                # На Linux/Mac spawn не используется, воркеры безопасны.
-                # Производительность: потеря ~10-15% скорости загрузки данных,
-                # GPU простаивает чуть больше — приемлемо для одиночных запусков.
+                # Windows + Streamlit threading = pickle-конфликт при spawn
                 if platform.system() == "Windows":
                     n_workers = 0
                     mp_context = None
@@ -989,7 +787,7 @@ class ClassificationTrainer:
 
         return loaders
 
-    # ── Сохранение чекпоинта ───────────────────────────────────────────────
+    # Сохранение чекпоинта
 
     def _save_checkpoint(
         self,
@@ -1016,7 +814,7 @@ class ClassificationTrainer:
         torch.save(payload, path)
         return path
 
-    # ── Обучение одной модели на одном датасете ────────────────────────────
+    # Обучение одной модели на одном датасете
 
     def _train_one(
         self,
@@ -1026,17 +824,9 @@ class ClassificationTrainer:
         resume_from_path: Optional[str] = None,
     ) -> Optional[Dict[str, float]]:
         """
-        Обучает одну модель на одном датасете.
-        Возвращает финальные метрики или None при ошибке.
-        Очищает GPU-память в блоке finally (как в universal_model_trainer).
-
-        resume_from_path: путь к чекпоинту (.pt) для warm-start.
-            Загружает model_state_dict и optimizer_state_dict.
-            Используется автоподбором процента скрининга: вместо обучения
-            с нуля на x+10% эпох — дообучаем с сохранённых x% весов.
-            Примечание: состояние dataloader shuffle не восстанавливается,
-            поэтому результат незначительно отличается от непрерывного
-            обучения — для цели ранжирования Спирмена это приемлемо.
+        Обучает одну модель на одном датасете
+        Возвращает финальные метрики или None при ошибке
+        Очищает GPU-память в блоке finally (как в universal_model_trainer)
         """
         model_type = model_cfg["type"]
         model_max_epochs = model_cfg.get("max_epochs", self.max_epochs)
@@ -1070,14 +860,6 @@ class ClassificationTrainer:
                          f"Обучаемых параметров: {n_trainable:,} / {n_total:,} "
                          f"({100*n_trainable/n_total:.1f}%)")
 
-            # torch.compile: JIT-компиляция графа через Triton/CUDA.
-            # Управляется флагом use_torch_compile из model_cfg —
-            # передаётся из UI через config["use_torch_compile"].
-            # По умолчанию False: при SHA-скрининге компиляция каждой модели
-            # (~1–2 мин) превышает выигрыш от оптимизации.
-            # Включать только при финальном обучении на большом датасете.
-            # base_model хранит ссылку на НЕскомпилированную модель —
-            # нужна для корректной загрузки весов ES (load_state_dict).
             base_model = model
             if model_cfg.get("use_torch_compile", False) and \
                torch.cuda.is_available() and hasattr(torch, "compile") and \
@@ -1098,16 +880,7 @@ class ClassificationTrainer:
             train_loader = loaders["train"]
             val_loader = loaders.get("val")
 
-            # Оптимизатор — SGD с параметрами из Yang et al. (2021) MedMNIST
-            # (Yang et al., 2021, NeurIPS Datasets and Benchmarks Track).
-            # При freeze_backbone передаём только trainable параметры —
-            # замороженные слои не получают градиентов (Yosinski et al., 2014,
-            # NeurIPS 2014, "How transferable are features in deep neural networks?").
-            #
-            # lr по умолчанию: 1e-3 для обучения с нуля; 1e-4 для pretrained.
-            # Howard & Ruder (2018) "Universal Language Model Fine-Tuning for Text
-            # Classification", ACL 2018, pp. 328-339: при fine-tuning сниженный lr
-            # предотвращает разрушение предобученных признаков.
+            # Оптимизатор — SGD с параметрами
             lr = model_cfg.get("lr", 1e-4 if pretrained else 1e-3)
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = optim.SGD(
@@ -1121,37 +894,6 @@ class ClassificationTrainer:
                 loaders["train"].dataset, num_classes, self.device
             ))
 
-            # ── Warm-start: загрузка чекпоинта ────────────────────────────
-            #
-            # Используется автоподбором процента скрининга: вместо обучения
-            # с нуля на ep_b% эпох дообучаем с весов прогона A (ep_a%).
-            #
-            # Стратегия восстановления состояния (три отдельных решения):
-            #
-            # (a) Веса модели — загружаем полностью. Основная цель warm-start.
-            #
-            # (b) Optimizer state_dict (momentum buffers) — загружаем.
-            #     SGD с momentum накапливает буферы v_t = beta*v_{t-1} + grad_t.
-            #     Эти буферы кодируют направление оптимизации; их сброс вызывает
-            #     нестабильность в первых эпохах после перезапуска.
-            #     Sutskever et al. (2013) "On the importance of initialization
-            #     and momentum in deep learning", ICML 2013, pp. 1139-1147:
-            #     momentum существенно ускоряет сходимость именно за счёт
-            #     накопленной истории градиентов.
-            #
-            # (c) Learning rate — сбрасываем в исходное значение lr из конфига.
-            #     optimizer_state_dict хранит lr последней эпохи прогона A.
-            #     CosineAnnealingLR к концу прогона A приближает lr к eta_min
-            #     (по умолчанию 0). Если не перезаписать lr, обучение в первых
-            #     эпохах warm-start фактически замирает из-за нулевого шага.
-            #     Howard & Ruder (2018) ACL 2018, pp. 328-339: при каждом новом
-            #     этапе fine-tuning lr возвращается к начальному значению —
-            #     только так оптимизатор проходит полный цикл на новом этапе.
-            #     Перезапись выполняется ПОСЛЕ load_state_dict, иначе
-            #     load_state_dict перекроет наше значение.
-            #
-            # (d) Scheduler — пересоздаём, state_dict НЕ загружаем.
-            #     Подробнее: см. блок создания scheduler ниже.
             resume_start_epoch = 0
 
             if resume_from_path and os.path.exists(resume_from_path):
@@ -1165,10 +907,6 @@ class ClassificationTrainer:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
                     # (c) Сброс lr в исходное значение.
-                    # Выполняется ПОСЛЕ load_state_dict — иначе load_state_dict
-                    # перекрывает наш lr. Перебираем все param_groups явно,
-                    # потому что freeze_backbone может создавать несколько групп.
-                    # Howard & Ruder (2018): lr = начальный для каждого нового этапа.
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = lr
 
@@ -1189,34 +927,6 @@ class ClassificationTrainer:
                     f"— обучаем с нуля"
                 )
 
-            # ── LR Scheduler ──────────────────────────────────────────────
-            #
-            # Создаётся ПОСЛЕ блока warm-start, чтобы T_max учитывал
-            # итоговый resume_start_epoch.
-            #
-            # Проблема исходного кода:
-            #   scheduler = CosineAnnealingLR(T_max=model_max_epochs)
-            #   затем scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            #   где ckpt сохранён с T_max=ep_a (другое значение).
-            #   CosineAnnealingLR вычисляет lr(t) = eta_min + 0.5*(lr_max-eta_min)
-            #   * (1 + cos(pi * t / T_max)), где t берётся из state_dict прогона A,
-            #   а T_max — из нового планировщика. При T_max_A != T_max_B lr "прыгает"
-            #   в непредсказуемое значение уже на первом шаге — именно это вызывало
-            #   наблюдавшиеся "искажения" в метриках.
-            #
-            # Решение (Loshchilov & Hutter, 2017, "SGDR: Stochastic Gradient
-            # Descent with Warm Restarts", ICLR 2017):
-            #   При warm restart планировщик инициализируется заново с
-            #   T_max = remaining_epochs (оставшееся число эпох).
-            #   Cosine-кривая проходит полный цикл от lr (eta_max) до eta_min
-            #   именно за те эпохи, которые реально будут выполнены.
-            #   scheduler_state_dict намеренно не загружается:
-            #   планировщик всегда стартует из шага 0 своего нового цикла.
-            #
-            # remaining_epochs:
-            #   обучение с нуля: remaining == model_max_epochs
-            #   warm-start:      remaining == model_max_epochs - ep_a
-            #   минимум 1 — защита от деления на ноль при граничных случаях.
             remaining_epochs = max(1, model_max_epochs - resume_start_epoch)
             scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
@@ -1225,10 +935,7 @@ class ClassificationTrainer:
                 # Loshchilov & Hutter (2017).
             )
 
-            # AMP (Automatic Mixed Precision): ускорение за счёт fp16 на GPU.
-            # GradScaler предотвращает underflow градиентов при fp16.
-            # Enabled только при наличии GPU — на CPU AMP не даёт прироста.
-            # Micikevicius et al. (2018) "Mixed Precision Training", ICLR.
+            # AMP (Automatic Mixed Precision): ускорение за счёт fp16 на GPU
             use_amp = torch.cuda.is_available()
             scaler  = GradScaler(device="cuda", enabled=use_amp)
 
@@ -1249,16 +956,6 @@ class ClassificationTrainer:
             last_metrics: Dict[str, float] = {}
 
             # При warm-start добавляем в metrics_history запись с метриками
-            # чекпоинта прогона A. Это нужно чтобы max(history) корректно
-            # учитывал пик качества который мог быть достигнут до точки resume.
-            #
-            # Без этого history содержит только эпохи ep_a+1..ep_b, и если
-            # лучшая эпоха была в диапазоне 1..ep_a — она теряется при выборе
-            # best = max(history, key=...) в вызывающем коде (_train_cls).
-            #
-            # Jamieson & Talwalkar (2016) AISTATS 240-248: ранжирование SHA
-            # должно отражать лучший достигнутый результат кандидата, а не
-            # только результат последнего прогона.
             if resume_start_epoch > 0 and resume_from_path and os.path.exists(resume_from_path):
                 try:
                     _ckpt_for_history = torch.load(
@@ -1278,10 +975,6 @@ class ClassificationTrainer:
                 except Exception:
                     pass  # Если метрики из чекпоинта недоступны — пропускаем
 
-            # ── Основной цикл по эпохам ────────────────────────────────────
-            # DataPrefetcher: загружает следующий батч в фоновом потоке
-            # пока GPU обрабатывает текущий. Безопасен на Windows + Streamlit
-            # (использует threading, не multiprocessing).
             prefetcher = DataPrefetcher(train_loader, self.device)
 
             for epoch in range(resume_start_epoch + 1, model_max_epochs + 1):
@@ -1368,9 +1061,7 @@ class ClassificationTrainer:
                                                      val_metrics, key, scheduler=scheduler)
                         self.log(f"  [CKPT] Сохранён: {ckpt}")
 
-            # Восстанавливаем лучшие веса если ES включён.
-            # Загружаем в base_model (до компиляции) — torch.compile
-            # не поддерживает load_state_dict напрямую через обёртку.
+            # Восстанавливаем лучшие веса если ES включён
             if stopper and stopper.best_model_path and os.path.exists(stopper.best_model_path):
                 ckpt_data = torch.load(stopper.best_model_path, map_location=self.device)
                 base_model.load_state_dict(ckpt_data["model_state_dict"])
@@ -1388,10 +1079,7 @@ class ClassificationTrainer:
                 )
                 last_metrics = {**last_metrics, **{f"test_{k}": v for k, v in test_metrics.items()}}
 
-            # Сохраняем финальный чекпоинт.
-            # Сохраняем last_metrics (не best) — финальный чекпоинт содержит
-            # веса последней эпохи, которые нужны для следующего warm-start.
-            # Best-веса при ES уже восстановлены выше через stopper.best_model_path.
+            # Сохраняем финальный чекпоинт
             _final_ckpt = self._save_checkpoint(
                 base_model, optimizer, last_metrics.get("epoch", 0), last_metrics, key,
                 scheduler=scheduler,
@@ -1399,15 +1087,7 @@ class ClassificationTrainer:
             # Запоминаем путь для возможного warm-start следующего прогона
             self.last_checkpoint_paths[key] = _final_ckpt
 
-            # Возвращаем лучшие метрики по всей истории (включая прогон A).
-            # Это гарантирует что score для ранжирования SHA отражает лучший
-            # достигнутый результат кандидата, а не только результат последней
-            # эпохи или последнего прогона.
-            #
-            # Jamieson & Talwalkar (2016) AISTATS 240-248: SHA ранжирует
-            # кандидатов по лучшему результату за отведённый бюджет эпох.
-            # Если пик качества был в эпохах 1..ep_a (до warm-start),
-            # он должен участвовать в ранжировании прогона B.
+            # Возвращаем лучшие метрики по всей истории (включая прогон A)
             _history_for_best = self.metrics_history.get(key, [])
             if _history_for_best:
                 best_metrics = max(
@@ -1428,7 +1108,7 @@ class ClassificationTrainer:
             return None
 
         finally:
-            # ── КРИТИЧЕСКАЯ ОЧИСТКА ПАМЯТИ (аналог universal_model_trainer) ──
+            # НЕ СЛОМАТЬ! ВАЖНО ЧИСТИТЬ КОРРЕКТНО!
             try:
                 del model
             except NameError:
@@ -1443,7 +1123,6 @@ class ClassificationTrainer:
             gc.collect()
             self.log(f"  [MEM] Память очищена после {key}")
 
-    # ── Ранний отбор (Jamieson & Talwalkar, 2016) ──────────────────────────
 
     def _early_selection(self, checkpoint_epoch: int):
         """
@@ -1476,17 +1155,10 @@ class ClassificationTrainer:
 
         self.log(f"  [EARLY_SEL] Оставлено {len(keep)}/{len(scores)} моделей")
 
-    # ── Главный цикл ───────────────────────────────────────────────────────
 
     def run_training(self, resume_paths: Optional[Dict[str, str]] = None):
         """
-        Запускает обучение всех комбинаций модель × датасет.
-        Структура: внешний цикл по чекпоинтам, внутренний — по комбинациям.
-        После каждой комбинации — очистка памяти.
-
-        resume_paths: словарь {key: path_to_checkpoint} для warm-start.
-            key = f"{model_name}_{dataset_name}".
-            Используется автоподбором процента скрининга.
+        Запускает обучение всех комбинаций модель × датасет
         """
         self.log("\n" + "=" * 80)
         self.log("НАЧАЛО ОБУЧЕНИЯ КЛАССИФИКАТОРОВ")
@@ -1551,51 +1223,3 @@ class ClassificationTrainer:
             )
             if key in self.stop_reasons:
                 self.log(f"    → {self.stop_reasons[key]}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI / быстрый тест
-# ══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    # Пример конфигурации по образу Yang et al. (2021) MedMNIST
-    model_configs = [
-        {
-            "type": "resnet18",
-            "name": "resnet18_224",
-            "image_size": 224,
-            "max_epochs": 100,
-            "pretrained": True,
-            "early_stopping": {"patience": 15, "metric": "val_auc"},
-        },
-        {
-            "type": "resnet50",
-            "name": "resnet50_224",
-            "image_size": 224,
-            "max_epochs": 100,
-            "pretrained": True,
-            "early_stopping": {"patience": 15, "metric": "val_auc"},
-        },
-        {
-            "type": "efficientnet_b0",
-            "name": "efficientnet_b0",
-            "image_size": 224,
-            "max_epochs": 100,
-            "pretrained": True,
-            "early_stopping": {"patience": 15, "metric": "val_auc"},
-        },
-    ]
-
-    trainer = ClassificationTrainer(
-        model_configs=model_configs,
-        dataset_names=["PathMNIST"],
-        max_epochs=100,
-        checkpoint_interval=10,
-        seed=42,
-        enable_early_stopping=True,
-        early_stopping_patience=15,
-        early_stopping_metric="val_auc",
-        enable_early_selection=False,
-        clean_old_results=False,
-    )
-    trainer.run_training()

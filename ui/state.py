@@ -1,9 +1,3 @@
-"""
-ui/state.py — Управление состоянием сессии и конфигурацией
-
-Хранит путь к датасетам в .env (один раз), остальное — в st.session_state.
-"""
-
 import os
 import streamlit as st
 from pathlib import Path
@@ -60,7 +54,7 @@ def init_session_state():
             st.session_state["datasets_path"] = saved
 
 
-# ── Работа с путём ─────────────────────────────────────────────────────────
+# Работа с путями
 
 def _load_path_from_env() -> Path | None:
     """Загружает путь из .env файла. Возвращает Path или None."""
@@ -102,7 +96,7 @@ def get_available_datasets() -> list[str]:
     return sorted([d.name for d in p.iterdir() if d.is_dir()])
 
 
-# ── Вспомогательные функции для лога ──────────────────────────────────────
+# Утилиты для логов
 
 def append_log(key: str, line: str):
     """Добавляет строку в лог в session_state."""
